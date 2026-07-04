@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# bonsai-cli — launch the Bonsai-8B deterministic integer inference engine.
+#
+# Usage:
+#   bonsai-cli [MODE] [PROMPT] [--receipts] [--verbose] [extra run_bonsai_cli flags...]
+#
+# MODE (default: one-shot):
+#   repl            interactive REPL              — omit PROMPT      (no receipts by default)
+#   json   PROMPT   structured JSON output                           (no receipts by default)
+#   (none) PROMPT   one-shot completion                              (no receipts by default)
+#
+# Flags:
+#   --receipts      emit a notarized, byte-exact, third-party-verifiable receipt (OFF by default)
+#   --verbose       show engine/timing/receipt diagnostics. By DEFAULT, json and one-shot print
+#                   ONLY the model output (stderr diagnostics are suppressed); repl is unaffected.
+#
+# Examples:
+#   bonsai-cli repl
+#   bonsai-cli repl --receipts
+#   bonsai-cli json "List three primes."
+#   bonsai-cli json "List three primes." --receipts
+#   bonsai-cli "What is a tensor?"                       # one-shot, model output only
+#   bonsai-cli "What is a tensor?" --receipts --verbose -n 64
+#
+# Env:
+#   BONSAI_GPU=0      force CPU (default uses the GPU producer, auto-falls back to CPU if absent)
+#   BONSAI_DRYRUN=1   print the resolved command instead of running it
+set -euo pipefail
+
+# Print the header comment block (lines after the shebang up to the first non-comment line) as help.
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="$ROOT/bonsai"                                   # the extracted engine package lives here
+PY="$ENGINE/.venv/bin/python"; [ -x "$PY" ] || PY="python3"
+GPU="${BONSAI_GPU:-1}"
+
+[ $# -ge 1 ] || usage 1
+case "$1" in -h|--help|help) usage 0 ;; esac
+
+# Mode: repl | json | (default) one-shot.
+mode="oneshot"
+case "$1" in repl|json) mode="$1"; shift ;; esac
+
+# Receipts default OFF; --verbose default OFF. Strip both out of the passthrough args.
+receipt="--no-receipt"
+verbose=0
+pre=()
+for a in "$@"; do
+    case "$a" in
+        --receipts|--receipt) receipt="--receipt" ;;
+        --no-receipt)         receipt="--no-receipt" ;;
+        --verbose|-v)         verbose=1 ;;
+        *)                    pre+=("$a") ;;
+    esac
+done
+set -- "${pre[@]+"${pre[@]}"}"
+
+# For json/one-shot, the first bare (non-flag) token is the PROMPT. REPL takes no prompt.
+prompt_args=()
+if [ "$mode" != "repl" ]; then
+    rest=()
+    for a in "$@"; do
+        if [ ${#prompt_args[@]} -eq 0 ] && [ "${a:0:1}" != "-" ]; then
+            prompt_args=(-p "$a")
+        else
+            rest+=("$a")
+        fi
+    done
+    set -- "${rest[@]+"${rest[@]}"}"
+    if [ ${#prompt_args[@]} -eq 0 ]; then
+        echo "bonsai-cli: '$mode' needs a PROMPT (e.g. bonsai-cli $mode \"your question\")" >&2
+        exit 2
+    fi
+fi
+
+gpu_args=(); [ "$GPU" = "1" ] && gpu_args=(--gpu)
+
+case "$mode" in
+    repl)    base=(--fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;            # no -p => interactive loop
+    json)    base=(--json --fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;
+    oneshot) base=(--fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;
+esac
+
+cmd=("$PY" -m trinote.cli.run_bonsai_cli "${base[@]}" "${prompt_args[@]+"${prompt_args[@]}"}" "$@")
+
+# json / one-shot emit ONLY the model output (stdout) unless --verbose; all diagnostics go to stderr.
+quiet_stderr=0
+[ "$mode" != "repl" ] && [ "$verbose" = "0" ] && quiet_stderr=1
+
+if [ "${BONSAI_DRYRUN:-0}" = "1" ]; then
+    note=""; [ "$quiet_stderr" = "1" ] && note=" 2>/dev/null"
+    printf '[bonsai-cli] would run (cwd=%s):' "$ENGINE"
+    printf ' %q' PYTHONPATH=src "${cmd[@]}"; printf '%s\n' "$note"
+    exit 0
+fi
+
+cd "$ENGINE"
+if [ "$quiet_stderr" = "1" ]; then
+    exec env PYTHONPATH=src "${cmd[@]}" 2>/dev/null
+else
+    exec env PYTHONPATH=src "${cmd[@]}"
+fi

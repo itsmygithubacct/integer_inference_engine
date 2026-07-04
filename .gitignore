@@ -1,0 +1,45 @@
+# .gitignore for ~/integer_inference_engine (repo root). Patterns without a leading slash
+# match at any depth, so they cover bonsai/ and any sibling engines.
+
+# Virtualenvs — never commit (machine-local; recreate with `uv venv` + requirements*.txt).
+# Covers bonsai/.venv and any nested venv.
+.venv/
+venv/
+.venv_*/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Built native binaries — build artifacts, NOT source. Rebuild per-host with tools/build_*.sh;
+# the engine loader prefers $BONSAI_NOTARY_HOME/bin and falls back to tools/.
+*.so
+
+# Model weights — large, regenerable; fetched out-of-tree via scripts/fetch_weights.sh.
+*.gguf
+*.safetensors
+
+# Generated state and secrets live OUTSIDE this tree under $BONSAI_NOTARY_HOME
+# (default ~/.local/integer_inference_engine/bonsai) — never committed. Belt-and-suspenders
+# in case an override ever writes inside the tree.
+keys/
+*.key.json
+*.wif
+master_mnemonic*
+receipts/
+bundles/
+sessions/
+debug/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs / pids
+*.log
+*.pid

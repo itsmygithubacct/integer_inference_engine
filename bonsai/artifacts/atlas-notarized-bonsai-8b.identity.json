@@ -1,0 +1,32 @@
+{
+  "inferenceEngine": "int-ref@bonsai-qwen3",
+  "mintedFrom": {
+    "artifact": "atlas-notarized-bonsai-8b.safetensors",
+    "charter": "CHARTER-ATLAS-NOTARIZED-BONSAI-8B.md",
+    "gguf": "Bonsai-8B-Q1_0.gguf"
+  },
+  "modelHash": "e5ae7bd10b103b8139f1c37e1c1d353878d4f55d8451d0b6b39aaac2943658e1",
+  "name": "ATLAS-Notarized-Bonsai-8B",
+  "paramCount": 8188548096,
+  "qualityGate": {
+    "gateHash": "aaa20676fa8d9afa2834f84c66d9ea72328c4e5ac1ebd1b9f0814dce381da720",
+    "metric": "teacher-forced-top1-agreement-vs-prismml-libllama",
+    "source": "gate-json",
+    "targetAgreement": 0.5,
+    "threshold": 0.8,
+    "value": 1.0,
+    "verdict": "PASS"
+  },
+  "ricardianHash": "cb70148166bf3f57867ebc00bba692c78dce03bb338107c976945976773718a9",
+  "tokenizerHash": "085fe8da71ec2e2eabb58b8bf834cf1dce50e07ece9094cb41376bc6b326cd71",
+  "weightProvenance": {
+    "ggufFile": "Bonsai-8B-Q1_0.gguf",
+    "ggufSha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+    "importer": "trinote.infer_int.import_bonsai_gguf",
+    "kind": "imported-weights",
+    "license": "Apache-2.0",
+    "quant": "GGUF Q1_0 g128",
+    "source": "prism-ml/Bonsai-8B-gguf"
+  },
+  "weightsRoot": "artifacts/model/atlas-notarized-bonsai-8b.safetensors"
+}
