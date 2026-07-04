@@ -42,6 +42,15 @@ See [`integer_engine.md`](integer_engine.md) for the full design (sections marke
 `north-mini-code` reuses `bonsai`'s determinism primitives (`fixedpoint`, RoPE); a small set is vendored
 verbatim under `north-mini-code/src/nmc/_bonsai/` to keep it self-contained.
 
+## Get it
+
+```bash
+git clone https://github.com/itsmygithubacct/integer_inference_engine.git
+cd integer_inference_engine
+```
+
+Standalone — no sibling repos required. Pick an engine below (`bonsai/` is the proven reference).
+
 ## Quick start (bonsai)
 
 ```bash
@@ -76,7 +85,7 @@ model-agnostic `trinote.*` notary stack via `$NMC_BONSAI_SRC` (default `bonsai/s
 
 ## Used by `bonsai-notary`
 
-This engine is one of four pieces in the [`bonsai-notary`](../bonsai-notary) composition (deterministic
+This engine is one of four pieces in the [`bonsai-notary`](https://github.com/itsmygithubacct/bonsai-notary) composition (deterministic
 inference + on-chain notarization). That repo references this one at `engine/` and expects the
 `trinote` package under `bonsai/src`.
 
