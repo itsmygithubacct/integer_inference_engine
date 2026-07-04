@@ -1,0 +1,38 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 6904b9c1a..5df1dea4d 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -66,6 +66,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_XVERSE,           "xverse"           },
+     { LLM_ARCH_COMMAND_R,        "command-r"        },
+     { LLM_ARCH_COHERE2,          "cohere2"          },
++    { LLM_ARCH_COHERE2MOE,       "cohere2moe"       },
+     { LLM_ARCH_DBRX,             "dbrx"             },
+     { LLM_ARCH_OLMO,             "olmo"             },
+     { LLM_ARCH_OLMO2,            "olmo2"            },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index c4aabab7e..43292f532 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -70,6 +70,7 @@ enum llm_arch {
+     LLM_ARCH_XVERSE,
+     LLM_ARCH_COMMAND_R,
+     LLM_ARCH_COHERE2,
++    LLM_ARCH_COHERE2MOE, // vocab-only: register arch so llama-tokenize can load Cohere MoE GGUFs (North Mini Code)
+     LLM_ARCH_DBRX,
+     LLM_ARCH_OLMO,
+     LLM_ARCH_OLMO2,
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index 163f222ef..d9649c488 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -2103,7 +2103,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+                 pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
+                 clean_spaces = false;
+             } else if (
+-                tokenizer_pre == "tiny_aya") {
++                tokenizer_pre == "tiny_aya" ||
++                tokenizer_pre == "cohere2moe") {   // Cohere MoE (North Mini Code) shares the TINY_AYA pre-tokenizer
+                 pre_type = LLAMA_VOCAB_PRE_TYPE_TINY_AYA;
+                 clean_spaces = false;
+             } else if (

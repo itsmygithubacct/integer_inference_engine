@@ -1,0 +1,26 @@
+# Bonsai engine configuration  —  copy to  $BONSAI_NOTARY_HOME/bonsai.toml  (default ~/.local/trinote/bonsai.toml)
+#
+# Precedence:  an explicit CLI flag   >   this file   >   the built-in defaults.
+# Keys mirror the CLI flags (dashes -> underscores). [sections] are cosmetic (flattened on load).
+# Unknown or out-of-range keys are ignored WITH A WARNING, so a typo never silently changes behaviour.
+# Point $BONSAI_CONFIG at a different file to override the location.
+
+[inference]
+sampler          = "qwen3-rec"   # min_p | qwen3-rec | greedy | temp | top_k | top_p
+max_new          = 256           # generation budget (tokens). Long greedy-ish runs can fall into
+                                 # repetition loops on a 1-bit model — keep this modest, or raise
+                                 # rep_penalty / no_repeat_ngram below.
+engine           = "native"      # native | prismml.cpp   (cryptographic receipts require 'native')
+chat             = false         # wrap prompts in the Bonsai/Qwen3 chat template
+verify_mode      = "fast-local"  # fast-local | fresh-oracle
+
+[sampling]
+# Repetition controls (receipt-safe: recorded in the receipt + byte-exactly reproducible at a fixed seed).
+rep_penalty      = 1.3           # > 1.0 penalises already-emitted tokens; the main cure for tail loops.
+no_repeat_ngram  = 3            # forbid repeating any 3-gram (hard stop for verbatim loops). 0 = off.
+seed             = 0             # fixed seed -> reproducible generations + verifiable receipts.
+# Applied by the temp/top_k/top_p/min_p modes (the qwen3-rec preset sets its own top_k=20/top_p=0.95):
+temp             = 0.8
+top_k            = 40
+top_p            = 0.95
+min_p            = 0.0

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# north-mini-code-cli — launch the north-mini-code deterministic integer engine (cohere2moe 30B MoE).
+#
+# Usage:
+#   north-mini-code-cli [MODE] [PROMPT] [--receipts] [--broadcast [--confirm]] [--verbose] [-n N]
+#
+# MODE (default: one-shot):
+#   repl            interactive REPL              — omit PROMPT
+#   json   PROMPT   structured JSON output
+#   (none) PROMPT   one-shot completion
+#
+# Flags:
+#   --receipts      emit a secp256k1-signed, byte-exact, third-party-verifiable receipt (OFF by default).
+#                   Its on-chain 3rd-entry artifact (modelHash+receiptHash) is produced + dry-run-logged.
+#   --broadcast     REAL BSV broadcast of the 3rd entry via the bonsai-notary wallet (needs that wallet);
+#                   builds the tx but does not send unless --confirm. Money-safety: off by default.
+#   --confirm       actually SEND the broadcast (spends sats); requires --broadcast.
+#   --verbose, -v   show engine/timing/receipt diagnostics. By DEFAULT json and one-shot print ONLY the
+#                   model output (stderr diagnostics suppressed); repl always shows them.
+#   -n N            max new tokens (default 64)
+#
+# Examples:
+#   north-mini-code-cli "The capital of France is"
+#   north-mini-code-cli "The capital of France is" --receipts --verbose
+#   north-mini-code-cli json "List three primes." --receipts
+#   north-mini-code-cli repl --receipts
+#
+# Env:
+#   NMC_BLOB=<path>   the GGUF blob (default: largest ollama blob, or `ollama pull north-mini-code-1.0`)
+#   NMC_BACKEND       cuda-resident | cuda | cpu  (default cuda; auto-falls back to cpu)
+#   NMC_BONSAI_SRC    the model-agnostic trinote receipt stack (default: <root>/bonsai/src)
+set -euo pipefail
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
+case "${1:-}" in -h|--help|help) usage 0 ;; esac
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="$ROOT/north-mini-code"
+PY="$ENGINE/.venv/bin/python"; [ -x "$PY" ] || PY="python3"
+export NMC_BONSAI_SRC="${NMC_BONSAI_SRC:-$ROOT/bonsai/src}"
+exec env PYTHONPATH="$ENGINE/src" "$PY" "$ENGINE/tools/nmc_cli.py" "$@"
