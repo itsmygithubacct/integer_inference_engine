@@ -1,9 +1,9 @@
 # A standalone deterministic integer inference engine for BitNet-style LLMs, with Ollama interop
 
 > **Status: design document.** The *core* — a byte-exact, all-integer fixed-point inference engine for 1-bit
-> (Q1_0) weights — is **already built and measured** in `bonsai-notarized-bitnet` (the `int-ref@bonsai-qwen3`
-> engine: `src/trinote/infer_int/reference_bonsai.py`, `src/trinote/determinism/fixedpoint.py`, the CPU/CUDA
-> kernels, receipts, GGUF import). This document describes extracting that core into a **standalone engine**,
+> (Q1_0) weights — is **already built and measured** in the `integer_inference_engine/bonsai` engine
+> (`bonsai/src/trinote/infer_int/reference_bonsai.py`, `bonsai/src/trinote/determinism/fixedpoint.py`, the
+> CPU/CUDA kernels, receipts, GGUF import). This document describes generalizing that core into a **standalone engine**,
 > generalizing the weight codec to **BitNet-style ternary** models, and wiring it to **Ollama** for model
 > distribution and a drop-in API. Sections are marked **[proven]** (exists today) or **[proposed]** (design).
 
@@ -88,8 +88,18 @@ GPU/threaded non-determinism therefore do not apply:
 Integer associativity holds *only if no value silently wraps unexpectedly*. The engine carries a per-tensor
 bound (`max|a|·max|b|·K ≤ 2⁶³−1`) checked **before** each multiply; a breach **raises** rather than wrapping
 (a silent wrap would be "wrong-but-still-deterministic" — both producer and verifier would agree on garbage).
-The Q1 weight apply is the one deliberate exception: it wraps mod-2⁶⁴ *by construction*, byte-identically to the
-NumPy reference, so producer and verifier wrap the same way.
+There are **two** deliberate wrap-by-construction exceptions, both byte-identical across the NumPy oracle and the
+C/CUDA producers (so producer and verifier wrap the same way, and determinism is preserved *by consistent wrap*
+rather than by raising):
+1. **The Q1 weight apply** — wraps mod-2⁶⁴ by construction (the packed masked-sum matches the NumPy reference bit
+   for bit).
+2. **The SiLU / sigmoid activation path** (`fixed_point_sigmoid`/`fixed_point_silu` and the FFN `gate*up`) — the
+   distance `m − x` and the `x·sigmoid(x)` product are **not** fail-loud-bounded; for an out-of-envelope input
+   (e.g. an int64-min-scale mask sentinel) they wrap, but wrap *identically* in the oracle and the native/GPU
+   kernels (pinned at the int64 extremes by `test_bonsai_native_silu_matches_oracle_if_present`). Real
+   activations are RMSNorm-bounded and never reach the wrap; callers must use a **bounded** causal-mask sentinel
+   (~−2^(frac+30)), which the engine always does. Every *other* multiply (attention Q·Kᵀ / probs·V, RMSNorm gain,
+   RoPE, sampler temperature) keeps the fail-loud bound.
 
 ### 3.5 Producer / verifier split
 The **pure-integer reference (NumPy/Python) is the canonical verifier**; accelerated kernels (CPU C/OpenMP,
@@ -289,6 +299,11 @@ Takeaway: the engine is competitive and *reproducible*; it trades a constant fac
 
 ## 10. What's proven vs. what this proposes
 
+"CI-gated" below means the byte-exact CPU-oracle ⇄ CPU-native parity (incl. the int64 overflow boundary) runs
+on every push/PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which builds the native kernel and
+sets `TRINOTE_REQUIRE_NATIVE=1` so a missing kernel fails the suite rather than silently passing on the oracle
+alone. GPU parity is not in CI (no GPU runner).
+
 | Capability | Status |
 |---|---|
 | All-integer fixed-point transformer, byte-exact CPU-oracle ⇄ CPU-native (incl. int64 overflow boundary) | **proven, CI-gated** (Q1_0 8B) |
@@ -341,8 +356,8 @@ reference engine was built.
 
 ---
 
-*Reference implementation (the proven core this generalizes):* `bonsai-notarized-bitnet` —
-`src/trinote/infer_int/` (engine, kernels, import, samplers, receipts glue),
-`src/trinote/determinism/fixedpoint.py` (integer primitives), `tools/bonsai_q1_kernel.c` +
-`tools/bonsai_q1_gpu.cu` (byte-identical CPU/CUDA producers), and the specs under `~/research/bonsai-notary/`
-(`Q1-BITMATMUL-REFORMULATION.md`, `GPU-FEASIBILITY.md`, `IMPLEMENT-GPU-MODE.md`, `DETERMINISM`/`SAMPLER` docs).
+*Reference implementation (the proven core this generalizes):* `integer_inference_engine/bonsai` —
+`bonsai/src/trinote/infer_int/` (engine, kernels, import, samplers, receipts glue),
+`bonsai/src/trinote/determinism/fixedpoint.py` (integer primitives), `bonsai/tools/bonsai_q1_kernel.c` +
+`bonsai/tools/bonsai_q1_gpu.cu` (byte-identical CPU/CUDA producers), plus the external
+`Q1-BITMATMUL-REFORMULATION`, `GPU-FEASIBILITY`, `IMPLEMENT-GPU-MODE`, `DETERMINISM`, and `SAMPLER` design notes.

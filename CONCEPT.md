@@ -85,4 +85,4 @@ operator — the basis for on-chain notarization, regulatory attestation, and tr
 ---
 
 *Full design: [`integer_engine.md`](integer_engine.md). North-mini-code status + the fidelity result:
-[`north-mini-code/`](north-mini-code/) and `~/research/integer_inference_engine/`.*
+[`north-mini-code/`](north-mini-code/). Supporting research notes remain outside the published repository.*

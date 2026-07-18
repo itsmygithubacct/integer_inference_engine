@@ -1,0 +1,61 @@
+name: ci
+
+# Gates the load-bearing claim in README.md / integer_engine.md: the pure-integer CPU ORACLE is byte-exact
+# with the C/OpenMP NATIVE producer (incl. the int64 overflow boundary), enforced on every push/PR. GPU
+# parity is NOT run here (no GPU runner) — that remains an on-hardware / BONSAI_VERIFY_GPU check, as documented.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bonsai:
+    name: bonsai (oracle ⇄ native byte-exact)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bonsai
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Create venv + install deps
+        run: |
+          uv venv
+          uv pip install -r requirements.txt -r requirements_test.txt
+      - name: Build native Q1 kernel (C/OpenMP producer)
+        run: tools/build_bonsai_q1_kernel.sh
+      - name: Run test suite (native kernel MANDATORY)
+        # TRINOTE_REQUIRE_NATIVE=1 makes the oracle⇄native parity non-skippable: if the kernel is missing the
+        # suite FAILS rather than silently passing on the oracle alone.
+        env:
+          TRINOTE_REQUIRE_NATIVE: "1"
+          PYTHONPATH: src
+        run: .venv/bin/python -m pytest -q
+
+  north-mini-code:
+    name: north-mini-code (codec + integer engine)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: north-mini-code
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Create venv (py3.12) + install deps
+        run: |
+          uv venv --python 3.12
+          uv pip install -r requirements.txt -r requirements_test.txt -r requirements_receipts.txt
+      - name: Build native Q4_K/Q6_K kernel (CPU producer)
+        run: tools/build_nmc_kernel.sh
+      - name: Run test suite
+        # GPU (cuda) tests self-skip on a CPU runner; the codec/oracle/CPU-kernel/receipt suites run.
+        env:
+          NMC_BONSAI_SRC: ../bonsai/src
+          PYTHONPATH: src
+        run: .venv/bin/python -m pytest -q
