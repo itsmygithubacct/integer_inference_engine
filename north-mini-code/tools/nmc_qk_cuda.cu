@@ -300,8 +300,10 @@ __device__ __forceinline__ int pk4(const int8_t *p) {
     return (p[0] & 0xFF) | ((p[1] & 0xFF) << 8) | ((p[2] & 0xFF) << 16) | ((p[3] & 0xFF) << 24);
 }
 
-// xlimb[l*T*in_f + t*in_f + i] = l-th balanced base-256 digit of x[t*in_f+i] (signed int8). Reconstructs x
-// exactly over ℤ when Ln covers max|x| (256^Ln/2 > max|x|); the caller picks Ln + guards the range.
+// xlimb[l*T*in_f + t*in_f + i] = l-th balanced base-256 digit of x[t*in_f+i] (signed int8). The greedy
+// decomposition keeps Ln signed digits and discards the final carry, so it reconstructs x exactly over ℤ
+// ONLY when |x| <= 127*(256^Ln - 1)/255 (NOT the looser 256^Ln/2 bound — that over-claims a high band and
+// wraps by 256^Ln, e.g. Ln=2 fails on [32640,32767]). The caller (_ln_for) picks Ln for that exact bound.
 __global__ void make_limbs(const int64_t *x, long long n, long long stride, int Ln, int8_t *xlimb) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -520,10 +522,15 @@ __global__ void matmul_multi_dp4a(uint8_t **wptrs, int qt, const int8_t *xlimb, 
     yout[(size_t)e * out_f + o] = (int64_t)(acc >> fw);
 }
 
-static int _ln_for(unsigned long long maxabs) {                // min balanced-base-256 limbs covering |x|<=maxabs
+static int _ln_for(unsigned long long maxabs) {                // safe DP4A limbs, or 0 for exact-kernel fallback
+    // L balanced digits (each in [-128,127]) reconstruct x exactly only when |x| <= 127*(256^L-1)/255, NOT
+    // the naive 2^(8L-1). Build that capacity with the overflow-safe recurrence cap(L)=cap(L-1)*256+127.
+    // The decomposition supports more limbs mathematically, but these kernels recombine each weighted limb in
+    // int64. Four limbs are the proven-safe Q4_K/Q6_K envelope; above it the caller must use the int128 path.
     int L = 1;
-    while (L < 8 && ((unsigned long long)1 << (8 * L - 1)) <= maxabs) L++;
-    return L;
+    unsigned long long cap = 127ULL;                           // capacity for L=1
+    while (L < 4 && maxabs > cap) { cap = cap * 256ULL + 127ULL; L++; }
+    return maxabs <= cap ? L : 0;
 }
 
 extern "C" int qk_moe_ffn_dp4a(const long long *gate_h, const long long *up_h, const long long *down_h, int n_e,
@@ -536,13 +543,16 @@ extern "C" int qk_moe_ffn_dp4a(const long long *gate_h, const long long *up_h, c
         long long g = gate_h[e], u = up_h[e], d = down_h[e];
         if (g < 0 || g >= g_nreg || u < 0 || u >= g_nreg || d < 0 || d >= g_nreg) return 1;
         pg[e] = g_reg[g].p; pu[e] = g_reg[u].p; pd[e] = g_reg[d].p;
-        qg = g_reg[g].qtype; qu = g_reg[u].qtype; qd = g_reg[d].qtype;     // uniform per stage
+        int eg = g_reg[g].qtype, eu = g_reg[u].qtype, ed = g_reg[d].qtype;
+        if (e == 0) { qg = eg; qu = eu; qd = ed; }
+        else if (qg != eg || qu != eu || qd != ed) return 1;              // one qtype per tensor/stage
     }
     long long nb_in = d_model / 256, nb_dn = e_ffn / 256;
     // host: Ln for the shared input h
     unsigned long long mxh = 0;
     for (long long i = 0; i < d_model; i++) { int64_t v = h[i]; unsigned long long a = v < 0 ? (~(unsigned long long)v + 1ULL) : (unsigned long long)v; if (a > mxh) mxh = a; }
     int Lh = _ln_for(mxh);
+    if (Lh == 0) return 1;                                      // outside safe DP4A envelope; use int128 path
     uint8_t **dpg = 0, **dpu = 0, **dpd = 0;
     int64_t *dh = 0, *dg = 0, *du = 0, *dd = 0, *dgs = 0, *dout = 0, *dhxs = 0, *dgxs = 0;
     int8_t *dhl = 0, *dgl = 0; unsigned long long *dmax = 0;
@@ -573,6 +583,7 @@ extern "C" int qk_moe_ffn_dp4a(const long long *gate_h, const long long *up_h, c
         unsigned long long mxg = 0;
         if (cudaMemcpy(&mxg, dmax, 8, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
         int Lg = _ln_for(mxg);
+        if (Lg == 0) goto done;                                 // outside safe DP4A envelope; use int128 path
         if (cudaMalloc(&dgl, (size_t)Lg * nge) != cudaSuccess) goto done;    // gu limbs (Lg known only now)
         make_limbs<<<(nge + tpb - 1) / tpb, tpb>>>(dg, nge, nge, Lg, dgl);   // [Lg, n_e*e_ffn]
         make_xsum<<<((long long)n_e * nb_dn * 8 + tpb - 1) / tpb, tpb>>>(dg, n_e, nb_dn, dgxs);

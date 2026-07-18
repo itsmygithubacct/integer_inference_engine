@@ -13,6 +13,9 @@ from pathlib import Path
 import numpy as np
 
 Q4_K, Q6_K = 0, 1
+_DP4A_SAFE_LIMBS = 4
+
+from nmc.qk_native import _require_weight_bytes   # shared buffer-length guard (Q4_K=144B, Q6_K=210B superblocks)
 
 
 def _so_path() -> Path:
@@ -88,6 +91,7 @@ def qk_linear(weight_raw: bytes, x_int: np.ndarray, out_f: int, n_blocks: int, f
     x = np.ascontiguousarray(np.atleast_2d(np.asarray(x_int, dtype=np.int64)))
     T, in_f = x.shape
     assert in_f == n_blocks * 256, (in_f, n_blocks)
+    _require_weight_bytes(weight_raw, out_f, n_blocks, qtype)   # fail loud on a short buffer (no OOB D2H copy)
     wbuf = (ctypes.c_char * len(weight_raw)).from_buffer_copy(weight_raw)
     out = np.empty((T, out_f), dtype=np.int64)
     rc = lib.qk_linear_cuda(ctypes.cast(wbuf, ctypes.c_void_p), x.ctypes.data, T, out_f, n_blocks,
@@ -105,6 +109,7 @@ def register_weight(weight_raw: bytes, out_f: int, n_blocks: int, qtype: int):
     lib = _lib()
     if lib is None or not hasattr(lib, "qk_register_weight"):
         return None
+    _require_weight_bytes(weight_raw, out_f, n_blocks, qtype)   # fail loud on a short buffer (no OOB VRAM upload)
     wbuf = (ctypes.c_char * len(weight_raw)).from_buffer_copy(weight_raw)
     h = lib.qk_register_weight(ctypes.cast(wbuf, ctypes.c_void_p), out_f, n_blocks, qtype)
     return None if h < 0 else int(h)
@@ -138,25 +143,76 @@ def dp4a_available() -> bool:
     return lib is not None and hasattr(lib, "qk_apply_resident_q6k_dp4a") and hasattr(lib, "qk_apply_resident_q4k_dp4a")
 
 
+def _balanced_capacity(L: int) -> int:
+    """Max |x| that L balanced base-256 digits (each in [-128, 127]) can represent EXACTLY via the greedy
+    signed-low-byte decomposition = 127*(256^L - 1)/255. (256^L - 1 is always divisible by 255, so exact.)"""
+    return 127 * ((256 ** L - 1) // 255)
+
+
 def limbs_needed(maxabs: int) -> int:
-    """Smallest L of balanced base-256 digits that represents |x|<=maxabs exactly (2^(8L-1) > maxabs), capped 8."""
+    """Smallest L of balanced base-256 digits that represents ±|x| exactly, capped at 8.
+
+    The greedy decomposition (make_limbs) keeps L signed digits and DISCARDS the final carry, so it is exact
+    only when |x| <= 127*(256^L - 1)/255 — NOT the naive 2^(8L-1) bound, which over-claims a high band and
+    silently corrupts the dot product (e.g. L=2 fails on [32640, 32767]: 32640 -> [-128,-128] = -32896 =
+    x - 65536). Raises rather than truncating if |x| exceeds the 8-digit capacity."""
+    m = int(maxabs)
     L = 1
-    while L < 8 and (1 << (8 * L - 1)) <= int(maxabs):
+    while L < 8 and m > _balanced_capacity(L):
         L += 1
+    if m > _balanced_capacity(8):
+        raise OverflowError(f"|x| max {m} exceeds 8 balanced base-256 digits ({_balanced_capacity(8)})")
     return L
+
+
+def _activation_absmax(x: np.ndarray) -> int:
+    """Return max(abs(x)) as a Python int without ``abs(INT64_MIN)`` wrapping."""
+    return max(abs(int(x.min())), abs(int(x.max()))) if x.size else 0
+
+
+def _dp4a_limb_count(x: np.ndarray, requested: int | None = None) -> int | None:
+    """Validate the activation decomposition used by the CUDA DP4A kernels.
+
+    The balanced-byte decomposition itself supports up to eight limbs, but the
+    current kernels recombine each weighted limb in int64.  Four limbs are the
+    largest envelope for which every Q4_K/Q6_K subgroup term is provably in
+    range.  Return ``None`` above that envelope so callers use the exact int128
+    kernel instead of silently wrapping.  An explicitly undersized/invalid limb
+    count is a caller error and fails loudly.
+    """
+    try:
+        needed = limbs_needed(_activation_absmax(x))
+    except OverflowError:
+        if requested is None:
+            return None
+        raise ValueError("activation is not representable by the DP4A balanced-byte decomposition") from None
+    if requested is None:
+        return needed if needed <= _DP4A_SAFE_LIMBS else None
+    requested = int(requested)
+    if not 1 <= requested <= _DP4A_SAFE_LIMBS:
+        raise ValueError(
+            f"DP4A limb count must be in [1, {_DP4A_SAFE_LIMBS}], got {requested}; "
+            "larger decompositions are not int64-safe in the current CUDA recombination"
+        )
+    if requested < needed:
+        raise ValueError(f"DP4A limb count {requested} is too small; activation requires {needed}")
+    return requested
 
 
 def apply_resident_dp4a(handle: int, x_int: np.ndarray, out_f: int, fw: int, qtype: int, ln: int = None):
     """DP4A apply of a resident Q4_K (qtype 0) or Q6_K (qtype 1) weight — byte-identical to apply_resident,
     faster on the big matmuls. ln (activation limbs) defaults to the minimum covering max|x|. [T,out_f] or None."""
+    if qtype not in (Q4_K, Q6_K):
+        raise ValueError(f"unknown qtype {qtype} (expected Q4_K={Q4_K} or Q6_K={Q6_K})")
     lib = _lib()
     fn = getattr(lib, "qk_apply_resident_q4k_dp4a" if qtype == Q4_K else "qk_apply_resident_q6k_dp4a", None)
     if lib is None or fn is None:
         return None
     x = np.ascontiguousarray(np.atleast_2d(np.asarray(x_int, dtype=np.int64)))
     T = x.shape[0]
+    ln = _dp4a_limb_count(x, ln)
     if ln is None:
-        ln = limbs_needed(int(np.abs(x).max()) if x.size else 0)
+        return None                                     # exact int128 fallback: outside DP4A's safe envelope
     out = np.empty((T, out_f), dtype=np.int64)
     rc = fn(int(handle), x.ctypes.data, T, int(fw), int(ln), out.ctypes.data)
     return None if rc != 0 else out

@@ -1,9 +1,10 @@
 """Stage 3 — the cohere2moe DENSE path in deterministic integer fixed-point.
 
 Implements the Cohere **parallel block** (one RMSNorm feeds BOTH attention and FFN; their outputs are summed
-into the residual: `x = x + Attn(n(x)) + FFN(n(x))`), GQA **full** attention with NeoX RoPE (θ=50000), the
-dense SwiGLU FFN, and the **tied-embedding** LM head — all integer. This is the leading dense block (block 0)
-and the scaffold the MoE blocks (Stage 5) slot into.
+into the residual: `x = x + Attn(n(x)) + FFN(n(x))`), GQA **full** attention with **interleaved/NORM** RoPE
+(lanes 2i, 2i+1; θ=50000) — NOT NeoX (see `apply_rope_fixed` import below) — the dense SwiGLU FFN, and the
+**tied-embedding** LM head, all integer. This is the leading dense block (block 0) and the scaffold the MoE
+blocks (Stage 5) slot into.
 
 Reuses the proven Bonsai integer primitives (`fixed_point_rmsnorm/softmax/sigmoid`, NeoX RoPE) and the Stage-2
 Q4_K/Q6_K codec for weights. A matching float64 reference defines the architecture; the gate is fidelity
@@ -26,6 +27,25 @@ import numpy as np
 from nmc._bonsai.fixedpoint import fixed_point_rmsnorm, fixed_point_softmax, fixed_point_sigmoid
 from nmc._bonsai.rope_v2 import build_rope_tables
 from nmc._bonsai.rope import apply_rope_fixed   # cohere2 uses NORM/INTERLEAVED RoPE (lanes 2i,2i+1), not NeoX
+
+_I64_MAX = (1 << 63) - 1
+
+
+def _assert_i64_contraction(amax: int, bmax: int, k: int, where: str) -> None:
+    """Fail loud if an int64 contraction max|a|*max|b|*K would wrap. nmc's decode hot path uses int64 numpy
+    matmul for speed — byte-identical to a big-int accumulation ONLY within the fixed-point envelope. A silent
+    wrap would diverge from the big-int oracle deterministically (the receipt-lethal failure: producer and
+    verifier agree on a wrong logit). `amax`/`bmax` are Python-int magnitudes (so int64-min can't wrap the
+    guard). Called once per matmul — cheap vs the matmul itself."""
+    if amax and bmax and amax * bmax * int(k) > _I64_MAX:
+        raise OverflowError(
+            f"{where}: int64 contraction max|a|*max|b|*K = {amax * bmax * int(k)} > 2^63-1 — an activation "
+            f"left the fixed-point envelope; the int64 matmul would wrap (deterministic-but-wrong for a receipt)")
+
+
+def _absmax_int(a: np.ndarray) -> int:
+    """max|a| as a Python int, avoiding np.abs(int64-min) wrap."""
+    return max(abs(int(a.min())), abs(int(a.max()))) if a.size else 0
 
 
 @dataclass
@@ -215,6 +235,13 @@ def attention_cached(q, ck, cv, start, cfg, window):
     out = np.empty((m, H, hd), dtype=np.int64)
     # int64 (not object) is byte-identical here — q·k over head_dim ≲ 2**40 and prob·v ≲ 2**38 both fit int64,
     # so native numpy matmul == big-int but ~100× faster (the decode hot path). Gated by the decode tests.
+    # Fail loud if that envelope is actually breached (one cheap vectorized check bounds every per-head matmul,
+    # so a silent int64 wrap can never diverge from the big-int oracle unnoticed).
+    _assert_i64_contraction(_absmax_int(q), _absmax_int(ck), hd, "attention_cached q·kᵀ")
+    # Each softmax row is non-negative and sums to at most 2**fa (integer division floors each entry), so the
+    # entire probability·V accumulation is bounded by 2**fa*max|V| — not that value times Lc. Multiplying by
+    # Lc again would reject safe long-context rows even though their probability mass is still one.
+    _assert_i64_contraction((1 << fa), _absmax_int(cv), 1, "attention_cached probs·v")
     for h in range(H):
         kv = h // cfg.rep
         qh = q[:, h, :]; kh = ck[kv]; vh = cv[kv]                     # all int64

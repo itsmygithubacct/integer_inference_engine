@@ -15,8 +15,8 @@ ollama blob, so run it under sudo.
 
 ## Why the stock reference build can't load nmc (and the 3-line fix)
 
-The nmc GGUF declares `general.architecture = cohere2moe`. The reference build
-(`~/research/refs/PrismML-llama.cpp`) registers only `cohere2`, so `load_arch` throws
+The nmc GGUF declares `general.architecture = cohere2moe`. An unpatched PrismML llama.cpp checkout registers
+only `cohere2`, so `load_arch` throws
 `unknown model architecture: 'cohere2moe'` — even in vocab-only mode. It also maps only the
 pre-string `"tiny_aya"` (not `"cohere2moe"`) to `TINY_AYA`.
 
@@ -34,9 +34,10 @@ It is purely additive — it does not touch any existing arch or pre-type, so ev
 ### Apply + build
 
 ```sh
-cd ~/research/refs/PrismML-llama.cpp
+LLAMA_CPP_DIR="$(pwd)/../PrismML-llama.cpp"
+cd "$LLAMA_CPP_DIR"
 git checkout -b cohere2moe-vocab-tokenize          # isolate; `git checkout prism` restores pristine source
-git apply integer_inference_engine/north-mini-code/tools/llama-cpp-cohere2moe-vocab.patch  # or: patch -p1 < ...
+git apply ../integer_inference_engine/north-mini-code/tools/llama-cpp-cohere2moe-vocab.patch
 cmake --build build --target llama-tokenize -j"$(nproc)"   # build is GGML_CUDA=OFF -> fast, CPU-only
 ```
 
@@ -52,7 +53,7 @@ print(next('/usr/share/ollama/.ollama/models/blobs/'+l['digest'].replace('sha256
            for l in m['layers'] if l['mediaType'].endswith('image.model')))
 PY
 )
-BIN=~/research/refs/PrismML-llama.cpp/build/bin/llama-tokenize
+BIN="$LLAMA_CPP_DIR/build/bin/llama-tokenize"
 sudo "$BIN" -m "$BLOB" --no-escape --no-bos --ids --log-disable -p 'The capital of France is'
 ```
 

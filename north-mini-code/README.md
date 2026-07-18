@@ -4,10 +4,9 @@ A work-in-progress all-integer / fixed-point engine for **`north-mini-code-1.0`*
 Q4_K_M), the second target after Bonsai-8B. Goal: byte-identical output across CPU/GPU/threads/batch + verifiable
 receipts, preserving the Q4_K model's quality (faithful integer rebuild, not a 1-bit re-quantization).
 
-**Design + plan:** [`north-mini-code-integer-engine.md`](../../../research/north-mini-code-integer-engine.md)
-(scoping, full architecture, milestones — under `~/research/`). Generalized design:
-[`integer_engine.md`](../integer_engine.md). Reuses the proven Bonsai engine at
-`~/integer_inference_engine/bonsai`.
+The generalized design is documented in [`integer_engine.md`](../integer_engine.md); private scoping and
+research notes intentionally remain outside the published repository. This port reuses the proven Bonsai
+engine under [`../bonsai`](../bonsai).
 
 ## Status
 - ✅ **Stage 1 — import/inspect**: full GGUF metadata pinned (arch, SWA pattern, MoE, norm, codec types).
@@ -86,7 +85,7 @@ requirements.txt            # numpy  (+ requirements_test.txt: pytest; requireme
 
 ## Run
 ```bash
-cd ~/integer_inference_engine/north-mini-code
+cd integer_inference_engine/north-mini-code
 uv venv --python 3.12 && uv pip install -r requirements.txt -r requirements_test.txt
 PYTHONPATH=src .venv/bin/python -m nmc.qk_codec --frac 24 --n 128   # codec self-test (parity + fidelity)
 PYTHONPATH=src .venv/bin/python -m pytest tests/ -q                 # the gates
@@ -94,11 +93,14 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/ -q                 # the gates
 
 To run the full deterministic engine (one-shot / `json` / `repl`, with `--receipts` and an optional
 `--broadcast`/`--confirm` on-chain 3rd entry), use the `north-mini-code-cli` launcher at the engine root
-(`~/integer_inference_engine/north-mini-code-cli`); receipts need `requirements_receipts.txt` (`ecdsa`).
+(`../north-mini-code-cli` from this directory); receipts need `requirements_receipts.txt` (`ecdsa`).
 
 **Validating a receipt bundle** — `tools/verify_bundle.py` (offline: signatures + commitments, no model/GPU) and
 `tools/replay_receipt.py` (byte-exact re-execution); see [docs/VALIDATING-A-BUNDLE.md](docs/VALIDATING-A-BUNDLE.md)
 for the full procedure (including reproducing a bundle on a *different* machine via `nmc_gpu_test.py replay`).
 
-Generated state/secrets, when the engine runs models, will live under `$BONSAI_NOTARY_HOME` (its own subtree),
-never in this source tree — same discipline as the Bonsai engine.
+Generated state/secrets, when the engine runs models, live OUT of this source tree under
+`~/.local/integer_inference_engine/north-mini-code` (see `src/nmc/receipts_runtime.py::STATE_HOME`) — same
+out-of-tree discipline as the Bonsai engine. Note: unlike Bonsai, north-mini-code does **not** currently read
+`$BONSAI_NOTARY_HOME`, so setting that variable relocates Bonsai's keys but not north-mini-code's secp256k1
+signing keys.

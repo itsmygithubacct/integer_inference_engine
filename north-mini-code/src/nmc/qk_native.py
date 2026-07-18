@@ -12,6 +12,23 @@ from pathlib import Path
 import numpy as np
 
 Q4_K, Q6_K = 0, 1
+_BLOCK_BYTES = {Q4_K: 144, Q6_K: 210}   # ggml superblock sizes (256 weights): Q4_K=144B, Q6_K=210B
+
+
+def _require_weight_bytes(weight_raw, out_f: int, n_blocks: int, qtype: int) -> int:
+    """Bytes the kernel will read = out_f*n_blocks*block_bytes. Validate the buffer is at least that long, so
+    a truncated/corrupt GGUF (gguf.read_raw does no length check) fails loud instead of an OOB heap read."""
+    bs = _BLOCK_BYTES.get(int(qtype))
+    if bs is None:
+        raise ValueError(f"unknown qtype {qtype} (expected Q4_K={Q4_K} or Q6_K={Q6_K})")
+    out_f, n_blocks = int(out_f), int(n_blocks)
+    if out_f <= 0 or n_blocks <= 0:
+        raise ValueError(f"out_f and n_blocks must be positive, got out_f={out_f}, n_blocks={n_blocks}")
+    need = out_f * n_blocks * bs
+    if len(weight_raw) < need:
+        raise ValueError(f"weight buffer too short: {len(weight_raw)} bytes < required {need} "
+                         f"(out_f={out_f}, n_blocks={n_blocks}, qtype={qtype}) — truncated or corrupt GGUF")
+    return need
 
 
 def _so_path() -> Path:
@@ -54,6 +71,7 @@ def qk_linear(weight_raw: bytes, x_int: np.ndarray, out_f: int, n_blocks: int, f
     x = np.ascontiguousarray(np.atleast_2d(np.asarray(x_int, dtype=np.int64)))
     T, in_f = x.shape
     assert in_f == n_blocks * 256, (in_f, n_blocks)
+    _require_weight_bytes(weight_raw, out_f, n_blocks, qtype)   # fail loud on a short buffer (no OOB read)
     wbuf = (ctypes.c_char * len(weight_raw)).from_buffer_copy(weight_raw)
     out = np.empty((T, out_f), dtype=np.int64)
     lib.qk_linear(ctypes.cast(wbuf, ctypes.c_void_p), x.ctypes.data, T, out_f, n_blocks, int(fw), int(qtype),

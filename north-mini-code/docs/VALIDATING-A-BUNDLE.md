@@ -107,8 +107,18 @@ with the pins set, `sigModelAuthenticated` / `sigCounterpartyAuthenticated` must
 ## Level 2 — byte-exact replay (re-execution)
 
 This is the heart of the claim: re-run the deterministic engine and confirm it reproduces the **signed output
-byte-for-byte**. Because the engine is deterministic integer arithmetic pinned by `modelHash`, this holds on **any
-machine, any GPU arch, or CPU** — that is the whole point of the notarized integer engine.
+byte-for-byte**. Because the engine is deterministic integer arithmetic pinned by `modelHash`, the *compute path*
+holds on **any machine, any GPU arch, or CPU** — that is the whole point of the notarized integer engine.
+
+> **One honest caveat (unlike Bonsai).** north-mini-code rebuilds its RoPE cos/sin tables at run time from libm
+> `math.cos/sin` + a float `pow` fed to `round()` (`engine._rope`), rather than reading committed tables. Those
+> tables are now bound into `modelHash` (`receipts_runtime.model_hash` hashes every row through the
+> GGUF-declared context limit, and the engine refuses positions beyond that limit), so a host whose libm rounds a
+> borderline entry differently produces a **different `modelHash`** — the divergence is *detected* as a
+> `modelHash` mismatch (fail-closed: a genuine receipt is rejected, never forged), rather than silently emitting
+> different tokens. So replay is byte-exact on any host with **matching libm rounding**; on a host that diverges,
+> the mismatch is surfaced and attributable, not silent. Committing the tables into the shipped artifact (as
+> Bonsai does) to make this by-construction is tracked follow-up work.
 
 ### On a machine you already have (with the GGUF)
 
