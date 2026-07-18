@@ -18,6 +18,7 @@
 //   I5 order-free integer reductions | mod-2^64 wrap at every stage (NO wider-than-64-bit accumulator)
 
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -82,6 +83,242 @@ __global__ void q1_linear_kernel(
     }
     if (lane == 0)
         out[t * out_f + o] = (long long)total;      // u64 -> i64 two's-complement reinterpret
+}
+
+// Qwen3.5 artifacts commit Q1 scales as int32 after the importer has proved the
+// narrowing lossless.  Keep those scales narrow on device instead of silently
+// expanding roughly 800 MiB of the 27B artifact back to int64.  The multiply
+// still explicitly widens the scale to int64 before the modulo-2^64 product,
+// so this kernel has exactly the same arithmetic contract as q1_linear_kernel.
+__global__ void q1_linear_scale32_kernel(
+        const long long* __restrict__ x,
+        const unsigned char* __restrict__ bits,
+        const int* __restrict__ scale,
+        long long tokens, long long out_f, long long n_blocks, long long frac,
+        long long* __restrict__ out)
+{
+    const long long gtid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long warp_id = gtid >> 5;
+    const int lane = (int)(threadIdx.x & 31);
+    if (warp_id >= tokens * out_f) return;
+
+    const long long t = warp_id / out_f;
+    const long long o = warp_id % out_f;
+    const long long* xrow = x + t * (n_blocks * 128);
+    const unsigned char* brow = bits + o * (n_blocks * 16);
+    const int* srow = scale + o * n_blocks;
+    unsigned long long total = 0ULL;
+    for (long long b = 0; b < n_blocks; ++b) {
+        const long long* xb = xrow + b * 128;
+        const unsigned char* bb = brow + b * 16;
+        long long lane_partial = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = lane * 4 + j;
+            const int sbit = (bb[i >> 3] >> (i & 7)) & 1;
+            lane_partial += (long long)(2 * sbit - 1) * xb[i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            lane_partial += __shfl_down_sync(0xffffffffu, lane_partial, off);
+        if (lane == 0) {
+            const unsigned long long prod =
+                (unsigned long long)lane_partial * (unsigned long long)(long long)srow[b];
+            total += (unsigned long long)arshift_i64_floor((long long)prod, frac);
+        }
+    }
+    if (lane == 0) out[t * out_f + o] = (long long)total;
+}
+
+// GPU analogue of the CPU activation-LUT kernel.  For each 8-activation byte
+// lane, commit all 256 exact subset sums once; every output row then performs
+// 16 gathers per 128-wide block instead of 128 sign/activation operations (or
+// 128 DP4A limb instructions).  The table is reused by grouped projections.
+__global__ void q1_lut_build_kernel(const long long* x, long long n_blocks,
+                                    long long* lut) {
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    const long long total=n_blocks*16*256;
+    if(i>=total)return;
+    const int mask=(int)(i&255);const long long lane=(i>>8)&15;const long long b=i>>12;
+    const long long* src=x+b*128+lane*8;unsigned long long sum=0;
+    #pragma unroll
+    for(int j=0;j<8;++j)if(mask&(1<<j))sum+=(unsigned long long)src[j];
+    lut[i]=(long long)sum;
+}
+
+__global__ void q1_lut32_build_kernel(const long long* x,long long n_blocks,int* lut,int* overflow){
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x,total=n_blocks*16*256;if(i>=total)return;
+    const int mask=(int)(i&255);const long long lane=(i>>8)&15,b=i>>12;const long long* src=x+b*128+lane*8;
+    unsigned long long us=0;for(int j=0;j<8;++j)if(mask&(1<<j))us+=(unsigned long long)src[j];
+    const long long s=(long long)us;if(s<(long long)INT_MIN||s>(long long)INT_MAX){atomicOr(overflow,1);lut[i]=0;}
+    else lut[i]=(int)s;
+}
+
+__global__ void q1_lut_apply_scale32_kernel(
+        const long long* lut,const unsigned char* bits,const int* scale,
+        long long out_f,long long n_blocks,long long frac,long long* out){
+    const long long o=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(o>=out_f)return;
+    const unsigned char* br=bits+o*n_blocks*16;const int* sr=scale+o*n_blocks;
+    unsigned long long total=0;
+    for(long long b=0;b<n_blocks;++b){
+        unsigned long long selected=0,all=0;const long long* lb=lut+b*16*256;
+        #pragma unroll
+        for(int lane=0;lane<16;++lane){selected+=(unsigned long long)lb[lane*256+br[b*16+lane]];all+=(unsigned long long)lb[lane*256+255];}
+        const long long signed_sum=(long long)(selected*2ULL-all);
+        const unsigned long long prod=(unsigned long long)signed_sum*(unsigned long long)(long long)sr[b];
+        total+=(unsigned long long)arshift_i64_floor((long long)prod,frac);
+    }
+    out[o]=(long long)total;
+}
+
+__global__ void q1_lut_apply_scale64_kernel(
+        const long long* lut,const unsigned char* bits,const long long* scale,
+        long long out_f,long long n_blocks,long long frac,long long* out){
+    const long long o=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(o>=out_f)return;
+    const unsigned char* br=bits+o*n_blocks*16;const long long* sr=scale+o*n_blocks;
+    unsigned long long total=0;
+    for(long long b=0;b<n_blocks;++b){
+        unsigned long long selected=0,all=0;const long long* lb=lut+b*16*256;
+        #pragma unroll
+        for(int lane=0;lane<16;++lane){selected+=(unsigned long long)lb[lane*256+br[b*16+lane]];all+=(unsigned long long)lb[lane*256+255];}
+        const long long signed_sum=(long long)(selected*2ULL-all);
+        const unsigned long long prod=(unsigned long long)signed_sum*(unsigned long long)sr[b];
+        total+=(unsigned long long)arshift_i64_floor((long long)prod,frac);
+    }
+    out[o]=(long long)total;
+}
+
+__global__ void q1_transpose_bits_kernel(const unsigned char* src,unsigned char* dst,
+                                         long long out_f,long long n_blocks){
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    const long long n=out_f*n_blocks*16;if(i>=n)return;
+    const long long lane=i%16,b=(i/16)%n_blocks,o=i/(16*n_blocks);
+    dst[(b*16+lane)*out_f+o]=src[i];
+}
+// BMMA layout: fixed block, then output row, then its 16 packed K bits.
+__global__ void q1_repack_bits_bmma_kernel(const unsigned char* src,unsigned char* dst,
+                                           long long out_f,long long n_blocks){
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=out_f*n_blocks*16;if(i>=n)return;
+    const long long lane=i%16,b=(i/16)%n_blocks,o=i/(16*n_blocks);
+    dst[(b*out_f+o)*16+lane]=src[i];
+}
+__global__ void q1_transpose_scale32_kernel(const int* src,int* dst,long long out_f,long long n_blocks){
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(i>=out_f*n_blocks)return;
+    const long long b=i%n_blocks,o=i/n_blocks;dst[b*out_f+o]=src[i];
+}
+
+__global__ void q1_lut_apply_scale32_transposed_kernel(
+        const long long* lut,const unsigned char* bits,const int* scale,
+        long long out_f,long long n_blocks,long long frac,long long* out){
+    const long long o=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(o>=out_f)return;
+    unsigned long long total=0;
+    for(long long b=0;b<n_blocks;++b){
+        unsigned long long selected=0,all=0;const long long* lb=lut+b*16*256;
+        #pragma unroll
+        for(int lane=0;lane<16;++lane){
+            const unsigned char wb=bits[(b*16+lane)*out_f+o];
+            selected+=(unsigned long long)lb[lane*256+wb];all+=(unsigned long long)lb[lane*256+255];
+        }
+        const long long signed_sum=(long long)(selected*2ULL-all);
+        const unsigned long long prod=(unsigned long long)signed_sum*(unsigned long long)(long long)scale[b*out_f+o];
+        total+=(unsigned long long)arshift_i64_floor((long long)prod,frac);
+    }
+    out[o]=(long long)total;
+}
+
+// Four output rows per thread exposes independent gather chains and removes
+// three quarters of loop/control overhead.  The int32 LUT is lossless only
+// after q1_lut32_build_kernel's device guard; all sums/products remain int64.
+__global__ void q1_lut32_apply_scale32_transposed_x4_kernel(
+        const int* lut,const unsigned char* bits,const int* scale,long long out_f,
+        long long n_blocks,long long frac,long long* out){
+    const long long base=((long long)blockIdx.x*blockDim.x+threadIdx.x)*4;if(base>=out_f)return;
+    unsigned long long total[4]={0,0,0,0};
+    for(long long b=0;b<n_blocks;++b){
+        unsigned long long sel[4]={0,0,0,0},all=0;const int* lb=lut+b*16*256;
+        #pragma unroll
+        for(int lane=0;lane<16;++lane){all+=(unsigned long long)(long long)lb[lane*256+255];
+            #pragma unroll
+            for(int r=0;r<4;++r)if(base+r<out_f){const unsigned char wb=bits[(b*16+lane)*out_f+base+r];
+                sel[r]+=(unsigned long long)(long long)lb[lane*256+wb];}}
+        #pragma unroll
+        for(int r=0;r<4;++r)if(base+r<out_f){const long long ss=(long long)(sel[r]*2ULL-all);
+            const unsigned long long p=(unsigned long long)ss*(unsigned long long)(long long)scale[b*out_f+base+r];
+            total[r]+=(unsigned long long)arshift_i64_floor((long long)p,frac);}
+    }
+    #pragma unroll
+    for(int r=0;r<4;++r)if(base+r<out_f)out[base+r]=(long long)total[r];
+}
+
+__global__ void q1_linear_scale32_transposed_kernel(
+        const long long* x,const unsigned char* bits,const int* scale,long long tokens,
+        long long out_f,long long n_blocks,long long frac,long long* out){
+    const long long gtid=(long long)blockIdx.x*blockDim.x+threadIdx.x,warp=gtid>>5;
+    const int lane=threadIdx.x&31;if(warp>=tokens*out_f)return;
+    const long long t=warp/out_f,o=warp%out_f;const long long* xr=x+t*n_blocks*128;
+    unsigned long long total=0;
+    for(long long b=0;b<n_blocks;++b){long long part=0;
+        #pragma unroll
+        for(int j=0;j<4;++j){const int e=lane*4+j;const unsigned char wb=bits[(b*16+(e>>3))*out_f+o];
+            part+=(long long)(2*((wb>>(e&7))&1)-1)*xr[b*128+e];}
+        #pragma unroll
+        for(int off=16;off;off>>=1)part+=__shfl_down_sync(0xffffffffu,part,off);
+        if(lane==0){const unsigned long long prod=(unsigned long long)part*(unsigned long long)(long long)scale[b*out_f+o];
+            total+=(unsigned long long)arshift_i64_floor((long long)prod,frac);}
+    }if(lane==0)out[t*out_f+o]=(long long)total;
+}
+
+// Pack one int64 activation block into four 128x8 column-major b1 tiles: tile
+// g contains bitplanes 8g..8g+7.  Two's-complement bit 31 is handled with a
+// negative coefficient during reconstruction, so the mapping is exact for the
+// entire signed int32 envelope (guarded by the caller's LUT/range policy).
+__global__ void q1_bmma_activation_kernel(const long long* x,long long n_blocks,
+                                          unsigned int* planes,int* overflow){
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x,total=n_blocks*32*4;if(i>=total)return;
+    const int word=i&3,bit=(i>>2)&31;const long long b=i>>7;unsigned int packed=0;
+    for(int j=0;j<32;++j){const long long v=x[b*128+word*32+j];
+        if(v<(long long)INT_MIN||v>(long long)INT_MAX){atomicOr(overflow,1);return;}
+        packed|=((unsigned int)(((int)v>>bit)&1))<<j;}
+    const int group=bit>>3,col=bit&7;
+    planes[((b*4+group)*8+col)*4+word]=packed;
+}
+
+__global__ void q1_bmma_apply_scale32_kernel(
+        const unsigned int* planes,const unsigned char* bits,const int* scale,
+        long long out_f,long long n_blocks,long long frac,long long* out){
+#if __CUDA_ARCH__ >= 750
+    using namespace nvcuda;
+    const int lane=threadIdx.x&31,warp_in_block=threadIdx.x>>5;
+    const long long warp=(long long)blockIdx.x*(blockDim.x/32)+warp_in_block;
+    const long long out_base=warp*8;if(out_base>=out_f)return;
+    __shared__ int smem[4][64];int* tile=smem[warp_in_block];
+    unsigned long long total=0;
+    for(long long b=0;b<n_blocks;++b){
+        wmma::fragment<wmma::matrix_a,8,8,128,wmma::experimental::precision::b1,wmma::row_major> af;
+        wmma::load_matrix_sync(af,bits+(b*out_f+out_base)*16,128);
+        int popw=0;if(lane<8){const unsigned int* wr=reinterpret_cast<const unsigned int*>(bits+(b*out_f+out_base+lane)*16);
+            popw=__popc(wr[0])+__popc(wr[1])+__popc(wr[2])+__popc(wr[3]);}
+        long long signed_sum=0;
+        #pragma unroll
+        for(int group=0;group<4;++group){
+            wmma::fragment<wmma::matrix_b,8,8,128,wmma::experimental::precision::b1,wmma::col_major> bf;
+            wmma::fragment<wmma::accumulator,8,8,128,int> cf,df;wmma::fill_fragment(cf,0);
+            wmma::load_matrix_sync(bf,planes+(b*4+group)*32,128);
+            wmma::bmma_sync(df,af,bf,cf,wmma::experimental::bmmaBitOpXOR,
+                            wmma::experimental::bmmaAccumulateOpPOPC);
+            wmma::store_matrix_sync(tile,df,8,wmma::mem_row_major);__syncwarp();
+            if(lane<8){
+                #pragma unroll
+                for(int p=0;p<8;++p){const long long term=(long long)popw-(long long)tile[lane*8+p];
+                    const int bit=group*8+p;if(bit==31)signed_sum-=term*(1LL<<31);else signed_sum+=term*(1LL<<bit);}
+            }__syncwarp();
+        }
+        if(lane<8){const unsigned long long prod=(unsigned long long)signed_sum*
+                (unsigned long long)(long long)scale[b*out_f+out_base+lane];
+            total+=(unsigned long long)arshift_i64_floor((long long)prod,frac);}
+    }
+    if(lane<8)out[out_base+lane]=(long long)total;
+#endif
 }
 
 // ---- DP4A Q1 apply (compute lever for prefill: ncu showed the int64 masked-sum is ALU-bound, dram 0.2%) ----
@@ -195,6 +432,50 @@ __global__ void q1_dp4a_warp_kernel(const signed char* __restrict__ d_limb, cons
     if (lane == 0) out[t * out_f + o] = (long long) total;
 }
 
+// DP4A resident apply for the losslessly narrowed Qwen3.5 scale layout.  This
+// is intentionally a separate kernel rather than a device-side dtype branch:
+// all warps in a launch read one known scale representation and the integer
+// instruction stream remains deterministic.
+__global__ void q1_dp4a_warp_scale32_kernel(
+        const signed char* __restrict__ d_limb, const unsigned char* __restrict__ bits,
+        const int* __restrict__ scale, long long tokens, long long out_f,
+        long long n_blocks, long long frac, int L, long long* __restrict__ out) {
+    const long long gtid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long warp_id = gtid >> 5;
+    const int lane = (int)(threadIdx.x & 31);
+    if (warp_id >= tokens * out_f) return;
+    const long long t = warp_id / out_f, o = warp_id % out_f;
+    const long long K = n_blocks * 128, TK = tokens * K;
+    const unsigned char* brow = bits + o * (n_blocks * 16);
+    const int* srow = scale + o * n_blocks;
+    unsigned long long total = 0ULL;
+    for (long long b = 0; b < n_blocks; ++b) {
+        const unsigned char wbyte = brow[b * 16 + (lane >> 1)];
+        const int bb = (lane & 1) * 4;
+        const int w0 = ((wbyte >> (bb + 0)) & 1) ? 1 : -1;
+        const int w1 = ((wbyte >> (bb + 1)) & 1) ? 1 : -1;
+        const int w2 = ((wbyte >> (bb + 2)) & 1) ? 1 : -1;
+        const int w3 = ((wbyte >> (bb + 3)) & 1) ? 1 : -1;
+        const int wpk = (w0 & 0xFF) | ((w1 & 0xFF) << 8) |
+                        ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+        const long long off = t * K + b * 128 + (long long)lane * 4;
+        long long lane_partial = 0;
+        for (int l = 0; l < L; ++l) {
+            const int dpk = *reinterpret_cast<const int*>(d_limb + (long long)l * TK + off);
+            lane_partial += ((long long)__dp4a(wpk, dpk, 0)) << (8 * l);
+        }
+        #pragma unroll
+        for (int o2 = 16; o2 > 0; o2 >>= 1)
+            lane_partial += __shfl_down_sync(0xffffffffu, lane_partial, o2);
+        if (lane == 0) {
+            const unsigned long long prod =
+                (unsigned long long)lane_partial * (unsigned long long)(long long)srow[b];
+            total += (unsigned long long)arshift_i64_floor((long long)prod, frac);
+        }
+    }
+    if (lane == 0) out[t * out_f + o] = (long long)total;
+}
+
 // ---- M2: RMSNorm (byte-exact port of bonsai_rmsnorm_i64, tools/bonsai_q1_kernel.c:173-258) ---------------
 // nvcc supports __int128 in device code (emulated), so this is a near-verbatim port: 128-bit sum-of-squares
 // (the residual stream is unbounded across 36 layers → exceeds int64), bit-exact integer isqrt, floor-division
@@ -301,6 +582,42 @@ __global__ void rmsnorm_kernel(const long long* __restrict__ x, long long rows, 
     }
     if (row_rc) row_rc[r] = local_rc;
     if (overflow && local_rc != 0) atomicOr(overflow, 1);
+}
+
+__device__ __forceinline__ unsigned long long g_isqrt_u64_fast(unsigned long long n){
+    unsigned long long res=0,bit=1ULL<<62;while(bit>n)bit>>=2;
+    while(bit){if(n>=res+bit){n-=res+bit;res=(res>>1)+bit;}else res>>=1;bit>>=2;}return res;
+}
+__device__ __forceinline__ long long g_floor_div_i64_u64(long long n,unsigned long long d){
+    if(n>=0)return (long long)((unsigned long long)n/d);
+    const unsigned long long mag=(~(unsigned long long)n)+1ULL;
+    const unsigned long long q=mag/d+(mag%d!=0);return q==(1ULL<<63)?(long long)0x8000000000000000LL:-(long long)q;
+}
+
+// Block-parallel committed-envelope RMSNorm.  It first proves every input and
+// gain fits int32 and max(x)^2*cols fits uint64; only then uses native
+// 32x32->64 products and 64-bit division.  A failed proof sets overflow and the
+// resident producer is discarded, preserving the big-int CPU oracle fallback.
+__global__ void rmsnorm_fast_i32_kernel(const long long* x,long long rows,long long cols,
+                                        long long frac,unsigned long long eps,const long long* gain,
+                                        long long* out,int* overflow){
+    const long long r=blockIdx.x;if(r>=rows)return;const int tid=threadIdx.x;
+    __shared__ unsigned long long ss[256],mm[256];__shared__ unsigned long long rms;__shared__ int bad;
+    unsigned long long local_s=0,local_m=0;int local_bad=0;const long long* row=x+r*cols;
+    for(long long i=tid;i<cols;i+=blockDim.x){const long long v=row[i];
+        if(v<INT_MIN||v>INT_MAX)local_bad=1;const long long a=v<0?-v:v;if((unsigned long long)a>local_m)local_m=(unsigned long long)a;}
+    ss[tid]=0;mm[tid]=local_m;if(tid==0)bad=0;__syncthreads();if(local_bad)atomicOr(&bad,1);
+    for(int off=blockDim.x/2;off;off>>=1){__syncthreads();if(tid<off&&mm[tid+off]>mm[tid])mm[tid]=mm[tid+off];}
+    __syncthreads();if(tid==0&&mm[0]&&mm[0]*mm[0]>ULLONG_MAX/(unsigned long long)cols)bad=1;__syncthreads();
+    if(!bad){for(long long i=tid;i<cols;i+=blockDim.x){const long long v=row[i];local_s+=(unsigned long long)(v*v);}ss[tid]=local_s;}
+    __syncthreads();for(int off=blockDim.x/2;off;off>>=1){if(tid<off)ss[tid]+=ss[tid+off];__syncthreads();}
+    if(tid==0&&!bad){unsigned long long mean=ss[0]/(unsigned long long)cols;
+        if(mean>ULLONG_MAX-eps)bad=1;else{mean+=eps;rms=g_isqrt_u64_fast(mean);if(!rms)bad=1;}}
+    __syncthreads();if(bad){if(tid==0)atomicOr(overflow,1);return;}
+    const long long fp=1LL<<frac;long long* dst=out+r*cols;
+    for(long long i=tid;i<cols;i+=blockDim.x){const long long n=g_floor_div_i64_u64(row[i]*fp,rms);long long y=n;
+        if(gain){const long long gg=gain[i];if(n<INT_MIN||n>INT_MAX||gg<INT_MIN||gg>INT_MAX){atomicOr(overflow,1);continue;}
+            y=arshift_i64_floor(n*gg,frac);}dst[i]=y;}
 }
 
 // ---- M3: prefill attention (byte-exact port of bonsai_attention_prefill_i64, bonsai_q1_kernel.c:1060) ----
@@ -477,6 +794,317 @@ __global__ void add_kernel(const long long* __restrict__ a, const long long* __r
     out[i] = g_u64_to_i64((unsigned long long) a[i] + (unsigned long long) b[i]);
 }
 
+// ---- Qwen3.5 recurrent primitive parity rung -----------------------------------------------------------
+// These kernels implement one M=1 Gated DeltaNet update while keeping the
+// canonical Q30 state on device.  They are also used as the arithmetic core of
+// the resident hybrid executor; the standalone host ABI below is a small,
+// independently testable parity rung.
+
+__device__ __forceinline__ long long g_sigmoid_fixed(long long xi, long long frac,
+                                                      long long log2e, long long d_clip) {
+    const long long m = xi > 0 ? xi : 0;
+    long long d0 = m;
+    long long d1 = g_u64_to_i64((unsigned long long)m - (unsigned long long)xi);
+    if (d0 > d_clip) d0 = d_clip;
+    if (d1 > d_clip) d1 = d_clip;
+    const long long e0 = g_exp2_neg_fixed((d0 * log2e) >> frac, frac);
+    const long long e1 = g_exp2_neg_fixed((d1 * log2e) >> frac, frac);
+    const long long denom = e0 + e1;
+    return denom ? ((e1 << frac) / denom) : 0;
+}
+
+__device__ __forceinline__ long long g_lut_interp(const long long* lut, long long n,
+                                                   long long x, long long minimum,
+                                                   long long step) {
+    const long long maximum = minimum + step * (n - 1);
+    if (x <= minimum) return lut[0];
+    if (x >= maximum) return lut[n - 1];
+    const long long pos = x - minimum;
+    long long idx = pos / step;
+    if (idx > n - 2) idx = n - 2;
+    const long long rem = pos - idx * step;
+    return lut[idx] + ((lut[idx + 1] - lut[idx]) * rem) / step;
+}
+
+// Exact integer L2 norm, one CUDA thread per row.  Qwen3.5 key/state width is
+// 128; a u128 accumulator covers the committed envelope and reports overflow.
+__global__ void bonsai35_l2norm_kernel(const long long* x, long long rows, long long cols,
+                                       long long frac, long long* out, int* overflow) {
+    const long long r = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows || *overflow) return;
+    const long long* src = x + r * cols;
+    long long* dst = out + r * cols;
+    unsigned __int128 ssq = 0;
+    for (long long i = 0; i < cols; ++i) {
+        if (!g_add_square_u128(&ssq, src[i])) { atomicOr(overflow, 1); return; }
+    }
+    const unsigned long long norm = g_isqrt_u128(ssq);
+    if (!norm) {
+        for (long long i = 0; i < cols; ++i) dst[i] = 0;
+        return;
+    }
+    const __int128 fp = (__int128)1 << frac;
+    for (long long i = 0; i < cols; ++i) {
+        const __int128 q = g_floor_div_i128_u64((__int128)src[i] * fp, norm);
+        if (!g_i128_to_i64(q, &dst[i])) { atomicOr(overflow, 1); return; }
+    }
+}
+
+__global__ void bonsai35_controls_kernel(
+        const long long* alpha, const long long* beta, const long long* dt_bias,
+        const long long* ssm_a, const long long* soft_lut, long long soft_n,
+        const long long* exp_lut, long long exp_n, long long value_heads,
+        long long frac, long long log2e, long long d_clip,
+        long long soft_min, long long soft_step, long long soft_max,
+        long long exp_min, long long exp_step,
+        long long* beta_out, long long* decay_out, int* overflow) {
+    const long long h = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= value_heads || *overflow) return;
+    beta_out[h] = g_sigmoid_fixed(beta[h], frac, log2e, d_clip);
+    const long long ax = g_u64_to_i64((unsigned long long)alpha[h] + (unsigned long long)dt_bias[h]);
+    long long soft;
+    if (ax <= soft_min) soft = 0;
+    else if (ax >= soft_max) soft = ax;
+    else soft = g_lut_interp(soft_lut, soft_n, ax, soft_min, soft_step);
+    const long long gate = arshift_i64_floor(
+        g_u64_to_i64((unsigned long long)soft * (unsigned long long)ssm_a[h]), frac);
+    if (gate > 0) { atomicOr(overflow, 1); return; }
+    const long long fp = (long long)1 << frac;
+    long long decay;
+    if (gate <= exp_min) decay = 0;
+    else if (gate >= 0) decay = fp;
+    else decay = g_lut_interp(exp_lut, exp_n, gate, exp_min, exp_step);
+    decay_out[h] = decay;
+}
+
+// One block per value head, 128 threads.  Each thread owns one state/output
+// column j, so the two synchronization points exactly separate prediction,
+// outer update, and output contraction without atomics or changed shifts.
+__global__ void bonsai35_state_step_kernel(
+        const long long* q_key, const long long* k_key, const long long* v,
+        const long long* beta, const long long* decay, long long* state,
+        long long value_heads, long long key_heads, long long state_size,
+        long long frac, long long state_frac, long long gdn_scale,
+        long long* output) {
+    const long long h = blockIdx.x;
+    const long long j = threadIdx.x;
+    __shared__ long long delta[128];
+    if (h >= value_heads) return;
+    const bool active = j < state_size;
+    const long long kh = h % key_heads;
+    const long long* q = q_key + kh * state_size;
+    const long long* k = k_key + kh * state_size;
+    long long* st = state + h * state_size * state_size;
+    long long pred = 0;
+    if (active) {
+        unsigned long long acc = 0;
+        for (long long i = 0; i < state_size; ++i) {
+            const size_t off = (size_t)i * state_size + j;
+            st[off] = arshift_i64_floor(
+                g_u64_to_i64((unsigned long long)st[off] * (unsigned long long)decay[h]), frac);
+            acc += (unsigned long long)st[off] * (unsigned long long)k[i];
+        }
+        pred = arshift_i64_floor((long long)acc, state_frac);
+        const long long diff = g_u64_to_i64((unsigned long long)v[h * state_size + j] -
+                                            (unsigned long long)pred);
+        delta[j] = arshift_i64_floor(
+            g_u64_to_i64((unsigned long long)diff * (unsigned long long)beta[h]), frac);
+    }
+    __syncthreads();
+    if (active) {
+        const long long outer_shift = 2 * frac - state_frac;
+        for (long long i = 0; i < state_size; ++i) {
+            const long long add = arshift_i64_floor(
+                g_u64_to_i64((unsigned long long)k[i] * (unsigned long long)delta[j]), outer_shift);
+            const size_t off = (size_t)i * state_size + j;
+            st[off] = g_u64_to_i64((unsigned long long)st[off] + (unsigned long long)add);
+        }
+    }
+    __syncthreads();
+    if (active) {
+        unsigned long long acc = 0;
+        for (long long i = 0; i < state_size; ++i)
+            acc += (unsigned long long)st[(size_t)i * state_size + j] * (unsigned long long)q[i];
+        const long long score = arshift_i64_floor((long long)acc, frac);
+        output[h * state_size + j] = arshift_i64_floor(
+            g_u64_to_i64((unsigned long long)score * (unsigned long long)gdn_scale), frac);
+    }
+}
+
+// Guarded narrow-storage variant for sm_86.  The canonical Q30 state is stored
+// as int32 only while every value fits; each multiply is still an exact signed
+// 32x32->64 product followed by the canonical floor shift.  This avoids the
+// RTX 3070's very slow emulated 64x64 integer multiply.  Any escape sets the
+// poison flag and the whole GPU context is discarded/replayed on CPU.
+__global__ void bonsai35_state_step_i32_kernel(
+        const long long* q_key,const long long* k_key,const long long* v,
+        const long long* beta,const long long* decay,int* state,
+        long long value_heads,long long key_heads,long long state_size,
+        long long frac,long long state_frac,long long gdn_scale,
+        long long* output,int* overflow){
+    const long long h=blockIdx.x,j=threadIdx.x;__shared__ int delta[128];
+    if(h>=value_heads)return;const bool active=j<state_size;const long long kh=h%key_heads;
+    const long long* q=q_key+kh*state_size;const long long* k=k_key+kh*state_size;
+    int* st=state+(size_t)h*state_size*state_size;unsigned long long acc=0;
+    if(active){
+        const long long kv=k[j]; // touch one element for a uniform head-range guard below
+        if(kv<INT_MIN||kv>INT_MAX||decay[h]<INT_MIN||decay[h]>INT_MAX)atomicOr(overflow,1);
+        const int dec=(int)decay[h];
+        for(long long i=0;i<state_size;++i){const size_t off=(size_t)i*state_size+j;
+            const long long ki=k[i];if(ki<INT_MIN||ki>INT_MAX){atomicOr(overflow,1);continue;}
+            const long long nv=arshift_i64_floor((long long)st[off]*(long long)dec,frac);
+            if(nv<INT_MIN||nv>INT_MAX){atomicOr(overflow,1);continue;}st[off]=(int)nv;
+            acc+=(unsigned long long)((long long)st[off]*(long long)(int)ki);
+        }
+        const long long pred=arshift_i64_floor((long long)acc,state_frac);
+        const long long vv=v[h*state_size+j],bb=beta[h];
+        if(vv<INT_MIN||vv>INT_MAX||bb<INT_MIN||bb>INT_MAX){atomicOr(overflow,1);delta[j]=0;}
+        else{const long long diff=g_u64_to_i64((unsigned long long)vv-(unsigned long long)pred);
+            if(diff<INT_MIN||diff>INT_MAX){atomicOr(overflow,1);delta[j]=0;}
+            else{const long long dd=arshift_i64_floor(diff*(long long)(int)bb,frac);
+                if(dd<INT_MIN||dd>INT_MAX){atomicOr(overflow,1);delta[j]=0;}else delta[j]=(int)dd;}}
+    }
+    __syncthreads();
+    if(active){const long long outer_shift=2*frac-state_frac;
+        for(long long i=0;i<state_size;++i){const long long ki=k[i];if(ki<INT_MIN||ki>INT_MAX)continue;
+            const long long add=arshift_i64_floor((long long)(int)ki*(long long)delta[j],outer_shift);
+            const long long nv=(long long)st[(size_t)i*state_size+j]+add;
+            if(nv<INT_MIN||nv>INT_MAX){atomicOr(overflow,1);continue;}st[(size_t)i*state_size+j]=(int)nv;}}
+    __syncthreads();
+    if(active){acc=0;for(long long i=0;i<state_size;++i){const long long qi=q[i];
+            if(qi<INT_MIN||qi>INT_MAX){atomicOr(overflow,1);continue;}
+            acc+=(unsigned long long)((long long)st[(size_t)i*state_size+j]*(long long)(int)qi);}
+        const long long score=arshift_i64_floor((long long)acc,frac);
+        output[h*state_size+j]=arshift_i64_floor(
+            g_u64_to_i64((unsigned long long)score*(unsigned long long)gdn_scale),frac);}
+}
+
+// Exact modulo-2^64 signed i64*i32 using only native 32-bit multiplies.  This
+// retains the canonical int64 Q30 state when it grows beyond int32 without
+// falling back to sm_86's expensive general 64x64 multiply sequence.
+__device__ __forceinline__ long long g_mul_i64_i32_wrap(long long a,int b){
+    const unsigned long long ua=(unsigned long long)a;const unsigned int alo=(unsigned int)ua;
+    const unsigned int ahi=(unsigned int)(ua>>32),blo=(unsigned int)b;
+    unsigned long long p=(unsigned long long)alo*(unsigned long long)blo;
+    unsigned int cross=ahi*blo;if(b<0)cross+=(unsigned int)(0U-alo);
+    p+=(unsigned long long)cross<<32;return (long long)p;
+}
+
+__global__ void bonsai35_state_step_wide32_kernel(
+        const long long* q_key,const long long* k_key,const long long* v,
+        const long long* beta,const long long* decay,long long* state,
+        long long value_heads,long long key_heads,long long state_size,
+        long long frac,long long state_frac,long long gdn_scale,
+        long long* output,int* overflow){
+    const long long h=blockIdx.x,j=threadIdx.x;__shared__ long long delta[128];
+    if(h>=value_heads)return;const bool active=j<state_size;const long long kh=h%key_heads;
+    const long long* q=q_key+kh*state_size;const long long* k=k_key+kh*state_size;
+    long long* st=state+(size_t)h*state_size*state_size;unsigned long long acc=0;
+    if(active){
+        if(decay[h]<INT_MIN||decay[h]>INT_MAX||beta[h]<INT_MIN||beta[h]>INT_MAX)atomicOr(overflow,1);
+        const int dec=(int)decay[h];
+        for(long long i=0;i<state_size;++i){const size_t off=(size_t)i*state_size+j;const long long ki=k[i];
+            if(ki<INT_MIN||ki>INT_MAX){atomicOr(overflow,1);continue;}
+            st[off]=arshift_i64_floor(g_mul_i64_i32_wrap(st[off],dec),frac);
+            acc+=(unsigned long long)g_mul_i64_i32_wrap(st[off],(int)ki);}
+        const long long pred=arshift_i64_floor((long long)acc,state_frac);
+        const long long diff=g_u64_to_i64((unsigned long long)v[h*state_size+j]-(unsigned long long)pred);
+        delta[j]=arshift_i64_floor(g_mul_i64_i32_wrap(diff,(int)beta[h]),frac);
+    }
+    __syncthreads();
+    if(active){const long long outer_shift=2*frac-state_frac;
+        for(long long i=0;i<state_size;++i){const long long ki=k[i];if(ki<INT_MIN||ki>INT_MAX)continue;
+            const long long add=arshift_i64_floor(g_mul_i64_i32_wrap(delta[j],(int)ki),outer_shift);
+            st[(size_t)i*state_size+j]=g_u64_to_i64((unsigned long long)st[(size_t)i*state_size+j]+(unsigned long long)add);}}
+    __syncthreads();
+    if(active){acc=0;for(long long i=0;i<state_size;++i){const long long qi=q[i];
+            if(qi<INT_MIN||qi>INT_MAX){atomicOr(overflow,1);continue;}
+            acc+=(unsigned long long)g_mul_i64_i32_wrap(st[(size_t)i*state_size+j],(int)qi);}
+        const long long score=arshift_i64_floor((long long)acc,frac);
+        output[h*state_size+j]=arshift_i64_floor(
+            g_mul_i64_i32_wrap(score,(int)gdn_scale),frac);}
+}
+
+__global__ void bonsai35_split_qgate_kernel(const long long* qg, long long* q,
+                                             long long* gate, long long H, long long hd) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= H * hd) return;
+    const long long h = i / hd, e = i % hd;
+    q[i] = qg[(h * 2) * hd + e];
+    gate[i] = qg[(h * 2 + 1) * hd + e];
+}
+
+// Qwen3.5 text IMRoPE is a NeoX rotate-half over only the first n_rot
+// channels.  cos/sin contain n_rot/2 entries for this absolute position.
+__global__ void bonsai35_partial_rope_kernel(long long* x, const long long* cos,
+                                              const long long* sin, long long rows,
+                                              long long hd, long long n_rot, long long frac) {
+    const long long r = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const long long half = n_rot / 2;
+    long long* row = x + r * hd;
+    for (long long e = 0; e < half; ++e) {
+        const long long x0 = row[e], x1 = row[half + e];
+        row[e] = arshift_i64_floor(g_u64_to_i64(
+            (unsigned long long)x0 * (unsigned long long)cos[e] -
+            (unsigned long long)x1 * (unsigned long long)sin[e]), frac);
+        row[half + e] = arshift_i64_floor(g_u64_to_i64(
+            (unsigned long long)x0 * (unsigned long long)sin[e] +
+            (unsigned long long)x1 * (unsigned long long)cos[e]), frac);
+    }
+}
+
+__global__ void bonsai35_sigmoid_gate_kernel(const long long* x, const long long* gate,
+                                              long long* out, long long n, long long frac,
+                                              long long log2e, long long d_clip) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long sig = g_sigmoid_fixed(gate[i], frac, log2e, d_clip);
+    out[i] = arshift_i64_floor(g_u64_to_i64(
+        (unsigned long long)x[i] * (unsigned long long)sig), frac);
+}
+
+__global__ void bonsai35_partial_rope_pos_kernel(long long* x, const long long* pos,
+                                                  const long long* cos_table,
+                                                  const long long* sin_table,
+                                                  long long rows, long long hd,
+                                                  long long n_rot, long long frac) {
+    const long long r = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const long long half = n_rot / 2;
+    const long long* c = cos_table + (*pos) * half;
+    const long long* s = sin_table + (*pos) * half;
+    long long* row = x + r * hd;
+    for (long long e = 0; e < half; ++e) {
+        const long long x0=row[e],x1=row[half+e];
+        row[e]=arshift_i64_floor(g_u64_to_i64(
+            (unsigned long long)x0*(unsigned long long)c[e]-
+            (unsigned long long)x1*(unsigned long long)s[e]),frac);
+        row[half+e]=arshift_i64_floor(g_u64_to_i64(
+            (unsigned long long)x0*(unsigned long long)s[e]+
+            (unsigned long long)x1*(unsigned long long)c[e]),frac);
+    }
+}
+
+// Depthwise width-k convolution for a single recurrent decode token.  History
+// is [slot,k-1,conv_dim], oldest first; update and output are independent per
+// channel, so one thread performs both without a global synchronization.
+__global__ void bonsai35_conv_decode_kernel(
+        const long long* qkv, long long* history, const long long* weight,
+        long long slot, long long conv_dim, long long conv_k, long long frac,
+        long long* out) {
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=conv_dim)return;
+    long long* hist=history+(size_t)slot*(conv_k-1)*conv_dim;
+    unsigned long long acc=0;
+    for(long long j=0;j<conv_k-1;++j)
+        acc+=(unsigned long long)hist[j*conv_dim+i]*(unsigned long long)weight[i*conv_k+j];
+    acc+=(unsigned long long)qkv[i]*(unsigned long long)weight[i*conv_k+conv_k-1];
+    out[i]=arshift_i64_floor((long long)acc,frac);
+    for(long long j=0;j<conv_k-2;++j)hist[j*conv_dim+i]=hist[(j+1)*conv_dim+i];
+    hist[(conv_k-2)*conv_dim+i]=qkv[i];
+}
+
 // maxabs over each kv's (L,hd) block of a (Hkv, L, hd) tensor -> maxout[kv]. One thread per kv.
 __global__ void maxabs_per_kv_kernel(const long long* __restrict__ p, long long Hkv, long long L, long long hd,
                                      unsigned long long* __restrict__ maxout) {
@@ -577,6 +1205,279 @@ __global__ void attention_decode_batched_kernel(
     }
 }
 
+// Exact block-parallel M=1 decode attention for Qwen3.5.  One block owns one
+// query head for every phase, so score/max/Z/probability/output ordering has no
+// cross-block race.  The existing triangle guards prove every qK and pV sum
+// fits signed int64; integer addition is therefore associative and the warp /
+// block reduction order is byte-identical to the serial oracle.  Scores and V
+// sums still traverse their contracted dimensions in exact integer space—no
+// float, rescaling, or changed floor point is introduced.
+static constexpr long long Q35_ATTN_PARALLEL_MIN_L = 32;
+static constexpr int Q35_ATTN_TPB = 256;
+
+__device__ __forceinline__ unsigned long long q35_abs_i64(long long value) {
+    return value < 0
+        ? ((unsigned long long)(~(unsigned long long)value) + 1ULL)
+        : (unsigned long long)value;
+}
+
+// Parallel full-cache maxabs for the standalone parity ABI.  The resident
+// graph does not call this: its monotone max is updated from only the appended
+// K/V row below.
+__global__ void maxabs_bkv_parallel_kernel(
+        const long long* __restrict__ cache,
+        const long long* __restrict__ lengths,
+        long long B, long long Hkv, long long hd, long long cap,
+        unsigned long long* __restrict__ out) {
+    const long long gid = (long long)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    if (gid >= B * Hkv) return;
+    const long long b = gid / Hkv, kv = gid % Hkv, Lv = lengths[b];
+    const long long* base = cache + (b * Hkv + kv) * cap * hd;
+    __shared__ unsigned long long reduction[Q35_ATTN_TPB];
+    unsigned long long local = 0;
+    const long long count = Lv * hd;
+    for (long long i = tid; i < count; i += blockDim.x) {
+        const unsigned long long value = q35_abs_i64(base[i]);
+        if (value > local) local = value;
+    }
+    reduction[tid] = local;
+    __syncthreads();
+    for (int stride = Q35_ATTN_TPB / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && reduction[tid + stride] > reduction[tid])
+            reduction[tid] = reduction[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[gid] = reduction[0];
+}
+
+// Resident cache guard maxima are monotone: each decode appends exactly one
+// row per attention layer/KV head.  Updating from that row avoids rescanning
+// roughly a GiB of K/V cache data per 4K token across the 16 full layers.
+__global__ void q35_update_maxabs_rows_kernel(
+        const long long* __restrict__ rows, long long Hkv, long long hd,
+        unsigned long long* __restrict__ persistent_max,
+        const int* __restrict__ overflow) {
+    const long long kv = (long long)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    if (kv >= Hkv) return;
+    __shared__ int abort_block;
+    if (tid == 0) abort_block = atomicAdd((int*)overflow, 0);
+    __syncthreads();
+    if (abort_block) return;
+    __shared__ unsigned long long reduction[Q35_ATTN_TPB];
+    unsigned long long local = 0;
+    const long long* row = rows + kv * hd;
+    for (long long d = tid; d < hd; d += blockDim.x) {
+        const unsigned long long value = q35_abs_i64(row[d]);
+        if (value > local) local = value;
+    }
+    reduction[tid] = local;
+    __syncthreads();
+    for (int stride = Q35_ATTN_TPB / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && reduction[tid + stride] > reduction[tid])
+            reduction[tid] = reduction[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0 && reduction[0] > persistent_max[kv])
+        persistent_max[kv] = reduction[0];
+}
+
+template <typename CacheT>
+__global__ void attention_decode_m1_parallel_kernel(
+        const long long* __restrict__ q,
+        const CacheT* __restrict__ Kc,
+        const CacheT* __restrict__ Vc,
+        const long long* __restrict__ lengths,
+        long long B, long long H, long long Hkv, long long hd, long long cap,
+        long long frac, long long inv_sqrt_fp, long long log2e, long long d_clip,
+        const unsigned long long* __restrict__ maxk,
+        const unsigned long long* __restrict__ maxv,
+        long long* __restrict__ out,
+        long long* __restrict__ scratch,
+        int* __restrict__ overflow) {
+    const long long gid = (long long)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    if (gid >= B * H) return;
+    const long long b = gid / H, h = gid % H;
+    const long long rep = H / Hkv, kv = h / rep, Lv = lengths[b];
+    const long long* qh = q + gid * hd;
+    const CacheT* Kb = Kc + (b * Hkv + kv) * cap * hd;
+    const CacheT* Vb = Vc + (b * Hkv + kv) * cap * hd;
+    long long* sc = scratch + gid * cap;
+    long long* oh = out + gid * hd;
+    const unsigned __int128 i64max =
+        (unsigned __int128)0x7fffffffffffffffULL;
+
+    __shared__ unsigned long long reduction_u[Q35_ATTN_TPB];
+    __shared__ long long warp_max[Q35_ATTN_TPB / 32];
+    __shared__ long long score_max;
+    __shared__ unsigned long long Z_shared;
+    __shared__ int abort_block;
+    if (tid == 0) abort_block = (atomicAdd(overflow, 0) != 0);
+    __syncthreads();
+    if (abort_block) return;
+    if (Lv <= 0) {
+        for (long long d = tid; d < hd; d += blockDim.x) oh[d] = 0;
+        return;
+    }
+
+    // The tiny-cache path avoids reduction barriers.  All lanes take the same
+    // branch; only lane zero executes the original serial arithmetic.
+    if (Lv < Q35_ATTN_PARALLEL_MIN_L) {
+        if (tid != 0) return;
+        unsigned long long maxq = 0;
+        for (long long d = 0; d < hd; ++d) {
+            const unsigned long long value = q35_abs_i64(qh[d]);
+            if (value > maxq) maxq = value;
+        }
+        if ((unsigned __int128)maxq * (unsigned __int128)maxk[b * Hkv + kv]
+                > i64max / (unsigned __int128)hd) {
+            atomicOr(overflow, 1); return;
+        }
+        long long mx = (long long)0x8000000000000000ULL;
+        for (long long j = 0; j < Lv; ++j) {
+            long long dot = 0;
+            for (long long d = 0; d < hd; ++d) dot += qh[d] * Kb[j * hd + d];
+            long long score = arshift_i64_floor(dot, frac);
+            score = arshift_i64_floor(score * inv_sqrt_fp, frac);
+            sc[j] = score;
+            if (score > mx) mx = score;
+        }
+        long long Z = 0;
+        for (long long j = 0; j < Lv; ++j) {
+            long long delta = mx - sc[j];
+            if (delta > d_clip) delta = d_clip;
+            const long long u = (delta * log2e) >> frac;
+            const long long e = g_exp2_neg_fixed(u, frac);
+            sc[j] = e; Z += e;
+        }
+        for (long long j = 0; j < Lv; ++j)
+            sc[j] = Z ? ((sc[j] << frac) / Z) : 0;
+        unsigned long long maxp = 0;
+        for (long long j = 0; j < Lv; ++j) {
+            const unsigned long long value = q35_abs_i64(sc[j]);
+            if (value > maxp) maxp = value;
+        }
+        if ((unsigned __int128)maxp * (unsigned __int128)maxv[b * Hkv + kv]
+                > i64max / (unsigned __int128)Lv) {
+            atomicOr(overflow, 1); return;
+        }
+        for (long long d = 0; d < hd; ++d) {
+            long long acc = 0;
+            for (long long j = 0; j < Lv; ++j) acc += sc[j] * Vb[j * hd + d];
+            oh[d] = arshift_i64_floor(acc, frac);
+        }
+        return;
+    }
+
+    // q maxabs and the exact pre-dot guard.
+    unsigned long long local_maxq = 0;
+    for (long long d = tid; d < hd; d += blockDim.x) {
+        const unsigned long long value = q35_abs_i64(qh[d]);
+        if (value > local_maxq) local_maxq = value;
+    }
+    reduction_u[tid] = local_maxq;
+    __syncthreads();
+    for (int stride = Q35_ATTN_TPB / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && reduction_u[tid + stride] > reduction_u[tid])
+            reduction_u[tid] = reduction_u[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        abort_block = ((unsigned __int128)reduction_u[0]
+            * (unsigned __int128)maxk[b * Hkv + kv]
+            > i64max / (unsigned __int128)hd);
+        if (abort_block) atomicOr(overflow, 1);
+    }
+    __syncthreads();
+    if (abort_block) return;
+
+    // Eight warps compute eight positions concurrently.  Lanes cover head
+    // dimensions, giving coalesced K loads; every per-score dot is an exact
+    // in-range integer tree reduction under the guard above.
+    const int lane = tid & 31, warp = tid >> 5;
+    long long local_score_max = (long long)0x8000000000000000ULL;
+    for (long long j = warp; j < Lv; j += Q35_ATTN_TPB / 32) {
+        long long dot = 0;
+        for (long long d = lane; d < hd; d += 32)
+            dot += qh[d] * Kb[j * hd + d];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        if (lane == 0) {
+            long long score = arshift_i64_floor(dot, frac);
+            score = arshift_i64_floor(score * inv_sqrt_fp, frac);
+            sc[j] = score;
+            if (score > local_score_max) local_score_max = score;
+        }
+    }
+    if (lane == 0) warp_max[warp] = local_score_max;
+    __syncthreads();
+    if (tid == 0) {
+        long long mx = warp_max[0];
+        for (int w = 1; w < Q35_ATTN_TPB / 32; ++w)
+            if (warp_max[w] > mx) mx = warp_max[w];
+        score_max = mx;
+    }
+    __syncthreads();
+
+    // Integer exp polynomial and positive exact normalization.  Z is bounded
+    // by L*2^frac (<=2^41 for the supported frac<=29/L<=4096), so its tree sum
+    // is exact and independent of reduction order.
+    unsigned long long local_Z = 0;
+    for (long long j = tid; j < Lv; j += blockDim.x) {
+        long long delta = score_max - sc[j];
+        if (delta > d_clip) delta = d_clip;
+        const long long u = (delta * log2e) >> frac;
+        const long long e = g_exp2_neg_fixed(u, frac);
+        sc[j] = e;
+        local_Z += (unsigned long long)e;
+    }
+    reduction_u[tid] = local_Z;
+    __syncthreads();
+    for (int stride = Q35_ATTN_TPB / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduction_u[tid] += reduction_u[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) Z_shared = reduction_u[0];
+    __syncthreads();
+
+    unsigned long long local_maxp = 0;
+    for (long long j = tid; j < Lv; j += blockDim.x) {
+        const unsigned long long e = (unsigned long long)sc[j];
+        const long long probability = Z_shared
+            ? (long long)((e << frac) / Z_shared) : 0;
+        sc[j] = probability;
+        const unsigned long long value = q35_abs_i64(probability);
+        if (value > local_maxp) local_maxp = value;
+    }
+    reduction_u[tid] = local_maxp;
+    __syncthreads();
+    for (int stride = Q35_ATTN_TPB / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && reduction_u[tid + stride] > reduction_u[tid])
+            reduction_u[tid] = reduction_u[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        abort_block = ((unsigned __int128)reduction_u[0]
+            * (unsigned __int128)maxv[b * Hkv + kv]
+            > i64max / (unsigned __int128)Lv);
+        if (abort_block) atomicOr(overflow, 1);
+    }
+    __syncthreads();
+    if (abort_block) return;
+
+    // Dimensions are independent and coalesced across a warp.  Each thread
+    // retains ascending-position accumulation, exactly matching the oracle.
+    for (long long d = tid; d < hd; d += blockDim.x) {
+        long long acc = 0;
+        for (long long j = 0; j < Lv; ++j)
+            acc += sc[j] * Vb[j * hd + d];
+        oh[d] = arshift_i64_floor(acc, frac);
+    }
+}
+
 // Per-sequence-position RoPE for decode: x (B, Hh, hd), each sequence b at absolute position pos[b].
 __global__ void rope_decode_kernel(long long* __restrict__ x, const long long* __restrict__ pos,
                                    const long long* __restrict__ cos, const long long* __restrict__ sin,
@@ -606,6 +1507,84 @@ __global__ void kv_append_kernel(const long long* __restrict__ src, long long* _
     cache[((b * Hkv + kv) * cap + pos[b]) * hd + e] = src[(b * Hkv + kv) * hd + e];
 }
 
+// Qwen3.5 K/V values are Q16 and normally narrow by orders of magnitude, but
+// narrowing is never assumed.  The preflight and commit are separate kernels
+// in one stream: preflight examines BOTH complete rows and performs no writes;
+// commit observes its completed flag before writing either cache.  Thus one
+// unsafe lane cannot leave safe lanes partially appended.  The poisoned graph
+// is discarded and replayed on the canonical int64 CPU path.
+__global__ void q35_kv_i32_preflight_pair_kernel(
+        const long long* __restrict__ k, const long long* __restrict__ v,
+        long long n, int* __restrict__ overflow) {
+    const long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n) return;
+    const long long kval = k[gid], vval = v[gid];
+    if (kval < (long long)INT_MIN || kval > (long long)INT_MAX ||
+        vval < (long long)INT_MIN || vval > (long long)INT_MAX)
+        atomicOr(overflow, 1);
+}
+
+__global__ void q35_kv_i32_commit_pair_kernel(
+        const long long* __restrict__ k, const long long* __restrict__ v,
+        int* __restrict__ K, int* __restrict__ V,
+        const long long* __restrict__ pos, long long Hkv, long long hd,
+        long long cap, const int* __restrict__ overflow) {
+    __shared__ int abort_block;
+    if (threadIdx.x == 0) abort_block = atomicAdd((int*)overflow, 0);
+    __syncthreads();
+    if (abort_block) return;
+    const long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= Hkv * hd) return;
+    const long long kv = gid / hd, d = gid % hd;
+    const size_t dst = ((size_t)kv * cap + *pos) * hd + d;
+    K[dst] = (int)k[gid];
+    V[dst] = (int)v[gid];
+}
+
+__global__ void q35_narrow_i32_guard_kernel(
+        const long long* __restrict__ src, int* __restrict__ dst,
+        long long n, int* __restrict__ overflow) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long value = src[i];
+    if (value < (long long)INT_MIN || value > (long long)INT_MAX) {
+        atomicOr(overflow, 1);
+        return;
+    }
+    dst[i] = (int)value;
+}
+
+__global__ void q35_widen_i32_kernel(
+        const int* __restrict__ src, long long* __restrict__ dst, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (long long)src[i];
+}
+
+// Select one row from a resident BMMA-layout Q1 embedding table.  The only
+// token-dependent host input is the 8-byte ID.  Bits are laid out
+// (block,out,row-byte) and int32 scales (block,out), exactly as registered by
+// bonsai_q1_register_weight_i32_bmma.  Dequantization is integer sign*scale,
+// identical to reference_bonsai.q1_rows_fp and independent of frac.
+__global__ void q35_embedding_row_bmma_kernel(
+        const unsigned char* __restrict__ bits,
+        const int* __restrict__ scales,
+        long long vocab, long long n_blocks,
+        const long long* __restrict__ token,
+        long long* __restrict__ out, int* __restrict__ overflow) {
+    const long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long d = n_blocks * 128;
+    if (e >= d) return;
+    const long long tok = *token;
+    if (tok < 0 || tok >= vocab) {
+        if (e == 0) atomicOr(overflow, 1);
+        return;
+    }
+    const long long block = e >> 7, within = e & 127;
+    const unsigned char packed = bits[(block * vocab + tok) * 16 + (within >> 3)];
+    const long long scale = (long long)scales[block * vocab + tok];
+    out[e] = ((packed >> (within & 7)) & 1) ? scale : -scale;
+}
+
 // Seed sequence b's prefilled KV into the padded decode cache: src (n_layers,Hkv,Lb,hd) -> cache
 // (n_layers,B,Hkv,cap,hd) at [li,b,kv,0..Lb). One thread per (li,kv,j<Lb,e).
 __global__ void kv_seed_kernel(const long long* __restrict__ src, long long* __restrict__ cache, long long b,
@@ -627,14 +1606,53 @@ namespace {
 struct ResidentWeight {
     unsigned char* dbits;
     long long* dscale;
+    int* dscale32;
     long long out_f;
     long long n_blocks;
+    int scale_bits;
+    int layout;                         // 0 output-major artifact, 1 GPU-coalesced block/lane/output
 };
 std::vector<ResidentWeight> g_weights;   // handle = index into this registry (process-global)
+size_t g_weight_bytes = 0;               // exact live device bytes, exposed for feasibility reporting
 
 // Resident int64 device buffers (gains, cos/sin tables) for the M3 monolith — uploaded once, reused.
 struct ResidentBuf { long long* ptr; size_t n; };
 std::vector<ResidentBuf> g_buffers;       // handle = index
+
+// Exact-allocation feasibility reservations.  A reservation is deliberately
+// split into the same logical allocations as the future graph (state, K, V,
+// conv history, scratch arenas) instead of one optimistic monolithic malloc;
+// this catches allocator fragmentation after ~1,000 resident weight uploads.
+struct GpuReservation { std::vector<void*> ptrs; size_t bytes; bool alive; };
+std::vector<GpuReservation> g_reservations;
+
+// Stable all-int64 ctypes ABI for the Qwen3.5 hybrid context.
+struct Bonsai35Config {
+    long long n_layers,d,dff,H,Hkv,hd,vocab,cap,frac,eps,n_rot;
+    long long key_heads,value_heads,state_size,state_frac,inner,conv_k;
+    long long gdn_scale,attn_scale,ssm_eps;
+    long long soft_min,soft_step,soft_max,exp_min,exp_step;
+    long long embed,final_gain,out_head,cos_buf,sin_buf,soft_buf,soft_n,exp_buf,exp_n;
+};
+struct Bonsai35LayerDesc {
+    long long kind,slot,n1,n2,w1,wu,w2;
+    long long wqkv,wz,walpha,wbeta,wout,conv,dt_bias,ssm_a,ssm_norm;
+    long long wqg,wk,wv,wo,q_norm,k_norm;
+};
+struct Bonsai35Ctx {
+    Bonsai35Config c; std::vector<Bonsai35LayerDesc> layers; bool alive,poisoned;
+    long long t,nrec,natt,conv_dim,max_k,graph_launches,input_mode;
+    long long token_submissions,embedded_submissions,model_input_host_bytes;
+    long long *state,*conv_hist;
+    int *K,*V;  // guarded Q16 cache: every append proves exact int32 narrowing
+    long long *x,*norm,*tmp,*qkv,*z,*alpha,*beta,*conv;
+    long long *qn,*kn,*rv,*rout,*rnorm,*zs,*rgated,*ctl_beta,*ctl_decay;
+    long long *qg,*aq,*agate,*ak,*av,*aout,*agated,*ffg,*ffu,*ffh,*scores,*digits,*logits,*trace;
+    long long *pos,*len,*token; unsigned long long *maxk,*maxv; int *overflow;
+    long long *h_x,*h_logits,*h_pos,*h_len,*h_token; int *h_overflow;
+    cudaStream_t stream; cudaGraph_t graph; cudaGraphExec_t graph_exec; bool graph_ready;
+};
+std::vector<Bonsai35Ctx> g_bonsai35;
 
 // Stateful M=B decode context: device KV cache (persists across steps) + per-step scratch + the weight/gain/
 // table handles, all stored at create so each step only moves (B,d) in and (B,vocab) logits out.
@@ -672,6 +1690,142 @@ int bonsai_gpu_available(void) {
     int n = 0;
     cudaError_t e = cudaGetDeviceCount(&n);
     return (e == cudaSuccess && n > 0) ? 0 : 1;     // 0 = available (matches the rc=0-is-good convention)
+}
+
+// Query allocator-visible memory after forcing CUDA context creation.  This is
+// used by the 27B feasibility proof; unlike nvidia-smi it is scoped to the
+// active device and includes the context/allocator state seen by this library.
+int bonsai_gpu_mem_info(unsigned long long* free_bytes, unsigned long long* total_bytes) {
+    if (!free_bytes || !total_bytes) return 1;
+    size_t f = 0, t = 0;
+    if (cudaFree(0) != cudaSuccess || cudaMemGetInfo(&f, &t) != cudaSuccess) return 2;
+    *free_bytes = (unsigned long long)f;
+    *total_bytes = (unsigned long long)t;
+    return 0;
+}
+
+unsigned long long bonsai_q1_resident_weight_bytes(void) {
+    return (unsigned long long)g_weight_bytes;
+}
+
+// Test/debug ABI for the exact KV-cache storage contract.  Values at both
+// int32 endpoints must survive narrowing and widening byte-exactly; any value
+// outside that closed interval returns the same fail-loud status used by the
+// resident graph before an output is exposed.
+int bonsai35_kv_i32_roundtrip_gpu(
+        const long long* src_host, long long n, long long* dst_host) {
+    if (!src_host || !dst_host || n <= 0) return 1;
+    long long *src = nullptr, *dst = nullptr;
+    int *cache = nullptr, *overflow = nullptr;
+    bool ok = true;
+    int host_overflow = 0;
+    ok = ok && (cudaMalloc(&src, (size_t)n * sizeof(long long)) == cudaSuccess);
+    ok = ok && (cudaMalloc(&cache, (size_t)n * sizeof(int)) == cudaSuccess);
+    ok = ok && (cudaMalloc(&dst, (size_t)n * sizeof(long long)) == cudaSuccess);
+    ok = ok && (cudaMalloc(&overflow, sizeof(int)) == cudaSuccess);
+    if (ok) {
+        ok = ok && (cudaMemcpy(src, src_host, (size_t)n * sizeof(long long),
+                              cudaMemcpyHostToDevice) == cudaSuccess);
+        ok = ok && (cudaMemset(overflow, 0, sizeof(int)) == cudaSuccess);
+    }
+    if (ok) {
+        const int threads = 128;
+        const unsigned blocks = (unsigned)((n + threads - 1) / threads);
+        q35_narrow_i32_guard_kernel<<<blocks, threads>>>(src, cache, n, overflow);
+        ok = ok && (cudaGetLastError() == cudaSuccess);
+        ok = ok && (cudaDeviceSynchronize() == cudaSuccess);
+        ok = ok && (cudaMemcpy(&host_overflow, overflow, sizeof(int),
+                              cudaMemcpyDeviceToHost) == cudaSuccess);
+        if (ok && !host_overflow) {
+            q35_widen_i32_kernel<<<blocks, threads>>>(cache, dst, n);
+            ok = ok && (cudaGetLastError() == cudaSuccess);
+            ok = ok && (cudaDeviceSynchronize() == cudaSuccess);
+            ok = ok && (cudaMemcpy(dst_host, dst, (size_t)n * sizeof(long long),
+                                  cudaMemcpyDeviceToHost) == cudaSuccess);
+        }
+    }
+    cudaFree(src); cudaFree(cache); cudaFree(dst); cudaFree(overflow);
+    if (!ok) return 2;
+    return host_overflow ? 4 : 0;
+}
+
+// Adversarial transaction ABI: initialize two cache rows to caller-provided
+// sentinels, run the SAME paired preflight/commit kernels as resident decode,
+// and return the final rows even on rc=4.  Tests use a single unsafe lane to
+// prove that neither K nor V receives any partial writes.
+int bonsai35_kv_i32_transaction_gpu(
+        const long long* k_host, const long long* v_host,
+        const int* k_initial, const int* v_initial,
+        long long n, long long* k_out_host, long long* v_out_host) {
+    if(!k_host||!v_host||!k_initial||!v_initial||!k_out_host||!v_out_host||n<=0)return 1;
+    long long *k=nullptr,*v=nullptr,*kout=nullptr,*vout=nullptr,*pos=nullptr;
+    int *K=nullptr,*V=nullptr,*overflow=nullptr;bool ok=true;int hov=0;const long long zero=0;
+    const size_t wide=(size_t)n*8,narrow=(size_t)n*4;const int T=128;
+    ok=ok&&(cudaMalloc(&k,wide)==cudaSuccess);ok=ok&&(cudaMalloc(&v,wide)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&K,narrow)==cudaSuccess);ok=ok&&(cudaMalloc(&V,narrow)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&kout,wide)==cudaSuccess);ok=ok&&(cudaMalloc(&vout,wide)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&pos,8)==cudaSuccess);ok=ok&&(cudaMalloc(&overflow,sizeof(int))==cudaSuccess);
+    if(ok){
+        ok=ok&&(cudaMemcpy(k,k_host,wide,cudaMemcpyHostToDevice)==cudaSuccess);
+        ok=ok&&(cudaMemcpy(v,v_host,wide,cudaMemcpyHostToDevice)==cudaSuccess);
+        ok=ok&&(cudaMemcpy(K,k_initial,narrow,cudaMemcpyHostToDevice)==cudaSuccess);
+        ok=ok&&(cudaMemcpy(V,v_initial,narrow,cudaMemcpyHostToDevice)==cudaSuccess);
+        ok=ok&&(cudaMemcpy(pos,&zero,8,cudaMemcpyHostToDevice)==cudaSuccess);
+        ok=ok&&(cudaMemset(overflow,0,sizeof(int))==cudaSuccess);
+    }
+    if(ok){
+        const unsigned blocks=(unsigned)((n+T-1)/T);
+        q35_kv_i32_preflight_pair_kernel<<<blocks,T>>>(k,v,n,overflow);
+        q35_kv_i32_commit_pair_kernel<<<blocks,T>>>(k,v,K,V,pos,1,n,1,overflow);
+        q35_widen_i32_kernel<<<blocks,T>>>(K,kout,n);
+        q35_widen_i32_kernel<<<blocks,T>>>(V,vout,n);
+        ok=ok&&(cudaGetLastError()==cudaSuccess);ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);
+        ok=ok&&(cudaMemcpy(&hov,overflow,sizeof(int),cudaMemcpyDeviceToHost)==cudaSuccess);
+        ok=ok&&(cudaMemcpy(k_out_host,kout,wide,cudaMemcpyDeviceToHost)==cudaSuccess);
+        ok=ok&&(cudaMemcpy(v_out_host,vout,wide,cudaMemcpyDeviceToHost)==cudaSuccess);
+    }
+    cudaFree(k);cudaFree(v);cudaFree(K);cudaFree(V);cudaFree(kout);cudaFree(vout);
+    cudaFree(pos);cudaFree(overflow);if(!ok)return 2;return hov?4:0;
+}
+
+// Atomically reserve a list of device allocations.  On any failure all
+// allocations made by this call are freed before returning -1, so callers can
+// cleanly fall back to CPU without poisoning the long-lived process.
+long long bonsai_gpu_reservation_create(const unsigned long long* sizes, long long count,
+                                        unsigned long long* allocated_bytes) {
+    if (!sizes || count <= 0 || count > 1024) return -1;
+    GpuReservation r; r.bytes = 0; r.alive = false;
+    r.ptrs.reserve((size_t)count);
+    for (long long i = 0; i < count; ++i) {
+        const size_t size_max = ~(size_t)0;
+        if (sizes[i] == 0 || sizes[i] > (unsigned long long)size_max ||
+            r.bytes > size_max - (size_t)sizes[i]) {
+            for (void* p : r.ptrs) cudaFree(p);
+            return -1;
+        }
+        void* p = nullptr;
+        if (cudaMalloc(&p, (size_t)sizes[i]) != cudaSuccess) {
+            // Clear CUDA's sticky allocation error before returning control.
+            cudaGetLastError();
+            for (void* q : r.ptrs) cudaFree(q);
+            return -1;
+        }
+        r.ptrs.push_back(p);
+        r.bytes += (size_t)sizes[i];
+    }
+    r.alive = true;
+    g_reservations.push_back(std::move(r));
+    const long long h = (long long)g_reservations.size() - 1;
+    if (allocated_bytes) *allocated_bytes = (unsigned long long)g_reservations[(size_t)h].bytes;
+    return h;
+}
+
+void bonsai_gpu_reservation_free(long long handle) {
+    if (handle < 0 || (size_t)handle >= g_reservations.size()) return;
+    GpuReservation& r = g_reservations[(size_t)handle];
+    if (!r.alive) return;
+    for (void* p : r.ptrs) cudaFree(p);
+    r.ptrs.clear(); r.bytes = 0; r.alive = false;
 }
 
 // Packed-Q1_0 linear x @ W.T. Returns 0 on success; nonzero on any CUDA failure so the Python wrapper
@@ -734,16 +1888,32 @@ int bonsai_q1_linear_dp4a_gpu(const long long* x, const unsigned char* bits, con
     const size_t osz = (size_t) tokens * out_f * sizeof(long long);
     const size_t dsz = (size_t) LL * tokens * K;                 // int8 digits
     long long *dx=nullptr,*ds=nullptr,*dout=nullptr; unsigned char* db=nullptr; signed char* dd=nullptr;
+    int* d_ovf=nullptr; int h_ovf=0;
     bool ok=true; int rc=1;
     ok=ok&&(cudaMalloc(&dx,xsz)==cudaSuccess);
     ok=ok&&(cudaMalloc(&db,bsz)==cudaSuccess);
     ok=ok&&(cudaMalloc(&ds,ssz)==cudaSuccess);
     ok=ok&&(cudaMalloc(&dout,osz)==cudaSuccess);
     ok=ok&&(cudaMalloc(&dd,dsz)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&d_ovf,sizeof(int))==cudaSuccess);
     ok=ok&&(cudaMemcpy(dx,x,xsz,cudaMemcpyHostToDevice)==cudaSuccess);
     ok=ok&&(cudaMemcpy(db,bits,bsz,cudaMemcpyHostToDevice)==cudaSuccess);
     ok=ok&&(cudaMemcpy(ds,scale,ssz,cudaMemcpyHostToDevice)==cudaSuccess);
+    ok=ok&&(cudaMemset(d_ovf,0,sizeof(int))==cudaSuccess);
     if (ok) {
+        const int TPB=128;
+        // L=4 envelope guard (was defined but never launched → a silent-wrap hazard for an out-of-envelope
+        // L=4). Run it on the raw activations; if ANY |x| leaves the balanced base-256 L=4 range the flag is
+        // set and we return rc 4 (CPU fallback) instead of computing non-byte-exact digits. Never fires for
+        // committed models (|x|~2^25 « 2.14e9); L=8 is always exact so it is skipped.
+        if (LL == 4) {
+            range_guard_l4_kernel<<<(unsigned)((tokens*K+TPB-1)/TPB),TPB>>>(dx,tokens*K,d_ovf);
+            ok=ok&&(cudaGetLastError()==cudaSuccess);
+            ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);
+            ok=ok&&(cudaMemcpy(&h_ovf,d_ovf,sizeof(int),cudaMemcpyDeviceToHost)==cudaSuccess);
+        }
+    }
+    if (ok && !h_ovf) {
         const int TPB=128;
         const bool prof = getenv("BONSAI_GPU_PROFILE") != nullptr;
         cudaEvent_t e0,e1,e2; if (prof){cudaEventCreate(&e0);cudaEventCreate(&e1);cudaEventCreate(&e2);cudaEventRecord(e0);}
@@ -759,10 +1929,11 @@ int bonsai_q1_linear_dp4a_gpu(const long long* x, const unsigned char* bits, con
             cudaEventDestroy(e0);cudaEventDestroy(e1);cudaEventDestroy(e2);}
         ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);
     }
-    ok=ok&&(cudaMemcpy(out,dout,osz,cudaMemcpyDeviceToHost)==cudaSuccess);
-    if (ok) rc=0; else rc=2;
+    if (ok && !h_ovf) ok=ok&&(cudaMemcpy(out,dout,osz,cudaMemcpyDeviceToHost)==cudaSuccess);
+    if (h_ovf) rc=4;              // out of L=4 envelope: caller falls back to the always-exact path (no wrap)
+    else if (ok) rc=0; else rc=2;
     if (dx) cudaFree(dx); if (db) cudaFree(db); if (ds) cudaFree(ds);
-    if (dout) cudaFree(dout); if (dd) cudaFree(dd);
+    if (dout) cudaFree(dout); if (dd) cudaFree(dd); if (d_ovf) cudaFree(d_ovf);
     return rc;
 }
 
@@ -781,8 +1952,69 @@ long long bonsai_q1_register_weight(const unsigned char* bits, const long long* 
         cudaMemcpy(dscale, scale, ssz, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(dbits); cudaFree(dscale); return -1;
     }
-    g_weights.push_back(ResidentWeight{dbits, dscale, out_f, n_blocks});
+    g_weights.push_back(ResidentWeight{dbits, dscale, nullptr, out_f, n_blocks, 64, 0});
+    g_weight_bytes += bsz + ssz;
     return (long long)(g_weights.size() - 1);
+}
+
+// Upload one projection while preserving its committed int32 scale storage.
+// The Qwen3.5 importer rejects any scale that cannot be narrowed losslessly;
+// this ABI therefore performs no saturation or reinterpretation.
+long long bonsai_q1_register_weight_i32(const unsigned char* bits, const int* scale,
+                                        long long out_f, long long n_blocks) {
+    if (!bits || !scale || out_f <= 0 || n_blocks <= 0) return -1;
+    const size_t bsz = (size_t)out_f * (size_t)n_blocks * 16;
+    const size_t ssz = (size_t)out_f * (size_t)n_blocks * sizeof(int);
+    unsigned char* dbits = nullptr;
+    int* dscale = nullptr;
+    if (cudaMalloc(&dbits, bsz) != cudaSuccess) return -1;
+    if (cudaMalloc(&dscale, ssz) != cudaSuccess) { cudaFree(dbits); return -1; }
+    if (cudaMemcpy(dbits, bits, bsz, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(dscale, scale, ssz, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dbits); cudaFree(dscale); return -1;
+    }
+    g_weights.push_back(ResidentWeight{dbits, nullptr, dscale, out_f, n_blocks, 32, 0});
+    g_weight_bytes += bsz + ssz;
+    return (long long)(g_weights.size() - 1);
+}
+
+// Register int32-scale Q1 in a runtime-only coalesced CUDA layout.  A temporary
+// upload is transposed on device and freed before return, so resident bytes are
+// unchanged and the committed artifact/digest remain untouched.
+long long bonsai_q1_register_weight_i32_gpu_layout(const unsigned char* bits,const int* scale,
+                                                   long long out_f,long long n_blocks){
+    if(!bits||!scale||out_f<=0||n_blocks<=0)return -1;
+    const size_t bsz=(size_t)out_f*n_blocks*16,ssz=(size_t)out_f*n_blocks*4;
+    unsigned char *srcb=nullptr,*dstb=nullptr;int *srcs=nullptr,*dsts=nullptr;bool ok=true;
+    ok=ok&&(cudaMalloc(&srcb,bsz)==cudaSuccess);ok=ok&&(cudaMalloc(&dstb,bsz)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&srcs,ssz)==cudaSuccess);ok=ok&&(cudaMalloc(&dsts,ssz)==cudaSuccess);
+    ok=ok&&(cudaMemcpy(srcb,bits,bsz,cudaMemcpyHostToDevice)==cudaSuccess);
+    ok=ok&&(cudaMemcpy(srcs,scale,ssz,cudaMemcpyHostToDevice)==cudaSuccess);
+    if(ok){const int T=128;q1_transpose_bits_kernel<<<(unsigned)((bsz+T-1)/T),T>>>(srcb,dstb,out_f,n_blocks);
+        q1_transpose_scale32_kernel<<<(unsigned)(((size_t)out_f*n_blocks+T-1)/T),T>>>(srcs,dsts,out_f,n_blocks);
+        ok=ok&&(cudaGetLastError()==cudaSuccess);ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);}
+    if(srcb)cudaFree(srcb);if(srcs)cudaFree(srcs);
+    if(!ok){if(dstb)cudaFree(dstb);if(dsts)cudaFree(dsts);cudaGetLastError();return -1;}
+    g_weights.push_back(ResidentWeight{dstb,nullptr,dsts,out_f,n_blocks,32,1});g_weight_bytes+=bsz+ssz;
+    return (long long)g_weights.size()-1;
+}
+
+long long bonsai_q1_register_weight_i32_bmma(const unsigned char* bits,const int* scale,
+                                             long long out_f,long long n_blocks){
+    if(!bits||!scale||out_f<=0||n_blocks<=0||out_f%8)return -1;
+    const size_t bsz=(size_t)out_f*n_blocks*16,ssz=(size_t)out_f*n_blocks*4;
+    unsigned char *srcb=nullptr,*dstb=nullptr;int *srcs=nullptr,*dsts=nullptr;bool ok=true;
+    ok=ok&&(cudaMalloc(&srcb,bsz)==cudaSuccess);ok=ok&&(cudaMalloc(&dstb,bsz)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&srcs,ssz)==cudaSuccess);ok=ok&&(cudaMalloc(&dsts,ssz)==cudaSuccess);
+    ok=ok&&(cudaMemcpy(srcb,bits,bsz,cudaMemcpyHostToDevice)==cudaSuccess);
+    ok=ok&&(cudaMemcpy(srcs,scale,ssz,cudaMemcpyHostToDevice)==cudaSuccess);
+    if(ok){const int T=128;q1_repack_bits_bmma_kernel<<<(unsigned)((bsz+T-1)/T),T>>>(srcb,dstb,out_f,n_blocks);
+        q1_transpose_scale32_kernel<<<(unsigned)(((size_t)out_f*n_blocks+T-1)/T),T>>>(srcs,dsts,out_f,n_blocks);
+        ok=ok&&(cudaGetLastError()==cudaSuccess);ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);}
+    if(srcb)cudaFree(srcb);if(srcs)cudaFree(srcs);
+    if(!ok){if(dstb)cudaFree(dstb);if(dsts)cudaFree(dsts);cudaGetLastError();return -1;}
+    g_weights.push_back(ResidentWeight{dstb,nullptr,dsts,out_f,n_blocks,32,2});g_weight_bytes+=bsz+ssz;
+    return (long long)g_weights.size()-1;
 }
 
 // Apply a registered weight to fresh activations: uploads x, runs the SAME kernel against the resident
@@ -805,7 +2037,15 @@ int bonsai_q1_apply_resident(long long handle, const long long* x, long long tok
         const int threads = 128;
         const unsigned long long nblk =
             ((unsigned long long)total_warps * 32ULL + (threads - 1)) / (unsigned long long)threads;
-        q1_linear_kernel<<<(unsigned int)nblk, threads>>>(dx, w.dbits, w.dscale, tokens, out_f, n_blocks, frac, dout);
+        if (w.scale_bits == 32 && w.layout == 1)
+            q1_linear_scale32_transposed_kernel<<<(unsigned int)nblk, threads>>>(
+                dx,w.dbits,w.dscale32,tokens,out_f,n_blocks,frac,dout);
+        else if (w.scale_bits == 32)
+            q1_linear_scale32_kernel<<<(unsigned int)nblk, threads>>>(
+                dx, w.dbits, w.dscale32, tokens, out_f, n_blocks, frac, dout);
+        else
+            q1_linear_kernel<<<(unsigned int)nblk, threads>>>(
+                dx, w.dbits, w.dscale, tokens, out_f, n_blocks, frac, dout);
         ok = ok && (cudaGetLastError() == cudaSuccess);
         ok = ok && (cudaDeviceSynchronize() == cudaSuccess);
     }
@@ -982,10 +2222,458 @@ int bonsai_attention_decode_batched_gpu(
     return rc;
 }
 
+// Standalone Qwen3.5 M=1 Gated DeltaNet parity rung.  All graph values remain
+// integer; state is copied back only because this ABI is for oracle comparison.
+// The resident executor invokes the same kernels against persistent state.
+int bonsai35_recurrent_step_gpu(
+        const long long* q, const long long* k, const long long* v,
+        const long long* z, const long long* alpha, const long long* beta,
+        long long* state_host, const long long* dt_bias, const long long* ssm_a,
+        const long long* norm_gain, const long long* soft_lut, long long soft_n,
+        const long long* exp_lut, long long exp_n,
+        long long key_heads, long long value_heads, long long state_size,
+        long long frac, long long state_frac, long long soft_min,
+        long long soft_step, long long soft_max, long long exp_min,
+        long long exp_step, long long gdn_scale, long long ssm_eps,
+        long long* gated_host) {
+    if (!q || !k || !v || !z || !alpha || !beta || !state_host || !dt_bias || !ssm_a ||
+        !norm_gain || !soft_lut || !exp_lut || !gated_host || key_heads <= 0 ||
+        value_heads <= 0 || state_size <= 0 || state_size > 128 || soft_n < 2 || exp_n < 2 ||
+        frac < 1 || frac > 29 || state_frac < frac || 2 * frac < state_frac ||
+        soft_step <= 0 || exp_step <= 0) return 1;
+    const size_t K = (size_t)key_heads * state_size;
+    const size_t V = (size_t)value_heads * state_size;
+    const size_t S = (size_t)value_heads * state_size * state_size;
+    long long *dq=nullptr,*dk=nullptr,*dv=nullptr,*dz=nullptr,*da=nullptr,*db=nullptr;
+    long long *dstate=nullptr,*ddt=nullptr,*dA=nullptr,*dng=nullptr,*dsl=nullptr,*del=nullptr;
+    long long *dqn=nullptr,*dkn=nullptr,*dbeta=nullptr,*ddecay=nullptr,*dout=nullptr,*dnorm=nullptr,*dzs=nullptr,*dgated=nullptr;
+    int* dov=nullptr;
+    bool ok = true; int hov = 0;
+    #define MALLOC(P,N) do { ok = ok && (cudaMalloc(&(P),(N)) == cudaSuccess); } while (0)
+    #define H2D(P,H,N) do { ok = ok && (cudaMemcpy((P),(H),(N),cudaMemcpyHostToDevice) == cudaSuccess); } while (0)
+    MALLOC(dq,K*8); MALLOC(dk,K*8); MALLOC(dv,V*8); MALLOC(dz,V*8);
+    MALLOC(da,(size_t)value_heads*8); MALLOC(db,(size_t)value_heads*8); MALLOC(dstate,S*8);
+    MALLOC(ddt,(size_t)value_heads*8); MALLOC(dA,(size_t)value_heads*8); MALLOC(dng,(size_t)state_size*8);
+    MALLOC(dsl,(size_t)soft_n*8); MALLOC(del,(size_t)exp_n*8); MALLOC(dqn,K*8); MALLOC(dkn,K*8);
+    MALLOC(dbeta,(size_t)value_heads*8); MALLOC(ddecay,(size_t)value_heads*8);
+    MALLOC(dout,V*8); MALLOC(dnorm,V*8); MALLOC(dzs,V*8); MALLOC(dgated,V*8); MALLOC(dov,sizeof(int));
+    if (ok) {
+        H2D(dq,q,K*8); H2D(dk,k,K*8); H2D(dv,v,V*8); H2D(dz,z,V*8);
+        H2D(da,alpha,(size_t)value_heads*8); H2D(db,beta,(size_t)value_heads*8); H2D(dstate,state_host,S*8);
+        H2D(ddt,dt_bias,(size_t)value_heads*8); H2D(dA,ssm_a,(size_t)value_heads*8);
+        H2D(dng,norm_gain,(size_t)state_size*8); H2D(dsl,soft_lut,(size_t)soft_n*8);
+        H2D(del,exp_lut,(size_t)exp_n*8); ok=ok&&(cudaMemset(dov,0,sizeof(int))==cudaSuccess);
+    }
+    const long long LOG2E_Q16=94548; const long long sh=16-frac;
+    const long long log2e=sh>=0?(LOG2E_Q16>>sh):(LOG2E_Q16<<(-sh));
+    const long long dca=((frac+2)<<(2*frac))/log2e, dcb=((long long)1<<62)/log2e;
+    const long long dclip=dca<dcb?dca:dcb;
+    if (ok) {
+        const int T=64;
+        bonsai35_l2norm_kernel<<<(unsigned)((key_heads+T-1)/T),T>>>(dq,key_heads,state_size,frac,dqn,dov);
+        bonsai35_l2norm_kernel<<<(unsigned)((key_heads+T-1)/T),T>>>(dk,key_heads,state_size,frac,dkn,dov);
+        bonsai35_controls_kernel<<<(unsigned)((value_heads+T-1)/T),T>>>(
+            da,db,ddt,dA,dsl,soft_n,del,exp_n,value_heads,frac,log2e,dclip,
+            soft_min,soft_step,soft_max,exp_min,exp_step,dbeta,ddecay,dov);
+        bonsai35_state_step_kernel<<<(unsigned)value_heads,128>>>(
+            dqn,dkn,dv,dbeta,ddecay,dstate,value_heads,key_heads,state_size,
+            frac,state_frac,gdn_scale,dout);
+        rmsnorm_kernel<<<(unsigned)((value_heads+T-1)/T),T>>>(
+            dout,value_heads,state_size,frac,ssm_eps,dng,dnorm,nullptr,dov);
+        silu_kernel<<<(unsigned)((V+T-1)/T),T>>>(dz,dzs,(long long)V,frac,log2e,dclip);
+        mulshift_kernel<<<(unsigned)((V+T-1)/T),T>>>(dnorm,dzs,dgated,(long long)V,frac);
+        ok=ok&&(cudaGetLastError()==cudaSuccess); ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);
+        ok=ok&&(cudaMemcpy(&hov,dov,sizeof(int),cudaMemcpyDeviceToHost)==cudaSuccess);
+        if (ok && !hov) {
+            ok=ok&&(cudaMemcpy(state_host,dstate,S*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+            ok=ok&&(cudaMemcpy(gated_host,dgated,V*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+        }
+    }
+    #undef MALLOC
+    #undef H2D
+    cudaFree(dq);cudaFree(dk);cudaFree(dv);cudaFree(dz);cudaFree(da);cudaFree(db);
+    cudaFree(dstate);cudaFree(ddt);cudaFree(dA);cudaFree(dng);cudaFree(dsl);cudaFree(del);
+    cudaFree(dqn);cudaFree(dkn);cudaFree(dbeta);cudaFree(ddecay);cudaFree(dout);cudaFree(dnorm);
+    cudaFree(dzs);cudaFree(dgated);cudaFree(dov);
+    if (!ok) return 2;
+    return hov ? 4 : 0;
+}
+
+// Standalone Qwen3.5 gated full-attention M=1 parity rung.  K/V prefix inputs
+// are read-only; only the transformed new K row and gated attention output are
+// returned, so a failed GPU attempt cannot partially mutate a caller cache.
+int bonsai35_attention_decode_gpu(
+        const long long* qg, const long long* k_new, const long long* v_new,
+        const long long* k_prefix, const long long* v_prefix, long long prefix_len,
+        long long H, long long Hkv, long long hd, long long n_rot,
+        long long frac, long long eps, long long inv_sqrt,
+        const long long* q_gain, const long long* k_gain,
+        const long long* cos, const long long* sin,
+        long long* gated_host, long long* k_row_host) {
+    if (!qg || !k_new || !v_new || !q_gain || !k_gain || !cos || !sin ||
+        !gated_host || !k_row_host || prefix_len < 0 || H <= 0 || Hkv <= 0 ||
+        H % Hkv || hd <= 0 || n_rot <= 0 || n_rot > hd || n_rot % 2 ||
+        frac < 1 || frac > 29 || eps < 0 || (prefix_len && (!k_prefix || !v_prefix))) return 1;
+    const long long L = prefix_len + 1;
+    const size_t Q=(size_t)H*hd, KV=(size_t)Hkv*hd, CACHE=(size_t)Hkv*L*hd;
+    long long *dqg=nullptr,*dq=nullptr,*dgate=nullptr,*dk=nullptr,*dv=nullptr,*dK=nullptr,*dV=nullptr;
+    long long *dqgains=nullptr,*dkgains=nullptr,*dc=nullptr,*ds=nullptr,*dout=nullptr,*dgated=nullptr;
+    long long *dscores=nullptr,*dlen=nullptr,*dpos=nullptr;
+    unsigned long long *dmk=nullptr,*dmv=nullptr; int* dov=nullptr;
+    bool ok=true; int hov=0;
+    #define MALLOC2(P,N) do { ok=ok&&(cudaMalloc(&(P),(N))==cudaSuccess); } while(0)
+    #define H2D2(P,S,N) do { ok=ok&&(cudaMemcpy((P),(S),(N),cudaMemcpyHostToDevice)==cudaSuccess); } while(0)
+    MALLOC2(dqg,Q*2*8);MALLOC2(dq,Q*8);MALLOC2(dgate,Q*8);MALLOC2(dk,KV*8);MALLOC2(dv,KV*8);
+    MALLOC2(dK,CACHE*8);MALLOC2(dV,CACHE*8);MALLOC2(dqgains,(size_t)hd*8);MALLOC2(dkgains,(size_t)hd*8);
+    MALLOC2(dc,(size_t)(n_rot/2)*8);MALLOC2(ds,(size_t)(n_rot/2)*8);MALLOC2(dout,Q*8);MALLOC2(dgated,Q*8);
+    MALLOC2(dscores,(size_t)H*L*8);MALLOC2(dlen,8);MALLOC2(dpos,8);
+    MALLOC2(dmk,(size_t)Hkv*8);MALLOC2(dmv,(size_t)Hkv*8);MALLOC2(dov,sizeof(int));
+    if (ok) {
+        H2D2(dqg,qg,Q*2*8);H2D2(dk,k_new,KV*8);H2D2(dv,v_new,KV*8);
+        H2D2(dqgains,q_gain,(size_t)hd*8);H2D2(dkgains,k_gain,(size_t)hd*8);
+        H2D2(dc,cos,(size_t)(n_rot/2)*8);H2D2(ds,sin,(size_t)(n_rot/2)*8);
+        H2D2(dlen,&L,8);H2D2(dpos,&prefix_len,8);ok=ok&&(cudaMemset(dov,0,sizeof(int))==cudaSuccess);
+        if (prefix_len) {
+            // Prefix rows are contiguous per KV head; the destination has one
+            // extra row, so copy head-by-head rather than as one flat block.
+            for (long long h=0; ok && h<Hkv; ++h) {
+                ok=ok&&(cudaMemcpy(dK+(size_t)h*L*hd,k_prefix+(size_t)h*prefix_len*hd,
+                                   (size_t)prefix_len*hd*8,cudaMemcpyHostToDevice)==cudaSuccess);
+                ok=ok&&(cudaMemcpy(dV+(size_t)h*L*hd,v_prefix+(size_t)h*prefix_len*hd,
+                                   (size_t)prefix_len*hd*8,cudaMemcpyHostToDevice)==cudaSuccess);
+            }
+        }
+    }
+    const long long LOG2E_Q16=94548, sh=16-frac;
+    const long long log2e=sh>=0?(LOG2E_Q16>>sh):(LOG2E_Q16<<(-sh));
+    const long long dca=((frac+2)<<(2*frac))/log2e,dcb=((long long)1<<62)/log2e;
+    const long long dclip=dca<dcb?dca:dcb;
+    if (ok) {
+        const int T=64;
+        bonsai35_split_qgate_kernel<<<(unsigned)((Q+T-1)/T),T>>>(dqg,dq,dgate,H,hd);
+        rmsnorm_kernel<<<(unsigned)((H+T-1)/T),T>>>(dq,H,hd,frac,eps,dqgains,dq,nullptr,dov);
+        rmsnorm_kernel<<<(unsigned)((Hkv+T-1)/T),T>>>(dk,Hkv,hd,frac,eps,dkgains,dk,nullptr,dov);
+        bonsai35_partial_rope_kernel<<<(unsigned)((H+T-1)/T),T>>>(dq,dc,ds,H,hd,n_rot,frac);
+        bonsai35_partial_rope_kernel<<<(unsigned)((Hkv+T-1)/T),T>>>(dk,dc,ds,Hkv,hd,n_rot,frac);
+        kv_append_kernel<<<(unsigned)((KV+T-1)/T),T>>>(dk,dK,dpos,1,Hkv,hd,L);
+        kv_append_kernel<<<(unsigned)((KV+T-1)/T),T>>>(dv,dV,dpos,1,Hkv,hd,L);
+        maxabs_bkv_parallel_kernel<<<(unsigned)Hkv,Q35_ATTN_TPB>>>(dK,dlen,1,Hkv,hd,L,dmk);
+        maxabs_bkv_parallel_kernel<<<(unsigned)Hkv,Q35_ATTN_TPB>>>(dV,dlen,1,Hkv,hd,L,dmv);
+        attention_decode_m1_parallel_kernel<long long><<<(unsigned)H,Q35_ATTN_TPB>>>(
+            dq,dK,dV,dlen,1,H,Hkv,hd,L,frac,inv_sqrt,log2e,dclip,dmk,dmv,dout,dscores,dov);
+        bonsai35_sigmoid_gate_kernel<<<(unsigned)((Q+T-1)/T),T>>>(
+            dout,dgate,dgated,(long long)Q,frac,log2e,dclip);
+        ok=ok&&(cudaGetLastError()==cudaSuccess);ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);
+        ok=ok&&(cudaMemcpy(&hov,dov,sizeof(int),cudaMemcpyDeviceToHost)==cudaSuccess);
+        if (ok&&!hov) {
+            ok=ok&&(cudaMemcpy(gated_host,dgated,Q*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+            ok=ok&&(cudaMemcpy(k_row_host,dk,KV*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+        }
+    }
+    #undef MALLOC2
+    #undef H2D2
+    cudaFree(dqg);cudaFree(dq);cudaFree(dgate);cudaFree(dk);cudaFree(dv);cudaFree(dK);cudaFree(dV);
+    cudaFree(dqgains);cudaFree(dkgains);cudaFree(dc);cudaFree(ds);cudaFree(dout);cudaFree(dgated);
+    cudaFree(dscores);cudaFree(dlen);cudaFree(dpos);cudaFree(dmk);cudaFree(dmv);cudaFree(dov);
+    if(!ok)return 2;return hov?4:0;
+}
+
 // Grid helpers shared by the monolith + the batched-decode step (one-thread-per-item vs one-warp-per-output).
 static const int MONO_TPB = 64;
 static inline unsigned int mono_blocks(long long nthreads) { return (unsigned int)((nthreads + MONO_TPB - 1) / MONO_TPB); }
 static inline unsigned int mono_wblocks(long long nwarps) { return (unsigned int)((nwarps * 32 + MONO_TPB - 1) / MONO_TPB); }
+
+static inline bool q35_weight_ok(long long h) {
+    return h >= 0 && (size_t)h < g_weights.size() && g_weights[(size_t)h].dbits;
+}
+static inline bool q35_buf_ok(long long h) {
+    return h >= 0 && (size_t)h < g_buffers.size() && g_buffers[(size_t)h].ptr;
+}
+static inline long long* q35_buf(long long h) { return g_buffers[(size_t)h].ptr; }
+
+static void q35_prepare_digits(Bonsai35Ctx& c, const long long* x, long long K) {
+    const long long words=(K/128)*32*4;
+    q1_bmma_activation_kernel<<<mono_blocks(words),MONO_TPB,0,c.stream>>>(
+        x,K/128,reinterpret_cast<unsigned int*>(c.digits),c.overflow);
+}
+static void q35_apply_prepared(Bonsai35Ctx& c, long long wh, long long* out) {
+    const ResidentWeight& w=g_weights[(size_t)wh];
+    const unsigned blocks=(unsigned)((w.out_f/8+3)/4); // four warps/block
+    if(w.scale_bits==32 && w.layout==2)
+        q1_bmma_apply_scale32_kernel<<<blocks,128,0,c.stream>>>(
+            reinterpret_cast<unsigned int*>(c.digits),w.dbits,w.dscale32,w.out_f,w.n_blocks,c.c.frac,out);
+    else if(w.scale_bits==32 && w.layout==1)
+        q1_lut32_apply_scale32_transposed_x4_kernel<<<blocks,MONO_TPB,0,c.stream>>>(
+            reinterpret_cast<int*>(c.digits),w.dbits,w.dscale32,w.out_f,w.n_blocks,c.c.frac,out);
+    else if(w.scale_bits==32)
+        q1_lut_apply_scale32_kernel<<<blocks,MONO_TPB,0,c.stream>>>(
+            c.digits,w.dbits,w.dscale32,w.out_f,w.n_blocks,c.c.frac,out);
+    else
+        q1_lut_apply_scale64_kernel<<<blocks,MONO_TPB,0,c.stream>>>(
+            c.digits,w.dbits,w.dscale,w.out_f,w.n_blocks,c.c.frac,out);
+}
+
+static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
+    const Bonsai35Config& g=c.c; const long long T=MONO_TPB;
+    const long long LOG2E_Q16=94548,sh=16-g.frac;
+    const long long log2e=sh>=0?(LOG2E_Q16>>sh):(LOG2E_Q16<<(-sh));
+    const long long dca=((g.frac+2)<<(2*g.frac))/log2e,dcb=((long long)1<<62)/log2e;
+    const long long dclip=dca<dcb?dca:dcb;
+    cudaMemsetAsync(c.overflow,0,sizeof(int),c.stream);
+    if(token_input){
+        const ResidentWeight& embed=g_weights[(size_t)g.embed];
+        cudaMemcpyAsync(c.token,c.h_token,8,cudaMemcpyHostToDevice,c.stream);
+        q35_embedding_row_bmma_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(
+            embed.dbits,embed.dscale32,embed.out_f,embed.n_blocks,c.token,c.x,c.overflow);
+        cudaMemcpyAsync(c.trace,c.x,(size_t)g.d*8,cudaMemcpyDeviceToDevice,c.stream);
+    }else{
+        cudaMemcpyAsync(c.x,c.h_x,(size_t)g.d*8,cudaMemcpyHostToDevice,c.stream);
+        cudaMemcpyAsync(c.trace,c.h_x,(size_t)g.d*8,cudaMemcpyHostToDevice,c.stream);
+    }
+    cudaMemcpyAsync(c.pos,c.h_pos,8,cudaMemcpyHostToDevice,c.stream);
+    cudaMemcpyAsync(c.len,c.h_len,8,cudaMemcpyHostToDevice,c.stream);
+    for(long long li=0;li<g.n_layers;++li){
+        const Bonsai35LayerDesc& l=c.layers[(size_t)li];
+        rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(l.n1),c.norm,c.overflow);
+        if(l.kind==0){ // recurrent
+            q35_prepare_digits(c,c.norm,g.d);
+            q35_apply_prepared(c,l.wqkv,c.qkv);q35_apply_prepared(c,l.wz,c.z);
+            q35_apply_prepared(c,l.walpha,c.alpha);q35_apply_prepared(c,l.wbeta,c.beta);
+            bonsai35_conv_decode_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
+                c.qkv,c.conv_hist,q35_buf(l.conv),l.slot,c.conv_dim,g.conv_k,g.frac,c.conv);
+            silu_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
+                c.conv,c.conv,c.conv_dim,g.frac,log2e,dclip);
+            const long long key_width=g.key_heads*g.state_size;
+            bonsai35_l2norm_kernel<<<mono_blocks(g.key_heads),T,0,c.stream>>>(
+                c.conv,g.key_heads,g.state_size,g.frac,c.qn,c.overflow);
+            bonsai35_l2norm_kernel<<<mono_blocks(g.key_heads),T,0,c.stream>>>(
+                c.conv+key_width,g.key_heads,g.state_size,g.frac,c.kn,c.overflow);
+            cudaMemcpyAsync(c.rv,c.conv+2*key_width,(size_t)g.value_heads*g.state_size*8,
+                            cudaMemcpyDeviceToDevice,c.stream);
+            bonsai35_controls_kernel<<<mono_blocks(g.value_heads),T,0,c.stream>>>(
+                c.alpha,c.beta,q35_buf(l.dt_bias),q35_buf(l.ssm_a),q35_buf(g.soft_buf),g.soft_n,
+                q35_buf(g.exp_buf),g.exp_n,g.value_heads,g.frac,log2e,dclip,
+                g.soft_min,g.soft_step,g.soft_max,g.exp_min,g.exp_step,c.ctl_beta,c.ctl_decay,c.overflow);
+            long long* st=c.state+(size_t)l.slot*g.value_heads*g.state_size*g.state_size;
+            bonsai35_state_step_wide32_kernel<<<(unsigned)g.value_heads,128,0,c.stream>>>(
+                c.qn,c.kn,c.rv,c.ctl_beta,c.ctl_decay,st,g.value_heads,g.key_heads,g.state_size,
+                g.frac,g.state_frac,g.gdn_scale,c.rout,c.overflow);
+            rmsnorm_fast_i32_kernel<<<(unsigned)g.value_heads,256,0,c.stream>>>(
+                c.rout,g.value_heads,g.state_size,g.frac,g.ssm_eps,q35_buf(l.ssm_norm),
+                c.rnorm,c.overflow);
+            silu_kernel<<<mono_blocks(g.inner),T,0,c.stream>>>(c.z,c.zs,g.inner,g.frac,log2e,dclip);
+            mulshift_kernel<<<mono_blocks(g.inner),T,0,c.stream>>>(c.rnorm,c.zs,c.rgated,g.inner,g.frac);
+            q35_prepare_digits(c,c.rgated,g.inner);q35_apply_prepared(c,l.wout,c.tmp);
+        }else{ // full attention
+            q35_prepare_digits(c,c.norm,g.d);
+            q35_apply_prepared(c,l.wqg,c.qg);q35_apply_prepared(c,l.wk,c.ak);q35_apply_prepared(c,l.wv,c.av);
+            bonsai35_split_qgate_kernel<<<mono_blocks(g.H*g.hd),T,0,c.stream>>>(c.qg,c.aq,c.agate,g.H,g.hd);
+            rmsnorm_fast_i32_kernel<<<(unsigned)g.H,256,0,c.stream>>>(
+                c.aq,g.H,g.hd,g.frac,g.eps,q35_buf(l.q_norm),c.aq,c.overflow);
+            rmsnorm_fast_i32_kernel<<<(unsigned)g.Hkv,256,0,c.stream>>>(
+                c.ak,g.Hkv,g.hd,g.frac,g.eps,q35_buf(l.k_norm),c.ak,c.overflow);
+            bonsai35_partial_rope_pos_kernel<<<mono_blocks(g.H),T,0,c.stream>>>(
+                c.aq,c.pos,q35_buf(g.cos_buf),q35_buf(g.sin_buf),g.H,g.hd,g.n_rot,g.frac);
+            bonsai35_partial_rope_pos_kernel<<<mono_blocks(g.Hkv),T,0,c.stream>>>(
+                c.ak,c.pos,q35_buf(g.cos_buf),q35_buf(g.sin_buf),g.Hkv,g.hd,g.n_rot,g.frac);
+            int* Kl=c.K+(size_t)l.slot*g.Hkv*g.cap*g.hd;
+            int* Vl=c.V+(size_t)l.slot*g.Hkv*g.cap*g.hd;
+            unsigned long long* maxKl=c.maxk+(size_t)l.slot*g.Hkv;
+            unsigned long long* maxVl=c.maxv+(size_t)l.slot*g.Hkv;
+            q35_kv_i32_preflight_pair_kernel<<<mono_blocks(g.Hkv*g.hd),T,0,c.stream>>>(
+                c.ak,c.av,g.Hkv*g.hd,c.overflow);
+            q35_kv_i32_commit_pair_kernel<<<mono_blocks(g.Hkv*g.hd),T,0,c.stream>>>(
+                c.ak,c.av,Kl,Vl,c.pos,g.Hkv,g.hd,g.cap,c.overflow);
+            q35_update_maxabs_rows_kernel<<<(unsigned)g.Hkv,Q35_ATTN_TPB,0,c.stream>>>(
+                c.ak,g.Hkv,g.hd,maxKl,c.overflow);
+            q35_update_maxabs_rows_kernel<<<(unsigned)g.Hkv,Q35_ATTN_TPB,0,c.stream>>>(
+                c.av,g.Hkv,g.hd,maxVl,c.overflow);
+            attention_decode_m1_parallel_kernel<int><<<(unsigned)g.H,Q35_ATTN_TPB,0,c.stream>>>(
+                c.aq,Kl,Vl,c.len,1,g.H,g.Hkv,g.hd,g.cap,g.frac,g.attn_scale,log2e,dclip,
+                maxKl,maxVl,c.aout,c.scores,c.overflow);
+            bonsai35_sigmoid_gate_kernel<<<mono_blocks(g.H*g.hd),T,0,c.stream>>>(
+                c.aout,c.agate,c.agated,g.H*g.hd,g.frac,log2e,dclip);
+            q35_prepare_digits(c,c.agated,g.H*g.hd);q35_apply_prepared(c,l.wo,c.tmp);
+        }
+        add_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(c.x,c.tmp,c.x,g.d);
+        rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(l.n2),c.norm,c.overflow);
+        q35_prepare_digits(c,c.norm,g.d);q35_apply_prepared(c,l.w1,c.ffg);q35_apply_prepared(c,l.wu,c.ffu);
+        silu_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffg,g.dff,g.frac,log2e,dclip);
+        mulshift_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffu,c.ffh,g.dff,g.frac);
+        q35_prepare_digits(c,c.ffh,g.dff);q35_apply_prepared(c,l.w2,c.tmp);
+        add_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(c.x,c.tmp,c.x,g.d);
+        cudaMemcpyAsync(c.trace+(size_t)(li+1)*g.d,c.x,(size_t)g.d*8,cudaMemcpyDeviceToDevice,c.stream);
+    }
+    rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(g.final_gain),c.norm,c.overflow);
+    q35_prepare_digits(c,c.norm,g.d);q35_apply_prepared(c,g.out_head,c.logits);
+    cudaMemcpyAsync(c.h_logits,c.logits,(size_t)g.vocab*8,cudaMemcpyDeviceToHost,c.stream);
+    cudaMemcpyAsync(c.h_overflow,c.overflow,sizeof(int),cudaMemcpyDeviceToHost,c.stream);
+    return cudaGetLastError()==cudaSuccess;
+}
+
+static void q35_free_ctx(Bonsai35Ctx& c){
+    if(c.graph_exec)cudaGraphExecDestroy(c.graph_exec);if(c.graph)cudaGraphDestroy(c.graph);
+    if(c.stream)cudaStreamDestroy(c.stream);
+    #define F(P) do{if(c.P)cudaFree(c.P);c.P=nullptr;}while(0)
+    F(state);F(conv_hist);F(K);F(V);F(x);F(norm);F(tmp);F(qkv);F(z);F(alpha);F(beta);F(conv);
+    F(qn);F(kn);F(rv);F(rout);F(rnorm);F(zs);F(rgated);F(ctl_beta);F(ctl_decay);F(qg);F(aq);F(agate);
+    F(ak);F(av);F(aout);F(agated);F(ffg);F(ffu);F(ffh);F(scores);F(digits);F(logits);F(pos);F(len);F(token);
+    F(maxk);F(maxv);F(overflow);F(trace);
+    #undef F
+    if(c.h_x)cudaFreeHost(c.h_x);if(c.h_logits)cudaFreeHost(c.h_logits);if(c.h_pos)cudaFreeHost(c.h_pos);
+    if(c.h_len)cudaFreeHost(c.h_len);if(c.h_token)cudaFreeHost(c.h_token);if(c.h_overflow)cudaFreeHost(c.h_overflow);
+    c.h_x=c.h_logits=c.h_pos=c.h_len=c.h_token=nullptr;c.h_overflow=nullptr;c.alive=false;
+}
+
+long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc* layers){
+    if(!cfg||!layers||cfg->n_layers<=0||cfg->d<=0||cfg->dff<=0||cfg->H<=0||cfg->Hkv<=0||
+       cfg->H%cfg->Hkv||cfg->hd<=0||cfg->cap<=0||cfg->state_size<=0||cfg->state_size>128||
+       cfg->conv_k<2||cfg->inner!=cfg->value_heads*cfg->state_size)return -1;
+    Bonsai35Ctx c{};c.c=*cfg;c.alive=false;c.poisoned=false;c.t=0;c.graph_launches=0;c.graph_ready=false;
+    c.input_mode=0;c.token_submissions=0;c.embedded_submissions=0;c.model_input_host_bytes=0;
+    c.layers.assign(layers,layers+cfg->n_layers);c.nrec=0;c.natt=0;
+    for(const auto& l:c.layers){if(l.kind==0)c.nrec++;else if(l.kind==1)c.natt++;else return -1;}
+    c.conv_dim=2*cfg->key_heads*cfg->state_size+cfg->inner;c.max_k=cfg->d;
+    if(cfg->dff>c.max_k)c.max_k=cfg->dff;if(cfg->inner>c.max_k)c.max_k=cfg->inner;
+    auto vw=[](long long h){return q35_weight_ok(h)&&g_weights[(size_t)h].scale_bits==32&&g_weights[(size_t)h].layout==2;};
+    auto vb=[](long long h){return q35_buf_ok(h);};
+    if(!vw(cfg->embed)||!vw(cfg->out_head)||!vb(cfg->final_gain)||!vb(cfg->cos_buf)||!vb(cfg->sin_buf)||
+       !vb(cfg->soft_buf)||!vb(cfg->exp_buf))return -1;
+    const ResidentWeight& ew=g_weights[(size_t)cfg->embed];
+    if(ew.out_f!=cfg->vocab||ew.n_blocks*128!=cfg->d)return -1;
+    for(const auto& l:c.layers){
+        if(!vb(l.n1)||!vb(l.n2)||!vw(l.w1)||!vw(l.wu)||!vw(l.w2))return -1;
+        if(l.kind==0&&(!vw(l.wqkv)||!vw(l.wz)||!vw(l.walpha)||!vw(l.wbeta)||!vw(l.wout)||
+           !vb(l.conv)||!vb(l.dt_bias)||!vb(l.ssm_a)||!vb(l.ssm_norm)))return -1;
+        if(l.kind==1&&(!vw(l.wqg)||!vw(l.wk)||!vw(l.wv)||!vw(l.wo)||!vb(l.q_norm)||!vb(l.k_norm)))return -1;
+    }
+    bool ok=true;auto cm=[&](auto** p,size_t n){if(ok)ok=(cudaMalloc((void**)p,n)==cudaSuccess);};
+    const size_t S=(size_t)c.nrec*cfg->value_heads*cfg->state_size*cfg->state_size;
+    const size_t CH=(size_t)c.nrec*(cfg->conv_k-1)*c.conv_dim;
+    const size_t KV=(size_t)c.natt*cfg->Hkv*cfg->cap*cfg->hd;
+    cm(&c.state,S*8);cm(&c.conv_hist,CH*8);cm(&c.K,KV*4);cm(&c.V,KV*4);
+    cm(&c.x,(size_t)cfg->d*8);cm(&c.norm,(size_t)cfg->d*8);cm(&c.tmp,(size_t)cfg->d*8);
+    cm(&c.qkv,(size_t)c.conv_dim*8);cm(&c.z,(size_t)cfg->inner*8);cm(&c.alpha,(size_t)cfg->value_heads*8);
+    cm(&c.beta,(size_t)cfg->value_heads*8);cm(&c.conv,(size_t)c.conv_dim*8);
+    const size_t KW=(size_t)cfg->key_heads*cfg->state_size,RW=(size_t)cfg->value_heads*cfg->state_size;
+    cm(&c.qn,KW*8);cm(&c.kn,KW*8);cm(&c.rv,RW*8);cm(&c.rout,RW*8);cm(&c.rnorm,RW*8);
+    cm(&c.zs,RW*8);cm(&c.rgated,RW*8);cm(&c.ctl_beta,(size_t)cfg->value_heads*8);cm(&c.ctl_decay,(size_t)cfg->value_heads*8);
+    const size_t Q=(size_t)cfg->H*cfg->hd,QG=2*Q,AK=(size_t)cfg->Hkv*cfg->hd;
+    cm(&c.qg,QG*8);cm(&c.aq,Q*8);cm(&c.agate,Q*8);cm(&c.ak,AK*8);cm(&c.av,AK*8);
+    cm(&c.aout,Q*8);cm(&c.agated,Q*8);cm(&c.ffg,(size_t)cfg->dff*8);cm(&c.ffu,(size_t)cfg->dff*8);
+    cm(&c.ffh,(size_t)cfg->dff*8);cm(&c.scores,(size_t)cfg->H*cfg->cap*8);
+    cm(&c.digits,(size_t)(c.max_k/128)*4*128);cm(&c.logits,(size_t)cfg->vocab*8);
+    cm(&c.trace,(size_t)(cfg->n_layers+1)*cfg->d*8);cm(&c.pos,8);cm(&c.len,8);cm(&c.token,8);
+    cm(&c.maxk,(size_t)c.natt*cfg->Hkv*8);cm(&c.maxv,(size_t)c.natt*cfg->Hkv*8);cm(&c.overflow,sizeof(int));
+    if(ok)ok=(cudaHostAlloc(&c.h_x,(size_t)cfg->d*8,cudaHostAllocPortable)==cudaSuccess);
+    if(ok)ok=(cudaHostAlloc(&c.h_logits,(size_t)cfg->vocab*8,cudaHostAllocPortable)==cudaSuccess);
+    if(ok)ok=(cudaHostAlloc(&c.h_pos,8,cudaHostAllocPortable)==cudaSuccess);
+    if(ok)ok=(cudaHostAlloc(&c.h_len,8,cudaHostAllocPortable)==cudaSuccess);
+    if(ok)ok=(cudaHostAlloc(&c.h_token,8,cudaHostAllocPortable)==cudaSuccess);
+    if(ok)ok=(cudaHostAlloc(&c.h_overflow,sizeof(int),cudaHostAllocPortable)==cudaSuccess);
+    if(ok)ok=(cudaStreamCreateWithFlags(&c.stream,cudaStreamNonBlocking)==cudaSuccess);
+    if(ok){cudaMemset(c.state,0,S*8);cudaMemset(c.conv_hist,0,CH*8);cudaMemset(c.K,0,KV*4);cudaMemset(c.V,0,KV*4);
+        cudaMemset(c.maxk,0,(size_t)c.natt*cfg->Hkv*8);cudaMemset(c.maxv,0,(size_t)c.natt*cfg->Hkv*8);}
+    if(!ok){q35_free_ctx(c);cudaGetLastError();return -1;}
+    c.alive=true;g_bonsai35.push_back(std::move(c));return (long long)g_bonsai35.size()-1;
+}
+
+int bonsai35_decode_step(long long handle,const long long* x_host,long long pos,long long* logits_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!x_host||!logits_host)return 1;
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap)return 1;
+    if(c.graph_ready&&c.input_mode!=1)return 3;
+    memcpy(c.h_x,x_host,(size_t)c.c.d*8);*c.h_pos=pos;*c.h_len=pos+1;*c.h_overflow=0;
+    if(!c.graph_ready){
+        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return 2;
+        bool ok=q35_enqueue_decode(c,false);
+        if(!ok||cudaStreamEndCapture(c.stream,&c.graph)!=cudaSuccess)return 2;
+        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return 2;
+        c.graph_ready=true;c.input_mode=1;
+    }
+    if(cudaGraphLaunch(c.graph_exec,c.stream)!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)return 2;
+    c.graph_launches++;c.embedded_submissions++;c.model_input_host_bytes+=(long long)c.c.d*8;
+    if(*c.h_overflow){c.poisoned=true;return 4;}
+    memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);c.t++;return 0;
+}
+
+// Production resident decode.  The captured graph transfers one token ID and
+// expands its resident packed-Q1 embedding row on device; no d_model-sized
+// host activation crosses PCIe.  A context is deliberately locked to the
+// input mode of its first capture so only one large CUDA graph is resident.
+int bonsai35_decode_token(long long handle,long long token,long long pos,long long* logits_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!logits_host)return 1;
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap||token<0||token>=c.c.vocab)return 1;
+    if(c.graph_ready&&c.input_mode!=2)return 3;
+    *c.h_token=token;*c.h_pos=pos;*c.h_len=pos+1;*c.h_overflow=0;
+    if(!c.graph_ready){
+        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return 2;
+        bool ok=q35_enqueue_decode(c,true);
+        if(!ok||cudaStreamEndCapture(c.stream,&c.graph)!=cudaSuccess)return 2;
+        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return 2;
+        c.graph_ready=true;c.input_mode=2;
+    }
+    if(cudaGraphLaunch(c.graph_exec,c.stream)!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)return 2;
+    c.graph_launches++;c.token_submissions++;c.model_input_host_bytes+=8;
+    if(*c.h_overflow){c.poisoned=true;return 4;}
+    memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);c.t++;return 0;
+}
+
+int bonsai35_ctx_reset(long long handle){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive)return 1;const auto& g=c.c;
+    cudaMemset(c.state,0,(size_t)c.nrec*g.value_heads*g.state_size*g.state_size*8);
+    cudaMemset(c.conv_hist,0,(size_t)c.nrec*(g.conv_k-1)*c.conv_dim*8);
+    cudaMemset(c.K,0,(size_t)c.natt*g.Hkv*g.cap*g.hd*4);cudaMemset(c.V,0,(size_t)c.natt*g.Hkv*g.cap*g.hd*4);
+    cudaMemset(c.maxk,0,(size_t)c.natt*g.Hkv*8);cudaMemset(c.maxv,0,(size_t)c.natt*g.Hkv*8);
+    c.t=0;c.poisoned=false;return cudaDeviceSynchronize()==cudaSuccess?0:2;
+}
+void bonsai35_ctx_free(long long handle){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return;Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(c.alive)q35_free_ctx(c);
+}
+
+// Debug/parity export after a completed step.  KV is compacted to
+// (attention_layers,Hkv,t,hd), omitting unused 4K capacity.
+int bonsai35_ctx_export(long long handle,long long* state_host,long long* conv_host,
+                        long long* k_host,long long* v_host,long long* trace_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.poisoned)return 1;const auto& g=c.c;bool ok=true;
+    const size_t S=(size_t)c.nrec*g.value_heads*g.state_size*g.state_size;
+    const size_t CH=(size_t)c.nrec*(g.conv_k-1)*c.conv_dim;
+    if(state_host)ok=ok&&(cudaMemcpy(state_host,c.state,S*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+    if(conv_host)ok=ok&&(cudaMemcpy(conv_host,c.conv_hist,CH*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+    if(trace_host)ok=ok&&(cudaMemcpy(trace_host,c.trace,(size_t)(g.n_layers+1)*g.d*8,cudaMemcpyDeviceToHost)==cudaSuccess);
+    if((k_host||v_host)&&c.t>0){
+        const size_t row_elems=(size_t)c.t*g.hd,bytes=row_elems*sizeof(int);
+        std::vector<int> narrow;
+        try{narrow.resize(row_elems);}catch(...){return 2;}
+        for(long long a=0;ok&&a<c.natt;++a)for(long long h=0;ok&&h<g.Hkv;++h){
+            const size_t src=((size_t)a*g.Hkv+h)*g.cap*g.hd;
+            const size_t dst=((size_t)a*g.Hkv+h)*c.t*g.hd;
+            if(k_host){ok=ok&&(cudaMemcpy(narrow.data(),c.K+src,bytes,cudaMemcpyDeviceToHost)==cudaSuccess);
+                if(ok)for(size_t i=0;i<row_elems;++i)k_host[dst+i]=(long long)narrow[i];}
+            if(v_host){ok=ok&&(cudaMemcpy(narrow.data(),c.V+src,bytes,cudaMemcpyDeviceToHost)==cudaSuccess);
+                if(ok)for(size_t i=0;i<row_elems;++i)v_host[dst+i]=(long long)narrow[i];}
+        }
+    }
+    return ok?0:2;
+}
+
+int bonsai35_ctx_stats(long long handle,long long* launches,long long* position,int* graph_ready,int* poisoned){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;const Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive)return 1;if(launches)*launches=c.graph_launches;if(position)*position=c.t;
+    if(graph_ready)*graph_ready=c.graph_ready?1:0;if(poisoned)*poisoned=c.poisoned?1:0;return 0;
+}
+
+int bonsai35_ctx_input_stats(long long handle,long long* input_mode,long long* token_submissions,
+                             long long* embedded_submissions,long long* model_input_host_bytes){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;const Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive)return 1;if(input_mode)*input_mode=c.input_mode;
+    if(token_submissions)*token_submissions=c.token_submissions;
+    if(embedded_submissions)*embedded_submissions=c.embedded_submissions;
+    if(model_input_host_bytes)*model_input_host_bytes=c.model_input_host_bytes;return 0;
+}
 
 // ---- M=B fully-resident batched decode: stateful context (KV persists on device across steps) ------------
 // Create the context: allocate the device KV cache + per-step scratch, and stash all weight/gain/table handles
@@ -1069,7 +2757,7 @@ int bonsai_decode_step(long long ctx_h, const long long* x_in, const long long* 
     long long log2e = shift>=0 ? (LOG2E_Q16>>shift) : (LOG2E_Q16<<(-shift));
     if (log2e<=0) return 1;
     long long dca=((frac+2)<<(2*frac))/log2e, dcb=((long long)1<<62)/log2e;
-    long long d_clip = dca<dcb?dca:dcb, d_clip_silu=((frac+2)<<(2*frac))/log2e;
+    long long d_clip = dca<dcb?dca:dcb, d_clip_silu=d_clip;  // SiLU mirrors softmax's (1<<62)//log2e cap (oracle parity)
     auto wbits=[](long long h){return g_weights[(size_t)h].dbits;};
     auto wscale=[](long long h){return g_weights[(size_t)h].dscale;};
     auto wof=[](long long h){return g_weights[(size_t)h].out_f;};
@@ -1133,11 +2821,21 @@ void bonsai_decode_ctx_free(long long ctx_h) {
 
 // Free all resident weights AND buffers (optional; process exit frees them anyway).
 void bonsai_q1_free_weights(void) {
+    for (size_t i = 0; i < g_reservations.size(); ++i) {
+        if (!g_reservations[i].alive) continue;
+        for (void* p : g_reservations[i].ptrs) cudaFree(p);
+        g_reservations[i].ptrs.clear();
+        g_reservations[i].alive = false;
+        g_reservations[i].bytes = 0;
+    }
+    g_reservations.clear();
     for (size_t i = 0; i < g_weights.size(); ++i) {
         if (g_weights[i].dbits) cudaFree(g_weights[i].dbits);
         if (g_weights[i].dscale) cudaFree(g_weights[i].dscale);
+        if (g_weights[i].dscale32) cudaFree(g_weights[i].dscale32);
     }
     g_weights.clear();
+    g_weight_bytes = 0;
     for (size_t i = 0; i < g_buffers.size(); ++i)
         if (g_buffers[i].ptr) cudaFree(g_buffers[i].ptr);
     g_buffers.clear();
@@ -1177,7 +2875,7 @@ int bonsai_prefill_forward_gpu(
     long long dca = ((frac + 2) << (2 * frac)) / log2e;
     long long dcb = ((long long) 1 << 62) / log2e;
     long long d_clip_attn = dca < dcb ? dca : dcb;
-    long long d_clip_silu = ((frac + 2) << (2 * frac)) / log2e;   // sigmoid form (no 1<<62 cap)
+    long long d_clip_silu = d_clip_attn;   // SiLU mirrors the (1<<62)//log2e cap for oracle parity (was uncapped)
 
     auto wbits = [](long long h) { return g_weights[(size_t) h].dbits; };
     auto wscale = [](long long h) { return g_weights[(size_t) h].dscale; };

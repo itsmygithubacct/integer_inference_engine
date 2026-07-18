@@ -29,6 +29,48 @@ def _standalone_from_txid(receipt: dict, txid: str, network: str, tag: str) -> d
             "modelHash": receipt["modelHash"], "receiptHash": receipt["receiptHash"]}
 
 
+def _stateful_from_record(record: dict, network: str) -> tuple[dict, dict]:
+    """Convert a chain_c/AgentTea action record into bundle inputs.
+
+    Keep this transform in the engine package so ``pack --from-emission`` does
+    not need to import the optional ``bsv_third_entry`` composition package.
+    The bundle verifier independently recomputes every binding.
+    """
+    required = (
+        "actionTxid", "receiptHashOnChain", "txCount", "lockTime", "amount",
+        "actionHash", "provenanceHash", "identity",
+    )
+    missing = [key for key in required if key not in record]
+    ident = record.get("identity")
+    identity_required = ("ricardianHash", "genesisTxid", "agentPubKey", "counterpartyPubKey")
+    if missing or not isinstance(ident, dict):
+        raise ValueError(f"incomplete stateful action record; missing {', '.join(missing) or 'identity'}")
+    identity_missing = [key for key in identity_required if key not in ident]
+    if identity_missing:
+        raise ValueError(
+            "incomplete stateful identity; missing " + ", ".join(identity_missing)
+        )
+    onchain = {
+        "kind": "stateful",
+        "network": network,
+        "actionTxid": record["actionTxid"],
+        "receiptVout": record.get("receiptVout", 1),
+        "receiptHashOnChain": record["receiptHashOnChain"],
+        "action": {
+            "amount": int(record["amount"]),
+            "txCount": int(record["txCount"]),
+            "lockTime": int(record["lockTime"]),
+            "actionHash": record["actionHash"],
+            "provenanceHash": record["provenanceHash"],
+        },
+    }
+    for key in ("rawTx", "sizeBytes"):
+        if record.get(key) is not None:
+            onchain[key] = record[key]
+    identity = {key: ident[key] for key in identity_required}
+    return onchain, identity
+
+
 def _cmd_pack(args) -> int:
     try:
         rb = _load_json(args.receipt_bundle)
@@ -53,11 +95,23 @@ def _cmd_pack(args) -> int:
             print(f"[bundle] --from-emission has no real on-chain txid (status={oc.get('status')}); "
                   "the receipt was not broadcast", file=sys.stderr)
             return 2
-        tag = emission.get("chainArtifact", {}).get("tag", "trinote/r1")
-        onchain = _standalone_from_txid(receipt, txid, args.network, tag)
-        if oc.get("rawTx"):   # carry the full signed tx so the bundle is self-contained + re-broadcastable
-            onchain["rawTx"] = oc["rawTx"]
-            onchain["sizeBytes"] = oc.get("sizeBytes")
+        record = oc.get("record")
+        if isinstance(record, dict):
+            try:
+                onchain, derived_identity = _stateful_from_record(record, args.network)
+            except (TypeError, ValueError) as exc:
+                print(f"[bundle] invalid stateful action record: {exc}", file=sys.stderr)
+                return 2
+            if identity is not None and identity != derived_identity:
+                print("[bundle] --identity disagrees with the stateful action record", file=sys.stderr)
+                return 2
+            identity = derived_identity
+        else:
+            tag = emission.get("chainArtifact", {}).get("tag", "trinote/r1")
+            onchain = _standalone_from_txid(receipt, txid, args.network, tag)
+            if oc.get("rawTx"):  # self-contained + re-broadcastable
+                onchain["rawTx"] = oc["rawTx"]
+                onchain["sizeBytes"] = oc.get("sizeBytes")
     else:
         onchain = _standalone_from_txid(receipt, args.txid, args.network, args.tag)
 
@@ -77,8 +131,15 @@ def _cmd_pack(args) -> int:
 def _load_model(artifact: str, *, fast: bool = True):
     from ..infer_int.artifact_io_bonsai import load_artifact_bonsai
     from ..infer_int.reference_bonsai import BonsaiReferenceModel
+    from ..infer_int.reference_bonsai35 import BonsaiQwen35ReferenceModel
     art, info = load_artifact_bonsai(artifact)
-    model = BonsaiReferenceModel(art)
+    architecture = str(art.get("config", {}).get("architecture", ""))
+    if architecture == "qwen35":
+        model = BonsaiQwen35ReferenceModel(art)
+    elif architecture == "qwen3":
+        model = BonsaiReferenceModel(art)
+    else:
+        raise ValueError(f"unsupported Bonsai artifact architecture {architecture!r}")
     engine = "oracle"
     if fast:
         # Engage the native packed-Q1 kernel for re-execution. It is BYTE-IDENTICAL to the pure-NumPy oracle

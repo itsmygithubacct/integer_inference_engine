@@ -7,12 +7,13 @@
 #
 #   scripts/bonsai.sh <mode> [PROMPT] [extra CLI flags...]      # PROMPT may also come last, or use -p "..."
 #
-# Modes (all run the deterministic integer engine):
+# Modes:
 #   json            structured JSON output {thinking,answer,bonsai,receipt,bundle} (deterministic + receipted)
 #   repl            interactive REPL (omit PROMPT) — deterministic + receipted, type 'quit' to exit
 #   deterministic   deterministic integer engine, NO receipt (fastest receipt-free reproducible run)   [alias: det]
 #   receipted       deterministic + local notarized receipt (byte-exact re-execution + verify)         [alias: rcpt]
 #   onchain         receipted + BSV OP_RETURN Third Entry — DRY-RUN by default (no spend/broadcast)
+#   bonsai27        Bonsai-27B Q1 GGUF through PrismML llama.cpp (Linux CUDA, inference-only, NO receipt) [alias: 27b]
 #
 # GPU:  native modes use the GPU (resident-monolith prefill + KV-export, byte-identical) when available.
 #       Set BONSAI_GPU=0 to force CPU.
@@ -39,6 +40,10 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURC
 [ $# -ge 1 ] || usage 1
 mode="$1"; shift
 
+# The 27B GGUF model has its own launcher and argument surface. Dispatch before the native launcher's positional
+# prompt normalization so model-option values cannot be mistaken for the prompt.
+case "$mode" in bonsai27|27b) exec "$REPO/../bonsai-27b-cli" "$@" ;; esac
+
 # Optional positional PROMPT, accepted EITHER first ("prompt" --flags) OR last (--flags "prompt"). Using -p
 # explicitly always works and takes precedence. (If you end the line with a value-taking flag and give no
 # prompt, pass it as -p to avoid the trailing token being read as the prompt.)
@@ -46,9 +51,9 @@ args=("$@")
 have_p=0
 for a in "${args[@]+"${args[@]}"}"; do case "$a" in -p|--prompt) have_p=1 ;; esac; done
 prompt_args=()
-if [ ${#args[@]} -ge 1 ] && [ "${args[0]:0:1}" != "-" ]; then          # prompt first
+if [ "$mode" != "repl" ] && [ ${#args[@]} -ge 1 ] && [ "${args[0]:0:1}" != "-" ]; then # prompt first
     prompt_args=(-p "${args[0]}"); args=("${args[@]:1}")
-elif [ $have_p -eq 0 ] && [ ${#args[@]} -ge 1 ]; then                  # else prompt last (if bare, no -p given)
+elif [ "$mode" != "repl" ] && [ $have_p -eq 0 ] && [ ${#args[@]} -ge 1 ]; then # else prompt last
     last="${args[$((${#args[@]}-1))]}"
     if [ "${last:0:1}" != "-" ]; then
         prompt_args=(-p "$last"); unset 'args[$((${#args[@]}-1))]'; args=("${args[@]+"${args[@]}"}")
@@ -62,12 +67,12 @@ gpu_args=()
 
 case "$mode" in
     json)                  base=(--json --fast "${gpu_args[@]}") ;;
-    repl)                  base=(--fast "${gpu_args[@]}") ;;          # no -p => interactive loop
+    repl)                  base=(--repl --chat --fast "${gpu_args[@]}") ;;
     deterministic|det)     base=(--fast "${gpu_args[@]}" --no-receipt) ;;
     receipted|rcpt)        base=(--fast "${gpu_args[@]}" --receipt) ;;
     onchain)               base=(--fast "${gpu_args[@]}" --receipt --onchain) ;;  # dry-run unless --chain-confirm
     -h|--help|help)        usage 0 ;;
-    *) echo "bonsai.sh: unknown mode '$mode' (try: json repl deterministic receipted onchain)" >&2; exit 2 ;;
+    *) echo "bonsai.sh: unknown mode '$mode' (try: json repl deterministic receipted onchain bonsai27)" >&2; exit 2 ;;
 esac
 
 cmd=("$PY" -m trinote.cli.run_bonsai_cli "${base[@]}" "${prompt_args[@]}" "$@")

@@ -1,9 +1,19 @@
-# Bonsai-8B deterministic integer inference engine (standalone)
+# Bonsai deterministic integer inference engine (standalone)
 
-A self-contained extraction of the **`int-ref@bonsai-qwen3`** engine from `bonsai-notarized-bitnet`: an
-all-integer / fixed-point transformer that runs the **ATLAS-Notarized-Bonsai-8B** model (Qwen3, ~8.19B params,
+A self-contained, all-integer / fixed-point transformer that runs the **ATLAS-Notarized-Bonsai-8B** model (Qwen3, ~8.19B params,
 **Q1_0** 1-bit weights, `frac=16`) with output **byte-identical across CPU/GPU/threads/batch** and an optional
 **third-party-verifiable receipt** per generation.
+
+For the **Bonsai-27B GGUF 1-bit** Qwen3.5 checkpoint on Linux, see
+[`BONSAI-27B-GGUF.md`](BONSAI-27B-GGUF.md). Its integer launcher attempts the optional resident CUDA producer
+by default, then cleanly falls back to the optimized resident CPU executor. PrismML llama.cpp is a separate,
+floating-point behavior reference/speed backend. The tracked receipt identity remains bound to Bonsai-8B;
+the CLI and shared receipt API hard-fail any 27B issuance that lacks a distinct identity, a hash-bound passing
+quality gate, and re-execution by a fresh canonical CPU oracle.
+That identity/gate link is an unsigned local integrity record, not an authenticity proof: replacing both JSON
+files can produce another internally consistent pair. Receipt signatures authenticate the signer separately.
+The controlled performance and idle-CPU protocol is in
+[`BONSAI-27B-BENCHMARKING.md`](BONSAI-27B-BENCHMARKING.md).
 
 For the full design and measured numbers see **[`bonsai8b.md`](bonsai8b.md)** (this model) and
 **[`../integer_engine.md`](../integer_engine.md)** (the generalized BitNet/Ollama design).
@@ -57,8 +67,26 @@ scripts/fetch_weights.sh                      # OPTIONAL: the 8B GGUF + imported
 ```
 
 The kernel and weights are resolved at runtime via `trinote.notary_paths` (prefer `~/.local/trinote`, fall back
-to the in-tree `tools/` / `artifacts/`). Without the CUDA `.so`, `--gpu` silently falls back to the CPU oracle;
-without weights, the synthetic-model tests still run (the engine is exercised end-to-end on a tiny random model).
+to the in-tree `tools/` / `artifacts/`). Without the CUDA `.so`, `--gpu` falls back to the selected CPU path;
+for Bonsai-27B that is the one-call resident native executor when its release-shape ABI is available, with the
+Python/NumPy graph retained as the canonical oracle. Without weights, synthetic-model tests still run.
+
+### Bonsai-27B acceptance boundary
+
+The optimized CPU executor validates and pins the release artifact once, owns reusable caches/workspaces, and
+executes embedding, all 64 layers, final RMSNorm, and logits or deterministic argmax inside one native ABI call
+and one persistent OpenMP team. Real traces, logits, caches, and generated IDs match the CPU oracle in portable
+and AVX2 modes. Controlled content-bound i7-10700F comparisons pass the plan's final gates: decode tokens 3-32
+and 33-128 are 4.2632x and 4.1983x faster than the frozen legacy producer; exact 32-token and 128-token prefills
+are 4.1616x and 3.6854x faster. Every comparison has matching output/cache commitments and a passing variation
+gate. See `BONSAI-27B-BENCHMARKING.md` for medians, hashes, and raw JSON paths.
+
+The RTX 3070 producer has a successful guarded-int32-KV run through all 4,096 populated positions. Its final-32
+median is 10.4025 tok/s, with 6,362,562,560 bytes observed live and a 6,740,049,920-byte conservative proof peak.
+A separate production-binary 128-token soak matches the native-disabled NumPy oracle byte-for-byte for residuals,
+recurrent state, convolution history, valid K/V, logits, and every generated token. CUDA remains a producer, not
+a verifier: a guarded failure poisons the context and requires replay by the canonical CPU oracle. The resident
+integer graph and regular PrismML Bonsai-27B process are mutually exclusive on an 8 GiB card.
 
 ---
 
@@ -76,6 +104,14 @@ PYTHONPATH=src .venv/bin/python -m trinote.cli.run_bonsai_cli \
     --fast --receipt --chat -p "What is a tensor?" -n 64
 ```
 
+The native REPL retains structured user/assistant turns and reuses exact KV/recurrent state. It evicts only whole
+oldest turns when the input budget fills; each receipt still commits the complete rendered input IDs for that turn.
+GNU line editing handles arrows/history, while input echo is disabled and queued mouse/type-ahead bytes are flushed
+during generation. Use `/help` for commands including `/context`, `/system`, `/think`, `/retry`, `/history`, and
+`/paste`; Ctrl-C cancels a generation without adding its partial output to context. Context defaults are model-aware
+(8B: original 16,384-token RoPE window when memory allows; native 27B: the artifact's 4,096-token cap) and can be
+overridden with `--context-size N`, `BONSAI_CONTEXT_SIZE=N`, or `context_size` in `bonsai.toml`.
+
 Each receipted turn prints `[receipt] <hash> VERIFIED` (it self-verifies by re-executing bit-exactly before
 emitting) and writes a portable bundle to `~/.local/trinote/bundles/`. Real secp256k1 signing keys are
 generated on first use under `~/.local/trinote/keys/`; pass `--model-key`/`--counterparty-key` to supply your
@@ -90,9 +126,12 @@ PYTHONPATH=src:tests .venv/bin/python -m pytest tests/test_bonsai_smoke.py tests
 PYTHONPATH=src:tests .venv/bin/python -m pytest tests/test_bonsai_gpu.py -q   # skips kernels if no GPU/.so
 ```
 
-These prove every accelerated path (CPU C, CUDA) is `np.array_equal` to the pure-NumPy integer oracle — the
-contract that makes the receipts meaningful. A stored bundle is independently re-verifiable offline with
-`PYTHONPATH=src .venv/bin/python -m trinote.cli.receipt_bundle_cli verify <bundle.tar.gz> --reexec`.
+These tests gate the accelerated configurations they actually exercise against the pure-NumPy integer oracle.
+They do not by themselves prove every 27B real-model CPU/GPU configuration: the opt-in real traces and release
+soak must also pass before such a claim is made. A stored bundle is independently re-verifiable offline; `--reexec`
+requires the committed artifact via `--artifact`:
+`PYTHONPATH=src .venv/bin/python -m trinote.cli.receipt_bundle_cli verify <bundle.tar.gz> --reexec --artifact <A.safetensors>`.
+(Omit `--reexec`/`--artifact` for the offline commitment+signature check without re-execution.)
 
 ---
 

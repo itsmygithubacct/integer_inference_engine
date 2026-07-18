@@ -6,13 +6,18 @@
 # Point $BONSAI_CONFIG at a different file to override the location.
 
 [inference]
-sampler          = "qwen3-rec"   # min_p | qwen3-rec | greedy | temp | top_k | top_p
+sampler          = "qwen3-rec"   # min_p | qwen3-rec | bonsai27-rec | greedy | temp | top_k | top_p
 max_new          = 256           # generation budget (tokens). Long greedy-ish runs can fall into
                                  # repetition loops on a 1-bit model — keep this modest, or raise
                                  # rep_penalty / no_repeat_ngram below.
 engine           = "native"      # native | prismml.cpp   (cryptographic receipts require 'native')
 chat             = false         # wrap prompts in the Bonsai/Qwen3 chat template
 verify_mode      = "fast-local"  # fast-local | fresh-oracle
+
+[repl]
+context_size     = "auto"        # auto reads model/artifact limits and host capacity; or set a token count
+system_prompt    = ""            # optional session system message (never persisted unless you save a bundle)
+no_think         = false         # one-shot Qwen3.5 override; the REPL answers directly by default and /think toggles
 
 [sampling]
 # Repetition controls (receipt-safe: recorded in the receipt + byte-exactly reproducible at a fixed seed).
