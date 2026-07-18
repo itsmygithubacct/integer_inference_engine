@@ -12,8 +12,10 @@ overflow / launch ``rc`` so a GPU hiccup degrades to CPU rather than aborting a 
 ``research/bonsai-notary/IMPLEMENT-GPU-MODE.md`` for the build plan and the parity gate that must pass before
 ``--gpu`` is permitted to emit a receipt, and ``Q1-BITMATMUL-REFORMULATION.md`` for the kernel math.
 
-NOTE: ``tools/bonsai_q1_gpu.cu`` (the actual kernel) is not written yet — until it is built into
-``tools/libbonsai_q1_gpu.so``, ``gpu_available()`` is ``False`` and this module is inert.
+NOTE: ``tools/bonsai_q1_gpu.cu`` (the actual kernel) is implemented and byte-checked against the CPU oracle.
+The GPU ``.so`` is a per-host build artifact (gitignored) — build it with ``tools/build_bonsai_q1_gpu.sh``.
+Until that ``libbonsai_q1_gpu.so`` is present on the host, ``gpu_available()`` is ``False`` and this module is
+inert (callers transparently fall back to the CPU native/oracle path).
 """
 from __future__ import annotations
 
@@ -74,6 +76,55 @@ def _load_lib():
         ap.restype = ctypes.c_int
         free.argtypes = []
         free.restype = None
+        try:
+            reg32 = lib.bonsai_q1_register_weight_i32
+        except AttributeError:
+            pass
+        else:
+            reg32.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64
+            ]
+            reg32.restype = ctypes.c_int64
+        try:
+            reg32_gpu = lib.bonsai_q1_register_weight_i32_gpu_layout
+        except AttributeError:
+            pass
+        else:
+            reg32_gpu.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64
+            ]
+            reg32_gpu.restype = ctypes.c_int64
+        try:
+            reg32_bmma = lib.bonsai_q1_register_weight_i32_bmma
+        except AttributeError:
+            pass
+        else:
+            reg32_bmma.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64
+            ]
+            reg32_bmma.restype = ctypes.c_int64
+        try:
+            mem = lib.bonsai_gpu_mem_info
+            weight_bytes = lib.bonsai_q1_resident_weight_bytes
+        except AttributeError:
+            pass
+        else:
+            mem.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            mem.restype = ctypes.c_int
+            weight_bytes.argtypes = []
+            weight_bytes.restype = ctypes.c_uint64
+        try:
+            reserve = lib.bonsai_gpu_reservation_create
+            release = lib.bonsai_gpu_reservation_free
+        except AttributeError:
+            pass
+        else:
+            reserve.argtypes = [
+                ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p,
+            ]
+            reserve.restype = ctypes.c_int64
+            release.argtypes = [ctypes.c_int64]
+            release.restype = None
     # M2 RMSNorm (optional; guarded so an older .so without it still loads).
     try:
         rms = lib.bonsai_rmsnorm_gpu
@@ -169,10 +220,17 @@ def q1_apply_gpu(x_fp: np.ndarray, bits: np.ndarray, scale_fp: np.ndarray, frac:
     return out
 
 
+_L4_LO, _L4_HI = -2155905152, 2139062143   # balanced base-256 L=4 envelope (Q1-BITMATMUL §4.4)
+
+
 def q1_apply_dp4a_gpu(x_fp: np.ndarray, bits: np.ndarray, scale_fp: np.ndarray, frac: int,
                       L: "int | None" = None) -> "np.ndarray | None":
     """DP4A Q1 apply (int8 dp4a hot loop), byte-identical to q1_linear_ref. L=4 when the activations fit the
-    balanced base-256 range (the committed envelope), else 8. Returns None if unavailable / out of L's range."""
+    balanced base-256 range (the committed envelope), else 8.
+
+    Returns None if the kernel is unavailable or declines (rc != 0). An EXPLICIT L=4 with activations OUTSIDE
+    the balanced base-256 envelope RAISES: the device range guard (range_guard_l4_kernel) is enforced host-side
+    here, so an out-of-envelope L=4 can never silently wrap (was a real hazard — the finding's dead-guard)."""
     lib = _load_lib()
     if lib is None or not hasattr(lib, "bonsai_q1_linear_dp4a_gpu"):
         return None
@@ -183,9 +241,15 @@ def q1_apply_dp4a_gpu(x_fp: np.ndarray, bits: np.ndarray, scale_fp: np.ndarray, 
     if x.shape[1] != n_blocks * 128:
         raise ValueError(f"Q1_0 contraction mismatch: x has {x.shape[1]}, weight expects {n_blocks * 128}")
     if L is None:
-        # L=4 balanced base-256 range is [-2155905152, 2139062143] (Q1-BITMATMUL §4.4); else L=8 (always exact).
         mn, mx = int(x.min()), int(x.max())
-        L = 4 if (mn >= -2155905152 and mx <= 2139062143) else 8
+        L = 4 if (_L4_LO <= mn and mx <= _L4_HI) else 8   # else L=8 (always exact)
+    elif int(L) == 4 and x.size:
+        mn, mx = int(x.min()), int(x.max())
+        if not (_L4_LO <= mn and mx <= _L4_HI):
+            raise ValueError(
+                f"q1_apply_dp4a_gpu: explicit L=4 requires activations in [{_L4_LO}, {_L4_HI}], got [{mn}, {mx}] "
+                f"— the L=4 digits would not reconstruct x and the kernel would silently wrap (rc=0). "
+                f"Use L=8 (always exact) or L=None (auto-selects a safe L).")
     out = np.empty((x.shape[0], out_f), dtype=np.int64)
     rc = lib.bonsai_q1_linear_dp4a_gpu(
         x.ctypes.data, b.ctypes.data, s.ctypes.data,
@@ -203,7 +267,9 @@ def residency_available() -> bool:
     return lib is not None and hasattr(lib, "bonsai_q1_register_weight")
 
 
-def q1_register_weight(bits: np.ndarray, scale_fp: np.ndarray) -> "int | None":
+def q1_register_weight(bits: np.ndarray, scale_fp: np.ndarray, *,
+                       gpu_coalesced: bool = False,
+                       gpu_bmma: bool = False) -> "int | None":
     """Upload a projection's bits+scale to the device ONCE; return an opaque handle (>=0), or None on
     failure / unavailability. Reuse the handle with ``q1_apply_resident`` to skip the per-call weight upload
     (the dominant decode cost). The committed int64 scale is used (no on-GPU int32 cache)."""
@@ -214,12 +280,85 @@ def q1_register_weight(bits: np.ndarray, scale_fp: np.ndarray) -> "int | None":
     src = np.asarray(scale_fp)
     if not np.issubdtype(src.dtype, np.integer):
         raise TypeError(f"Q1_0 scale must be an integer dtype, got {src.dtype}")
-    s = np.ascontiguousarray(src, dtype=np.int64)
+    # Qwen3.5 artifacts commit losslessly narrowed int32 scales.  Preserve that
+    # representation when the CUDA library exposes the scale32 ABI: expanding
+    # it here would consume ~800 MiB of otherwise avoidable RTX 3070 memory.
+    use_i32 = src.dtype.itemsize <= 4 and hasattr(lib, "bonsai_q1_register_weight_i32")
+    if gpu_coalesced and gpu_bmma:
+        raise ValueError("choose one GPU Q1 runtime layout")
+    if (gpu_coalesced or gpu_bmma) and not use_i32:
+        raise ValueError("GPU-coalesced Q1 registration currently requires committed int32 scales")
+    if gpu_coalesced and not hasattr(lib, "bonsai_q1_register_weight_i32_gpu_layout"):
+        return None
+    if gpu_bmma and not hasattr(lib, "bonsai_q1_register_weight_i32_bmma"):
+        return None
+    s = np.ascontiguousarray(src, dtype=np.int32 if use_i32 else np.int64)
     out_f, n_blocks = s.shape
     # keep refs alive only for the duration of the call; the device copy is what persists
-    h = lib.bonsai_q1_register_weight(b.ctypes.data, s.ctypes.data,
-                                      ctypes.c_int64(int(out_f)), ctypes.c_int64(int(n_blocks)))
+    if gpu_bmma:
+        fn = lib.bonsai_q1_register_weight_i32_bmma
+    elif gpu_coalesced:
+        fn = lib.bonsai_q1_register_weight_i32_gpu_layout
+    else:
+        fn = lib.bonsai_q1_register_weight_i32 if use_i32 else lib.bonsai_q1_register_weight
+    h = fn(b.ctypes.data, s.ctypes.data,
+           ctypes.c_int64(int(out_f)), ctypes.c_int64(int(n_blocks)))
     return None if int(h) < 0 else int(h)
+
+
+def gpu_memory_info() -> "dict[str, int] | None":
+    """Return allocator-visible CUDA memory, or ``None`` on an older/unavailable library.
+
+    ``resident_weight_bytes`` is tracked from successful live registrations,
+    which makes the Qwen3.5 memory-feasibility report auditable independently
+    of CUDA context and allocator overhead.
+    """
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "bonsai_gpu_mem_info"):
+        return None
+    free = ctypes.c_uint64()
+    total = ctypes.c_uint64()
+    if lib.bonsai_gpu_mem_info(ctypes.byref(free), ctypes.byref(total)) != 0:
+        return None
+    weight_bytes = 0
+    if hasattr(lib, "bonsai_q1_resident_weight_bytes"):
+        weight_bytes = int(lib.bonsai_q1_resident_weight_bytes())
+    return {
+        "free_bytes": int(free.value),
+        "total_bytes": int(total.value),
+        "used_bytes": int(total.value - free.value),
+        "resident_weight_bytes": weight_bytes,
+    }
+
+
+def gpu_reservation_create(component_bytes) -> "tuple[int, int] | None":
+    """Reserve several exact device allocations as one failure-atomic probe.
+
+    Returns ``(handle, allocated_bytes)`` on success.  A failed reservation is
+    fully unwound inside CUDA and returns ``None``; no partial allocations are
+    left behind.  This API is intentionally low-level and is used by the 27B
+    memory-feasibility tool rather than by inference itself.
+    """
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "bonsai_gpu_reservation_create"):
+        return None
+    sizes = np.ascontiguousarray(np.asarray(tuple(component_bytes), dtype=np.uint64))
+    if sizes.ndim != 1 or sizes.size == 0 or np.any(sizes == 0):
+        raise ValueError("GPU reservation components must be a non-empty list of positive byte counts")
+    allocated = ctypes.c_uint64()
+    handle = lib.bonsai_gpu_reservation_create(
+        sizes.ctypes.data, ctypes.c_int64(int(sizes.size)), ctypes.byref(allocated)
+    )
+    if int(handle) < 0:
+        return None
+    return int(handle), int(allocated.value)
+
+
+def gpu_reservation_free(handle: int) -> None:
+    """Release a feasibility reservation; safe to call more than once."""
+    lib = _load_lib()
+    if lib is not None and hasattr(lib, "bonsai_gpu_reservation_free"):
+        lib.bonsai_gpu_reservation_free(ctypes.c_int64(int(handle)))
 
 
 def q1_apply_resident(handle: int, x_fp: np.ndarray, out_features: int, n_blocks: int,

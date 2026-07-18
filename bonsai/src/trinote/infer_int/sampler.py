@@ -36,10 +36,11 @@ from ..hashing.sha import sha256_hex
 RECEIPT_SAFE_MODES = frozenset({"greedy", "temp", "top_k", "top_p", "min_p"})
 
 # Named presets usable as a `--sampler` value (expanded by `resolve_sampler`). qwen3-rec is the Qwen3 vendor
-# recommendation — our model IS Qwen3-based, and Qwen3 advises AGAINST greedy decoding (top_p nucleus + top_k
-# + low temperature). At a fixed seed it is still receipt-bound and byte-exactly reproducible.
+# recommendation for the native Bonsai-8B model. bonsai27-rec is Prism ML's recommendation for Bonsai-27B.
+# Both expand to ordinary sampler settings. The Bonsai-27B launcher passes its preset to PrismML llama.cpp.
 SAMPLER_PRESETS = {
     "qwen3-rec": {"mode": "top_p", "temperature": 0.6, "top_k": 20, "top_p": 0.95},
+    "bonsai27-rec": {"mode": "top_p", "temperature": 0.7, "top_k": 20, "top_p": 0.95},
 }
 
 
@@ -333,20 +334,33 @@ def top_probs(logits_row: np.ndarray, k: int, frac_bits: int,
 def _truncate(probs: np.ndarray, top_k: int, top_p_fp_val: int, frac_bits: int) -> np.ndarray:
     """Zero everything outside the top-k / nucleus (top-p), always keeping >= 1 token. Pure integer:
     `top_p_fp_val` is the COMMITTED fixed-point nucleus threshold (probs sum to ~2^frac)."""
-    probs = probs.astype(np.int64).copy()
-    order = np.argsort(probs, kind="stable")[::-1]             # descending by prob
-    keep = np.zeros(probs.shape[0], dtype=bool)
-    keep[order[: max(1, top_k)] if top_k and top_k > 0 else order] = True
+    probs = np.asarray(probs, dtype=np.int64)
+    count = int(probs.shape[0])
+    # Keep the historical stable ordering exactly.  NumPy's stable integer
+    # sort is faster than partition-plus-explicit-tie-resolution on the release
+    # vocabulary, and reversing it preserves the committed high-token-id tie
+    # rule.
+    order = np.argsort(probs, kind="stable")[::-1]             # descending, high-id ties first
+    keep_count = (
+        min(max(1, top_k), count)
+        if top_k and top_k > 0 else count
+    )
     if top_p_fp_val < (1 << frac_bits):                        # top_p < 1.0 → nucleus truncation
-        csum = np.cumsum(probs[order])
+        # Only the intersection of top-p and top-k survives.  If the nucleus
+        # threshold is not reached among these candidates, all top-k entries
+        # survive regardless of how far the nucleus continues.  Bounding this
+        # gather/cumsum avoids two vocabulary-sized masks and one full ordered
+        # probability copy in the common top-k + top-p presets.
+        csum = np.cumsum(probs[order[:keep_count]])
         n = int(np.searchsorted(csum, int(top_p_fp_val), side="left")) + 1   # +1: include the crossing token
-        nucleus = np.zeros(probs.shape[0], dtype=bool)
-        nucleus[order[: max(1, min(n, probs.shape[0]))]] = True
-        keep &= nucleus
-    probs[~keep] = 0
-    if not probs.any():                                       # never an all-zero distribution
-        probs[int(order[0])] = 1
-    return probs
+        keep_count = max(1, min(n, keep_count))
+
+    result = np.zeros_like(probs)
+    kept = order[:keep_count]
+    result[kept] = probs[kept]
+    if not result.any():                                      # never an all-zero distribution
+        result[int(order[0])] = 1
+    return result
 
 
 def _truncate_min_p(probs: np.ndarray, min_p_fp_val: int, frac_bits: int) -> np.ndarray:

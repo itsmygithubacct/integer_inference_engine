@@ -77,7 +77,7 @@ fi
 gpu_args=(); [ "$GPU" = "1" ] && gpu_args=(--gpu)
 
 case "$mode" in
-    repl)    base=(--fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;            # no -p => interactive loop
+    repl)    base=(--repl --chat --fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;
     json)    base=(--json --fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;
     oneshot) base=(--fast "${gpu_args[@]+"${gpu_args[@]}"}" "$receipt") ;;
 esac

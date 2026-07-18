@@ -61,6 +61,23 @@ def _nbytes_bonsai(t: _Tensor) -> int:
     raise ValueError(f"unsupported ggml type {t.ggml_type} for Bonsai tensor {t.name}")
 
 
+def _rint_to_fixed_i64(x: np.ndarray, frac: int, where: str) -> np.ndarray:
+    """round(x * 2^frac) -> int64, but FAIL LOUD on non-finite or out-of-range inputs. A NaN/Inf f16/f32
+    scale (representable in fp16; producible by a corrupt or overflowed GGUF) casts to an arbitrary/UB int64
+    (typically INT64_MIN) and would be COMMITTED + HASHED as a garbage scale/gain with only a RuntimeWarning.
+    The committed artifact must never silently encode a non-finite or wrapped value."""
+    x = np.asarray(x, dtype=np.float64)
+    if not np.all(np.isfinite(x)):
+        n = int((~np.isfinite(x)).sum())
+        raise ValueError(f"{where}: {n} non-finite value(s) (NaN/Inf) in the GGUF float data — refusing to "
+                         f"commit a garbage fixed-point scale/gain (corrupt or out-of-range quantization)")
+    scaled = x * float(1 << frac)
+    if np.any(np.abs(scaled) >= float(1 << 63)):
+        raise ValueError(f"{where}: fixed-point magnitude exceeds int64 at frac={frac} — the float scale is "
+                         f"too large to commit without a silent wrap")
+    return np.rint(scaled).astype(np.int64)
+
+
 def _dequant_q1_packed(r: _GGUFReader, t: _Tensor, frac: int) -> tuple[np.ndarray, np.ndarray]:
     """Q1_0 tensor -> (`bits`, `scale_fp`) with rows `(out, in/128, 16)` and `(out, in/128)`."""
     if len(t.shape) != 2:
@@ -70,13 +87,13 @@ def _dequant_q1_packed(r: _GGUFReader, t: _Tensor, frac: int) -> tuple[np.ndarra
         raise ValueError(f"{t.name}: expected GGML_TYPE_Q1_0 ({_GGML_Q1_0}), got {t.ggml_type}")
     raw = r.raw(t, _nbytes_bonsai(t)).reshape(out_f, in_f // _QK1_0, _Q1_BLOCK_BYTES)
     scale_f16 = raw[:, :, :2].copy().view("<f2").reshape(out_f, in_f // _QK1_0)
-    scale_fp = np.rint(scale_f16.astype(np.float64) * (1 << frac)).astype(np.int64)
+    scale_fp = _rint_to_fixed_i64(scale_f16.astype(np.float64), frac, f"{t.name} Q1_0 scale")
     bits = raw[:, :, 2:].copy()
     return bits, scale_fp
 
 
 def _gain(r: _GGUFReader, name: str, frac: int) -> np.ndarray:
-    return np.rint(_dequant_float(r, r.tensors[name]).reshape(-1) * (1 << frac)).astype(np.int64)
+    return _rint_to_fixed_i64(_dequant_float(r, r.tensors[name]).reshape(-1), frac, f"{name} gain")
 
 
 def _q1(r: _GGUFReader, name: str, frac: int) -> tuple[np.ndarray, np.ndarray]:
@@ -85,6 +102,9 @@ def _q1(r: _GGUFReader, name: str, frac: int) -> tuple[np.ndarray, np.ndarray]:
 
 def import_bonsai_gguf_to_artifact(gguf_path: str | Path, *, context_len: int | None = None,
                                    frac: int = 16, progress=print) -> dict:
+    if not (1 <= int(frac) <= 29):
+        raise ValueError(f"frac must be in [1, 29] (the fixed-point envelope the softmax/SiLU kernels accept), "
+                         f"got {frac} — an out-of-range frac silently wraps int64 in the compute path")
     r = _GGUFReader(gguf_path)
     arch = r.kv.get("general.architecture", "?")
     if arch != "qwen3":

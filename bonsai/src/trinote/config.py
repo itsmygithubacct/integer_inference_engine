@@ -19,11 +19,12 @@ from .notary_paths import config_path
 CONFIG_KEYS = frozenset({
     "sampler", "max_new", "engine", "chat", "verify_mode",
     "temp", "top_k", "top_p", "min_p", "seed", "rep_penalty", "no_repeat_ngram",
+    "context_size", "ctx_size", "system_prompt", "no_think",
 })
 
 # Choice-constrained keys — a value outside the set is dropped (argparse does NOT re-validate defaults).
 _CHOICES = {
-    "sampler": {"min_p", "qwen3-rec", "greedy", "temp", "top_k", "top_p"},
+    "sampler": {"min_p", "qwen3-rec", "bonsai27-rec", "greedy", "temp", "top_k", "top_p"},
     "engine": {"native", "prismml.cpp"},
     "verify_mode": {"fast-local", "fresh-oracle"},
 }
@@ -56,7 +57,20 @@ def load_config(path: str | Path | None = None) -> dict:
         elif key in _CHOICES and val not in _CHOICES[key]:
             bad.append(f"{key}={val!r}")
         else:
-            out[key] = val
+            dest = "ctx_size" if key == "context_size" else key
+            if dest == "ctx_size":
+                if isinstance(val, str) and val.strip().lower() == "auto":
+                    val = 0
+                if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+                    bad.append(f"{key}={val!r}")
+                    continue
+            if dest in {"chat", "no_think"} and not isinstance(val, bool):
+                bad.append(f"{key}={val!r}")
+                continue
+            if dest == "system_prompt" and not isinstance(val, str):
+                bad.append(f"{key}={val!r}")
+                continue
+            out[dest] = val
     if unknown:
         print(f"[bonsai] WARNING: ignoring unknown config key(s) in {p}: {', '.join(sorted(unknown))}",
               file=sys.stderr)

@@ -37,3 +37,24 @@ def test_invalid_toml_is_empty(tmp_path):
     p = tmp_path / "bad.toml"
     p.write_text("this = = not valid [[[")
     assert load_config(p) == {}
+
+
+def test_repl_context_and_system_settings_are_normalized(tmp_path):
+    p = tmp_path / "bonsai.toml"
+    p.write_text(textwrap.dedent('''
+        [repl]
+        context_size = "auto"
+        system_prompt = "Answer precisely."
+        no_think = false
+    '''))
+    assert load_config(p) == {
+        "ctx_size": 0,
+        "system_prompt": "Answer precisely.",
+        "no_think": False,
+    }
+
+
+def test_invalid_context_setting_is_dropped(tmp_path):
+    p = tmp_path / "bonsai.toml"
+    p.write_text('context_size = -1\nchat = true\n')
+    assert load_config(p) == {"chat": True}

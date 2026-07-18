@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# bonsai-27b-cli — run prism-ml/Bonsai-27B-gguf with PrismML llama.cpp on Linux.
+#
+# This is an INFERENCE-ONLY path. It cannot emit Trinote receipts because llama.cpp uses floating-point
+# activations and GPU kernels. Use ./bonsai-cli for byte-exact, receipt-capable Bonsai-8B inference.
+#
+# Usage:
+#   bonsai-27b-cli "What is a tensor?" [-n 256] [extra run_bonsai_cli flags...]
+#   bonsai-27b-cli repl [extra flags...]
+#
+# Setup:
+#   bonsai/scripts/install_bonsai_27b_gguf.sh
+#   bonsai/scripts/fetch_bonsai_27b_gguf.sh
+#
+# Env: BONSAI_CONTEXT_SIZE or legacy BONSAI_27B_CTX_SIZE overrides auto context;
+#      BONSAI_27B_NGL=99, BONSAI_27B_MAX_NEW=1024, BONSAI_DRYRUN=1.
+set -euo pipefail
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="$ROOT/bonsai"
+PY="$ENGINE/.venv/bin/python"; [ -x "$PY" ] || PY="python3"
+NOTARY_HOME="${BONSAI_NOTARY_HOME:-$HOME/.local/trinote}"
+MODELS_DIR="${BONSAI_MODELS_DIR:-$NOTARY_HOME/models}"
+RELEASE="prism-b9591-62061f9"
+MODEL="${BONSAI_27B_GGUF:-$MODELS_DIR/Bonsai-27B-Q1_0.gguf}"
+BIN_DIR="${BONSAI_27B_BIN_DIR:-$NOTARY_HOME/vendor/llama.cpp-bonsai27/$RELEASE/bin}"
+NGL="${BONSAI_27B_NGL:-99}"
+MAX_NEW="${BONSAI_27B_MAX_NEW:-1024}"
+
+case "${1:-}" in -h|--help|help) usage 0 ;; esac
+[ "$(uname -s)" = "Linux" ] || { echo "bonsai-27b-cli: this launcher is for Linux." >&2; exit 2; }
+
+prompt_args=()
+repl_args=()
+if [ "${1:-}" = "repl" ]; then
+    repl_args=(--repl)
+    shift
+elif [ $# -gt 0 ] && [ "${1:0:1}" != "-" ]; then
+    prompt_args=(-p "$1")
+    shift
+elif [ $# -eq 0 ]; then
+    usage 1
+fi
+
+# With no override, run_bonsai_cli passes `-c 0 --fit on` so llama.cpp fits
+# the model-advertised window to current hardware. Keep the old model-specific
+# variable as a compatibility alias; the generic variable wins.
+context_args=()
+if [ -n "${BONSAI_CONTEXT_SIZE:-}" ]; then
+    context_args=(--context-size "$BONSAI_CONTEXT_SIZE")
+elif [ -n "${BONSAI_27B_CTX_SIZE:-}" ]; then
+    context_args=(--context-size "$BONSAI_27B_CTX_SIZE")
+fi
+
+cmd=("$PY" -m trinote.cli.run_bonsai_cli
+     --engine prismml.cpp --no-receipt
+     --gguf "$MODEL" --bin-dir "$BIN_DIR"
+     --sampler bonsai27-rec --rep-penalty 1.0 --no-repeat-ngram 0
+     "${context_args[@]+"${context_args[@]}"}" --n-gpu-layers "$NGL" --flash-attn
+     -n "$MAX_NEW"
+     "${repl_args[@]+"${repl_args[@]}"}"
+     "${prompt_args[@]+"${prompt_args[@]}"}" "$@")
+
+if [ "${BONSAI_DRYRUN:-0}" = "1" ]; then
+    printf '[bonsai-27b-cli] would run (cwd=%s):' "$ENGINE"
+    printf ' %q' BONSAI_NOTARY_HOME="$NOTARY_HOME" PYTHONPATH=src LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "${cmd[@]}"
+    printf '\n'
+    exit 0
+fi
+
+[ -f "$MODEL" ] || {
+    echo "bonsai-27b-cli: model not found: $MODEL" >&2
+    echo "Run: $ENGINE/scripts/fetch_bonsai_27b_gguf.sh" >&2
+    exit 1
+}
+[ -x "$BIN_DIR/llama-cli" ] || {
+    echo "bonsai-27b-cli: PrismML llama-cli not found: $BIN_DIR/llama-cli" >&2
+    echo "Run: $ENGINE/scripts/install_bonsai_27b_gguf.sh" >&2
+    exit 1
+}
+
+cd "$ENGINE"
+exec env PYTHONPATH=src LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "${cmd[@]}"

@@ -17,6 +17,8 @@ __pycache__/
 # Built native binaries — build artifacts, NOT source. Rebuild per-host with tools/build_*.sh;
 # the engine loader prefers $BONSAI_NOTARY_HOME/bin and falls back to tools/.
 *.so
+bonsai/tools/prismml_teacher_forced
+bonsai/tools/prismml_tokenizer_server
 
 # Model weights — large, regenerable; fetched out-of-tree via scripts/fetch_weights.sh.
 *.gguf
@@ -33,6 +35,21 @@ receipts/
 bundles/
 sessions/
 debug/
+
+# ...but the unanchored `receipts/` above also matches the SOURCE receipt package at
+# bonsai/src/trinote/receipts/ (the canonical/signing/verify/ledger/emit/bundle stack the
+# whole engine imports). Re-include it — and the source `bundle/` sibling — so a fresh clone
+# is runnable and can verify receipts. Generated-state `receipts/`/`bundles/` dirs elsewhere
+# stay ignored. Keep these negations AFTER the ignores above.
+!bonsai/src/trinote/receipts/
+!bonsai/src/trinote/receipts/**
+!bonsai/src/trinote/bundle/
+!bonsai/src/trinote/bundle/**
+# The broad `**` re-includes would otherwise resurrect bytecode caches under these packages;
+# keep those out.
+bonsai/src/trinote/receipts/**/__pycache__/
+bonsai/src/trinote/bundle/**/__pycache__/
+*.pyc
 
 # Editor / OS cruft
 .vscode/

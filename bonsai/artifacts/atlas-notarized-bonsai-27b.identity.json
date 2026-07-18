@@ -1,0 +1,35 @@
+{
+  "format": "trinote-bonsai35-identity/1",
+  "inferenceEngine": "int-ref@bonsai-qwen35",
+  "modelHash": "7eab414ceff3fff1489053d415d0c6adb1e646e552d091cc1a898d0456adf3fb",
+  "name": "ATLAS-Notarized-Bonsai-27B",
+  "qualityGate": {
+    "caseCount": 10,
+    "count": 40,
+    "gateFile": "atlas-notarized-bonsai-27b.quality-gate.json",
+    "gateHash": "ed7cfdca1dbb0759dce78f5505fa01f173a656e44232a2b9858a0eb1082310d7",
+    "metric": "teacher-forced-top1-agreement-vs-prismml-libllama",
+    "prismRuntimeRelease": [
+      "prism-b9591-62061f9",
+      "62061f91088281e65071cc38c5f69ee95c39f14e",
+      "67c64046abcf73bf489e27c9ebe7525f5b77c58db9490d1d711efe6e17bf2975"
+    ],
+    "producer": "native",
+    "targetAgreement": 1.0,
+    "targetPass": true,
+    "targetThreshold": 0.5,
+    "teacherHarnessSha256": "aa27488ffdb20f17978c2d9769725e0c433dab887d152b6d2c35067e88d4b14e",
+    "threshold": 0.8,
+    "top1Pass": true,
+    "value": 1.0,
+    "verdict": "PASS"
+  },
+  "weightProvenance": {
+    "ggufFile": "Bonsai-27B-Q1_0.gguf",
+    "ggufSha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
+    "importer": "trinote.infer_int.import_bonsai35_gguf",
+    "kind": "imported-weights",
+    "quant": "GGUF Q1_0 g128",
+    "source": "prism-ml/Bonsai-27B-gguf"
+  }
+}

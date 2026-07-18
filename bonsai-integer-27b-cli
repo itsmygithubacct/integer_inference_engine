@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# bonsai-integer-27b-cli — native fixed-point Bonsai-27B/Qwen3.5 on Linux.
+#
+# Usage:
+#   bonsai-integer-27b-cli "What is a tensor?" [-n 64] [extra CLI flags...]
+#   bonsai-integer-27b-cli repl [--think] [--context-size N] [extra flags...]
+#
+# The default tries the fully resident integer CUDA graph, then cleanly falls
+# back to the resident fixed-point CPU executor.  Set BONSAI_INTEGER_27B_GPU=0
+# when PrismML already owns this 8 GiB GPU.  Receipts are disabled for an
+# interactive development REPL; append --receipt only with the artifact-bound
+# 27B identity (the tracked 8B identity intentionally fails the hash check).
+#
+# Import once if the native artifact is absent:
+#   cd bonsai
+#   PYTHONPATH=src .venv/bin/python -m trinote.cli.import_bonsai35_gguf_cli --context-len 4096
+#
+# Thread tuning (resolved before Python/NumPy starts):
+#   --threads N                       OpenMP worker count (default: physical cores)
+#   BONSAI_INTEGER_27B_THREADS=N      launcher-specific OpenMP override
+#   BONSAI_INTEGER_27B_BLAS_THREADS=N NumPy/BLAS backend override (default: 1)
+#   BONSAI_INTEGER_27B_GPU=0          disable resident CUDA (default: try GPU, clean CPU fallback)
+#   BONSAI_INTEGER_27B_MAX_NEW=N      default generation budget (default: 1024; -n overrides)
+#   BONSAI_CONTEXT_SIZE=N             override the artifact-aware context default (currently capped at 4096)
+set -euo pipefail
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="$ROOT/bonsai"
+PY="$ENGINE/.venv/bin/python"; [ -x "$PY" ] || PY="python3"
+NOTARY_HOME="${BONSAI_NOTARY_HOME:-$HOME/.local/trinote}"
+MODELS_DIR="${BONSAI_MODELS_DIR:-$NOTARY_HOME/models}"
+MODEL="${BONSAI_27B_GGUF:-$MODELS_DIR/Bonsai-27B-Q1_0.gguf}"
+ARTIFACT="${BONSAI_INTEGER_27B_ARTIFACT:-$MODELS_DIR/Bonsai-27B-Q1_0-int-qwen35.safetensors}"
+RELEASE="prism-b9591-62061f9"
+BIN_DIR="${BONSAI_27B_BIN_DIR:-$NOTARY_HOME/vendor/llama.cpp-bonsai27/$RELEASE/bin}"
+MAX_NEW="${BONSAI_INTEGER_27B_MAX_NEW:-1024}"
+
+# Thread-pool policy must be established before Python imports NumPy or loads
+# libgomp.  Bonsai-27B's integer contractions use the native OpenMP kernels;
+# allowing OpenBLAS/MKL/NumExpr to start a second team only oversubscribes the
+# host and can leave an idle REPL burning CPU in active spin waits.
+physical_core_count() {
+    local n=""
+    if command -v lscpu >/dev/null 2>&1; then
+        n="$(lscpu -p=SOCKET,CORE,ONLINE 2>/dev/null | awk -F, '
+            $1 !~ /^#/ && $3 == "Y" { seen[$1 ":" $2] = 1 }
+            END { print length(seen) }
+        ')"
+    fi
+    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+        n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+    fi
+    printf '%s\n' "$n"
+}
+
+cli_threads=""
+scan_args=("$@")
+for ((i = 0; i < ${#scan_args[@]}; i++)); do
+    case "${scan_args[$i]}" in
+        --threads=*) cli_threads="${scan_args[$i]#--threads=}" ;;
+        --threads)
+            if ((i + 1 < ${#scan_args[@]})); then
+                cli_threads="${scan_args[$((i + 1))]}"
+            fi
+            ;;
+    esac
+done
+if [ "$cli_threads" = "0" ]; then
+    cli_threads=""
+elif [ -n "$cli_threads" ] && ! [[ "$cli_threads" =~ ^[1-9][0-9]*$ ]]; then
+    echo "bonsai-integer-27b-cli: --threads must be a positive integer" >&2
+    exit 2
+fi
+
+blas_threads="${BONSAI_INTEGER_27B_BLAS_THREADS:-1}"
+[[ "$blas_threads" =~ ^[1-9][0-9]*$ ]] || {
+    echo "bonsai-integer-27b-cli: BONSAI_INTEGER_27B_BLAS_THREADS must be a positive integer" >&2
+    exit 2
+}
+: "${OPENBLAS_NUM_THREADS:=$blas_threads}"
+: "${MKL_NUM_THREADS:=$blas_threads}"
+: "${NUMEXPR_NUM_THREADS:=$blas_threads}"
+if [ -n "$cli_threads" ]; then
+    OMP_NUM_THREADS="$cli_threads"
+elif [ -n "${BONSAI_INTEGER_27B_THREADS:-}" ]; then
+    OMP_NUM_THREADS="$BONSAI_INTEGER_27B_THREADS"
+elif [ -z "${OMP_NUM_THREADS:-}" ]; then
+    OMP_NUM_THREADS="$(physical_core_count)"
+fi
+[[ "$OMP_NUM_THREADS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "bonsai-integer-27b-cli: Bonsai/OpenMP thread count must be a positive integer" >&2
+    exit 2
+}
+: "${OMP_DYNAMIC:=FALSE}"
+: "${OMP_WAIT_POLICY:=PASSIVE}"
+: "${OMP_PLACES:=cores}"
+: "${OMP_PROC_BIND:=close}"
+: "${OMP_MAX_ACTIVE_LEVELS:=1}"
+# GNU and Intel runtimes use these implementation-specific knobs in addition
+# to OMP_WAIT_POLICY.  Zero prevents post-region busy spinning at the REPL.
+: "${GOMP_SPINCOUNT:=0}"
+: "${KMP_BLOCKTIME:=0}"
+export OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS
+export OMP_NUM_THREADS OMP_DYNAMIC OMP_WAIT_POLICY OMP_PLACES OMP_PROC_BIND OMP_MAX_ACTIVE_LEVELS
+export GOMP_SPINCOUNT KMP_BLOCKTIME
+
+case "${1:-}" in -h|--help|help) usage 0 ;; esac
+[ "$(uname -s)" = "Linux" ] || { echo "bonsai-integer-27b-cli: Linux is required." >&2; exit 2; }
+
+prompt_args=()
+repl_args=()
+if [ "${1:-}" = "repl" ]; then
+    repl_args=(--repl)
+    shift
+elif [ $# -gt 0 ] && [ "${1:0:1}" != "-" ]; then
+    prompt_args=(-p "$1")
+    shift
+elif [ $# -eq 0 ]; then
+    usage 1
+fi
+
+[ -f "$MODEL" ] || { echo "bonsai-integer-27b-cli: GGUF not found: $MODEL" >&2; exit 1; }
+[ -f "$ARTIFACT" ] || {
+    echo "bonsai-integer-27b-cli: native artifact not found: $ARTIFACT" >&2
+    echo "Run: cd $ENGINE && PYTHONPATH=src $PY -m trinote.cli.import_bonsai35_gguf_cli --gguf $MODEL --out $ARTIFACT --context-len 4096" >&2
+    exit 1
+}
+
+cmd=("$PY" -m trinote.cli.run_bonsai_cli
+     --engine native --no-receipt --fast --fast-required
+     --gguf "$MODEL" --artifact "$ARTIFACT" --bin-dir "$BIN_DIR"
+     # Keep EOS unpenalized: the sampler's repetition window includes the
+     # prompt and control tokens.  A deterministic 4-gram guard arrests long
+     # loops without making the model less likely to stop naturally.
+     --chat --sampler bonsai27-rec --rep-penalty 1.0 --no-repeat-ngram 4
+     -n "$MAX_NEW"
+     "${repl_args[@]+"${repl_args[@]}"}"
+     "${prompt_args[@]+"${prompt_args[@]}"}" "$@")
+
+if [ "${BONSAI_INTEGER_27B_GPU:-1}" != "0" ]; then
+    cmd+=(--gpu)
+fi
+
+if [ "${BONSAI_DRYRUN:-0}" = "1" ]; then
+    printf '[bonsai-integer-27b-cli] would run (cwd=%s):' "$ENGINE"
+    printf ' %q' \
+        OPENBLAS_NUM_THREADS="$OPENBLAS_NUM_THREADS" MKL_NUM_THREADS="$MKL_NUM_THREADS" \
+        NUMEXPR_NUM_THREADS="$NUMEXPR_NUM_THREADS" OMP_NUM_THREADS="$OMP_NUM_THREADS" \
+        OMP_DYNAMIC="$OMP_DYNAMIC" OMP_WAIT_POLICY="$OMP_WAIT_POLICY" \
+        OMP_PLACES="$OMP_PLACES" OMP_PROC_BIND="$OMP_PROC_BIND" \
+        OMP_MAX_ACTIVE_LEVELS="$OMP_MAX_ACTIVE_LEVELS" GOMP_SPINCOUNT="$GOMP_SPINCOUNT" \
+        KMP_BLOCKTIME="$KMP_BLOCKTIME" BONSAI_NOTARY_HOME="$NOTARY_HOME" PYTHONPATH=src "${cmd[@]}"
+    printf '\n'
+    exit 0
+fi
+
+cd "$ENGINE"
+exec env BONSAI_NOTARY_HOME="$NOTARY_HOME" PYTHONPATH=src "${cmd[@]}"

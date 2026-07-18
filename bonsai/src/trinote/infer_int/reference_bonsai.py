@@ -8,6 +8,7 @@ signed sums followed by fixed-point scale application.
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -52,6 +53,62 @@ from .sampler import apply_rep_penalty
 
 _GROUP = 128
 _NEG_INF_SHIFT = 30
+_BYTE_SUBSET_MASKS = (
+    (np.arange(256, dtype=np.uint16)[:, None] >> np.arange(8, dtype=np.uint16)) & 1
+).astype(np.int64)
+_BYTE_SUBSET_MASKS.flags.writeable = False
+
+
+def _oracle_q1_worker_count() -> int:
+    raw = os.environ.get("TRINOTE_ORACLE_Q1_THREADS", "4")
+    try:
+        return max(1, min(32, int(raw)))
+    except ValueError:
+        return 4
+
+
+_ORACLE_Q1_WORKERS = _oracle_q1_worker_count()
+_ORACLE_Q1_POOL = (
+    ThreadPoolExecutor(max_workers=_ORACLE_Q1_WORKERS, thread_name_prefix="bonsai-q1-oracle")
+    if _ORACLE_Q1_WORKERS > 1 else None
+)
+
+
+def _q1_subset_output_chunk(
+    subset_lut: np.ndarray,
+    totals: np.ndarray,
+    block_index: np.ndarray,
+    byte_index: np.ndarray,
+    bits: np.ndarray,
+    scales: np.ndarray,
+    frac: int,
+    lo: int,
+    hi: int,
+) -> tuple[int, np.ndarray]:
+    """Evaluate independent output rows for the pure packed-byte oracle."""
+    selected = subset_lut[
+        block_index, byte_index, bits[lo:hi]
+    ].sum(axis=2, dtype=np.int64)
+    acc = (selected << np.int64(1)) - totals[None, :]
+    values = ((acc * scales[lo:hi]) >> frac).sum(axis=1, dtype=np.int64)
+    return lo, values
+
+
+def _q1_expanded_output_chunk(
+    x_groups: np.ndarray,
+    bits: np.ndarray,
+    scales: np.ndarray,
+    frac: int,
+    lo: int,
+    hi: int,
+) -> tuple[int, np.ndarray]:
+    """Evaluate independent multi-token output rows with the original equation."""
+    signs = _unpack_q1_signs(bits[lo:hi]).astype(np.int64)
+    acc = np.einsum("tbi,obi->tob", x_groups, signs, optimize=True)
+    values = ((acc * scales[lo:hi][None, :, :]) >> frac).sum(
+        axis=2, dtype=np.int64
+    )
+    return lo, values
 
 # OVERFLOW POLICY for the Q1_0 linear (decision #q1-wrap) — deliberately DIFFERENT from the attention
 # `fixed_point_matmul`, which fails loud (`_assert_no_int64_overflow`). The dominant Q1_0 product
@@ -98,14 +155,62 @@ def q1_linear_ref(x_fp: np.ndarray, bits: np.ndarray, scale_fp: np.ndarray, frac
     out_f, n_blocks = s.shape
     if x.shape[1] != n_blocks * _GROUP:
         raise ValueError(f"Q1_0 contraction mismatch: x has {x.shape[1]}, weight expects {n_blocks * _GROUP}")
+    # Decode is overwhelmingly the canonical 27B receipt oracle's bottleneck.
+    # For one activation row, evaluate each packed byte through a 256-entry
+    # subset-sum table instead of expanding every weight bit to an int64 sign:
+    #
+    #   sum(x_i * sign_i) = 2 * sum(x_i where bit_i=1) - sum(x_i)
+    #
+    # This is the same identity in Z/(2^64): all NumPy int64 additions,
+    # subtractions, shifts, and products retain the oracle's deliberate wrap
+    # semantics even at adversarial extrema. It also keeps the verifier a pure
+    # NumPy implementation, independent of every native producer handle.
+    if x.shape[0] == 1:
+        if out_chunk <= 0:
+            raise ValueError("out_chunk must be positive")
+        xb = x.reshape(n_blocks, 16, 8)
+        subset_lut = np.einsum(
+            "bqe,me->bqm", xb, _BYTE_SUBSET_MASKS, optimize=True
+        )
+        totals = xb.sum(axis=(1, 2), dtype=np.int64)
+        block_index = np.arange(n_blocks)[None, :, None]
+        byte_index = np.arange(16)[None, None, :]
+        out = np.empty((1, out_f), dtype=np.int64)
+        ranges = [
+            (lo, min(lo + out_chunk, out_f))
+            for lo in range(0, out_f, out_chunk)
+        ]
+        def apply_chunk(bounds):
+            return _q1_subset_output_chunk(
+                subset_lut, totals, block_index, byte_index, b, s, frac, *bounds
+            )
+        if _ORACLE_Q1_POOL is not None and len(ranges) > 1:
+            chunks = _ORACLE_Q1_POOL.map(apply_chunk, ranges)
+        else:
+            chunks = map(apply_chunk, ranges)
+        for lo, values in chunks:
+            out[0, lo:lo + values.size] = values
+        return out
+
     # int64 wrap is permitted here and bit-identical to the native kernel — see the OVERFLOW POLICY note above.
     xg = x.reshape(x.shape[0], n_blocks, _GROUP)
+    if out_chunk <= 0:
+        raise ValueError("out_chunk must be positive")
     out = np.empty((x.shape[0], out_f), dtype=np.int64)
-    for lo in range(0, out_f, out_chunk):
-        hi = min(lo + out_chunk, out_f)
-        signs = _unpack_q1_signs(b[lo:hi]).astype(np.int64)
-        acc = np.einsum("tbi,obi->tob", xg, signs, optimize=True)
-        out[:, lo:hi] = ((acc * s[lo:hi][None, :, :]) >> frac).sum(axis=2)
+    ranges = [
+        (lo, min(lo + out_chunk, out_f))
+        for lo in range(0, out_f, out_chunk)
+    ]
+
+    def apply_expanded(bounds):
+        return _q1_expanded_output_chunk(xg, b, s, frac, *bounds)
+
+    if _ORACLE_Q1_POOL is not None and len(ranges) > 1:
+        chunks = _ORACLE_Q1_POOL.map(apply_expanded, ranges)
+    else:
+        chunks = map(apply_expanded, ranges)
+    for lo, values in chunks:
+        out[:, lo:lo + values.shape[1]] = values
     return out
 
 
@@ -147,31 +252,43 @@ def fixed_point_silu(x_fp: np.ndarray, frac: int, *, native: bool = False) -> np
         if out is not None:
             return out
     sig = fixed_point_sigmoid(x, frac)
+    # x*sig is NOT fail-loud-guarded: the SiLU activation path is a tested wrap-by-construction exception to
+    # §3.4 (like the Q1 apply), byte-identical to silu_native at the int64 extremes
+    # (test_bonsai_native_silu_matches_oracle_if_present). A raise here would desync the oracle from the C/GPU
+    # producers. Real activations stay in-envelope (RMSNorm-bounded); an out-of-envelope x wraps consistently.
     return (x * sig) >> frac
 
 
-def _rmsnorm(x_fp: np.ndarray, frac: int, gain: np.ndarray, *, native: bool = False) -> np.ndarray:
+def _rmsnorm(x_fp: np.ndarray, frac: int, gain: np.ndarray, *, native: bool = False,
+             eps: int = 1) -> np.ndarray:
     if native and _gpu_full_enabled():
         try:
-            g = rmsnorm_gpu(x_fp, frac, 1, gain)          # byte-identical; None on overflow/unavailable -> CPU
+            g = rmsnorm_gpu(x_fp, frac, eps, gain)        # byte-identical; None on overflow/unavailable -> CPU
         except (MemoryError, RuntimeError):
             g = None
         if g is not None:
             return g
     if native and _native_rmsnorm_enabled():
         try:
-            out = rmsnorm_native(x_fp, frac, gain_q=gain)
+            out = rmsnorm_native(x_fp, frac, eps=eps, gain_q=gain)
         except (MemoryError, RuntimeError):
             out = None
         if out is not None:
             return out
-    return fixed_point_rmsnorm(x_fp, frac, gain_q=gain)
+    return fixed_point_rmsnorm(x_fp, frac, eps=eps, gain_q=gain)
 
 
-def _head_rmsnorm(x_heads: np.ndarray, frac: int, gain: np.ndarray, *, native: bool = False) -> np.ndarray:
+def _head_rmsnorm(
+    x_heads: np.ndarray,
+    frac: int,
+    gain: np.ndarray,
+    *,
+    native: bool = False,
+    eps: int = 1,
+) -> np.ndarray:
     """RMSNorm over the head_dim axis for `(H,T,hd)` head tensors."""
     h, t, d = x_heads.shape
-    y = _rmsnorm(x_heads.reshape(h * t, d), frac, gain, native=native)
+    y = _rmsnorm(x_heads.reshape(h * t, d), frac, gain, native=native, eps=eps)
     return y.reshape(h, t, d)
 
 
@@ -322,12 +439,16 @@ def _gpu_enabled() -> bool:
 def _verify_gpu_enabled() -> bool:
     """Opt-in (default OFF) GPU byte-exactness self-check. Enable with BONSAI_VERIFY_GPU=1.
 
-    When set, every GPU Q1 apply (`_gpu_apply`) re-runs the CPU int64 oracle (`q1_linear_ref`) for the SAME
-    inputs and asserts byte-equality, raising loudly on any mismatch — so a silently-wrong GPU result can NEVER
-    return rc=0 and slip into a notarized receipt. OFF by default because re-running the oracle defeats the GPU
-    perf win; this is a CI / spot-check gate, the runtime complement to the standalone parity tests. The GPU
-    .so is gitignored/per-host so default CI cannot exercise it — set this (with hardware present) to enforce
-    the "byte-identical to the CPU oracle" contract at runtime. See research/bonsai-notary/IMPLEMENT-GPU-MODE.md."""
+    SCOPE (be precise — this is a load-bearing security claim): when set, every DISCRETE GPU Q1 apply routed
+    through `_gpu_apply`/`_gpu_oracle_check` re-runs the CPU int64 oracle (`q1_linear_ref`) for the same inputs
+    and asserts byte-equality, raising on any mismatch. It does NOT cover the fused on-device PREFILL MONOLITH
+    (`prefill_forward_gpu`) or the RESIDENT-DECODE path, which compute Q1 applies + RMSNorm + RoPE + SiLU +
+    attention entirely on-device without per-op oracle re-checks — so this flag alone does not prove those
+    paths byte-exact. Those are gated instead by the standalone kernel↔oracle PARITY TESTS (run with GPU
+    hardware present); the runtime flag is a per-apply spot-check, not a whole-forward guarantee. OFF by
+    default (re-running the oracle defeats the GPU perf win). The GPU .so is gitignored/per-host so default CI
+    cannot exercise either mechanism. For a fully oracle-checked run, use the CPU/native path (the canonical
+    verifier) — a GPU-produced receipt is verified by re-executing it on that CPU oracle regardless."""
     v = os.environ.get("BONSAI_VERIFY_GPU")
     if v is None:
         return False
@@ -482,7 +603,10 @@ def _ffn_ref(x_fp, layer, frac, q1=_q1_bl_ref):
         up = q1(x_fp, layer, "wu", frac)
     else:
         gate, up = gate_up
-    h = (fixed_point_silu(gate, frac, native=native) * up) >> frac
+    silu = fixed_point_silu(gate, frac, native=native)
+    # silu*up shares the SiLU path's wrap-by-construction contract (the same shared NumPy line runs for the
+    # oracle and native FFN, so it can never desync them); real gate/up are RMSNorm-bounded and in-envelope.
+    h = (silu * up) >> frac
     return q1(h, layer, "w2", frac)
 
 
