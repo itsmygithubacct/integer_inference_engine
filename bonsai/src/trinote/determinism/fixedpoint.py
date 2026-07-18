@@ -118,6 +118,13 @@ def fixed_point_softmax(logits_q: np.ndarray, frac_bits: int = 16) -> np.ndarray
     # cannot wrap at any in-range frac. At frac=16 the first term (~8.2e5) dominates, so this min() is a
     # no-op for the committed model and the d_clip value is unchanged.
     d_clip = np.int64(min(((frac_bits + 2) << (2 * frac_bits)) // log2e, (1 << 62) // log2e))
+    # NOTE (determinism contract): the distance `m - row` is NOT fail-loud-bounded like the matmul path.
+    # For a well-formed row (a bounded causal-mask sentinel ~-2^(frac+30), which the engine always uses) the
+    # clamp `np.minimum(m-row, d_clip)` gives the correct 0-weight for masked entries. If a caller instead
+    # passes an int64-min-scale sentinel, `m-row` wraps int64 and that entry gets ~0.5 weight — WRONG, but
+    # still deterministic AND byte-identical to the native/GPU kernels (they wrap the same way; pinned by
+    # test_bonsai_native_silu_matches_oracle_if_present at the int64 extremes). This is the same
+    # wrap-by-construction exception as the Q1 apply, not a fail-loud multiply. Use a bounded mask sentinel.
     out = np.empty(z.shape, dtype=np.int64)
     for r in range(z.shape[0]):
         row = z[r]
@@ -151,6 +158,10 @@ def fixed_point_sigmoid(logits_q: np.ndarray, frac_bits: int = 16) -> np.ndarray
     # for committed receipts (verified over a wide input sweep); the two forms only diverge near frac=29
     # (outside the committed envelope), where the cap brings sigmoid into lockstep with softmax.
     d_clip = np.int64(min(((frac_bits + 2) << (2 * frac_bits)) // log2e, (1 << 62) // log2e))
+    # Same wrap-by-construction contract as fixed_point_softmax (see its note): `m - x` is intentionally not
+    # fail-loud-bounded — for bounded activations it is exact, and at int64 extremes it wraps byte-identically
+    # to the native SiLU kernel (pinned by test_bonsai_native_silu_matches_oracle_if_present). Determinism is
+    # preserved by consistent wrap, not by raising (a raise would desync the oracle from the C/GPU producers).
     zero = np.zeros((), dtype=np.int64)
     m = np.maximum(x, zero)
     d0 = np.minimum((m - zero).astype(np.int64), d_clip)
@@ -241,4 +252,11 @@ def fixed_point_matmul_ordered(a_fp: np.ndarray, b_fp: np.ndarray, perm: np.ndar
 def fixed_point_squared_relu(x_fp: np.ndarray, frac_bits: int = 16) -> np.ndarray:
     """squared-ReLU in fixed-point: relu(x)^2. Exactly representable (clamp then integer square)."""
     x = np.maximum(np.asarray(x_fp, dtype=np.int64), 0)
+    # Fail loud rather than silently wrap the int64 square (the module's overflow contract): a wrapped x*x
+    # is deterministic-but-wrong, the failure a receipt cannot detect. max(x) computed as a Python int.
+    xm = int(x.max()) if x.size else 0
+    if xm * xm > _INT64_MAX:
+        raise OverflowError(
+            f"fixed_point_squared_relu would overflow int64: max(x)^2 = {xm * xm} > 2^63-1 "
+            f"(activation left the fixed-point envelope — a determinism bug, not a quiet wrap)")
     return (x * x) >> frac_bits              # scale 2**(2f) -> 2**f

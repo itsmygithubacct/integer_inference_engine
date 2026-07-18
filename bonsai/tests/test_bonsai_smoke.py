@@ -1713,18 +1713,21 @@ def test_bonsai_native_silu_matches_oracle_if_present():
 
     if not qn.q1_native_available() or not hasattr(qn._load_lib(), "bonsai_silu_i64"):
         pytest.skip("native SiLU kernel (bonsai_silu_i64) not available")
-    frac = 16
     rng = np.random.default_rng(61)
-    for shape in ((4, 256), (1, 33), (7, 129), (3, 12288)):
-        for lo, hi in ((-(1 << 14), 1 << 14), (-(1 << 20), 1 << 20), (-(1 << 40), 1 << 40)):
-            x = rng.integers(lo, hi, size=shape, dtype=np.int64)
-            native = qn.silu_native(x, frac)
-            oracle = fixed_point_silu(x, frac, native=False)
-            assert native is not None
-            assert np.array_equal(native, oracle)
-    edges = np.array([[np.iinfo(np.int64).max, np.iinfo(np.int64).min, 0, 1, -1,
-                       1 << 16, -(1 << 16), 1 << 45]], dtype=np.int64)
-    assert np.array_equal(qn.silu_native(edges, frac), fixed_point_silu(edges, frac, native=False))
+    # Sweep frac: 16 (committed) AND 29 (the envelope edge where the kernel d_clip previously omitted the
+    # (1<<62)//log2e cap the oracle applies, so native and oracle diverged — review-3 MEDIUM).
+    for frac in (16, 29):
+        for shape in ((4, 256), (1, 33), (7, 129), (3, 12288)):
+            for lo, hi in ((-(1 << 14), 1 << 14), (-(1 << 20), 1 << 20), (-(1 << 40), 1 << 40)):
+                x = rng.integers(lo, hi, size=shape, dtype=np.int64)
+                native = qn.silu_native(x, frac)
+                oracle = fixed_point_silu(x, frac, native=False)
+                assert native is not None
+                assert np.array_equal(native, oracle), f"frac={frac}"
+        edges = np.array([[np.iinfo(np.int64).max, np.iinfo(np.int64).min, 0, 1, -1,
+                           1 << 16, -(1 << 16), 1 << 45]], dtype=np.int64)
+        assert np.array_equal(qn.silu_native(edges, frac), fixed_point_silu(edges, frac, native=False)), \
+            f"frac={frac} edges"
 
 
 def test_bonsai_native_silu_thread_count_invariant_if_present():

@@ -90,7 +90,7 @@ def debug_dir_default() -> str:
 # --- Non-receipt data homes (weights, benchmark outputs, built kernels, vendored llama.cpp) ----------------
 #
 # Historically these lived INSIDE the checked-out repo (``<repo>/models``, ``<repo>/benchmarks/results``,
-# ``<repo>/tools/*.so``, and an author-specific ``~/research/refs/...`` for llama.cpp). They now default under
+# ``<repo>/tools/*.so``, and an ad-hoc source checkout for llama.cpp). They now default under
 # ``$BONSAI_NOTARY_HOME`` too, so the repo tree holds only source. Each has a dedicated env override (mirroring
 # ``$BONSAI_DEBUG_DIR``), and the ``default_*`` resolvers PREFER the notary location but fall back to the
 # legacy in-repo / dev path when that is where the data still is — so existing installs keep working until the
@@ -170,7 +170,5 @@ def llama_dir() -> Path:
 
 
 def default_bin_dir() -> str:
-    """``llama-tokenize`` build/bin dir; prefers the notary vendor tree, falls back to the legacy author path
-    ``~/research/refs/PrismML-llama.cpp/build/bin`` if that is where it was built."""
-    return str(_resolve(llama_dir() / "build" / "bin",
-                        Path.home() / "research" / "refs" / "PrismML-llama.cpp" / "build" / "bin"))
+    """Default ``llama-tokenize`` build/bin directory under the configurable vendor tree."""
+    return str(llama_dir() / "build" / "bin")

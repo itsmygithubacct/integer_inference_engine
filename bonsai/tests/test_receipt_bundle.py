@@ -69,6 +69,23 @@ def test_tamper_receipt_file_detected(tmp_path):
     assert "file:receipt.json" in names
 
 
+def test_verify_bundle_failclosed_on_noninteger_seed(tmp_path):
+    """review-3 MEDIUM: a crafted receipt whose trace.sampler.seed is not an integer makes chain_artifact()
+    raise inside _verify_offline. verify_bundle must catch it and fail closed, not crash the verifier."""
+    rb = _receipt_bundle()
+    receipt = rb["receipt"]
+    onchain = {"kind": "standalone", "network": "main", "tag": "trinote/r1",
+               "txid": "ab" * 32, "modelHash": receipt["modelHash"], "receiptHash": receipt["receiptHash"]}
+    pack_bundle(bundle=rb, onchain=onchain, out_dir=tmp_path / "bseed")
+    rp = tmp_path / "bseed" / "receipt.json"
+    data = json.loads(rp.read_text())
+    data.setdefault("trace", {}).setdefault("sampler", {})["seed"] = "not-an-integer"
+    rp.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")))
+    out = verify_bundle(tmp_path / "bseed")                  # must NOT raise
+    assert isinstance(out, dict) and out["ok"] is False
+    assert any(not c["ok"] for c in out["offline"]["checks"])
+
+
 def test_tamper_manifest_bundlehash_detected(tmp_path):
     rb = _receipt_bundle()
     receipt = rb["receipt"]

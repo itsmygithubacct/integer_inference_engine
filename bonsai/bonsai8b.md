@@ -1,6 +1,6 @@
 # Bonsai-8B — the reference instance of the deterministic integer inference engine
 
-> **Status: built, byte-exact, measured, in production use** at `~/bonsai-notarized-bitnet`. This is the
+> **Status: built, byte-exact, measured, in production use.** This is the
 > concrete realization of the design in [`../integer_engine.md`](../integer_engine.md): an all-integer,
 > byte-reproducible inference engine running a real 8B 1-bit (Q1_0) model, with cryptographic receipts. Where
 > the parent doc is the generalized vision (BitNet-style + Ollama), this is the proven, specific implementation.
@@ -125,7 +125,7 @@ Weights live out-of-repo (fetched separately); all generated state goes under `$
 (`~/.local/trinote`), never into the repo tree.
 
 ```bash
-cd ~/bonsai-notarized-bitnet
+cd integer_inference_engine/bonsai
 scripts/fetch_weights.sh                       # GGUF + imported safetensors (one-time)
 tools/build_bonsai_q1_kernel.sh                # CPU native kernel (byte-exact fast path)
 tools/build_bonsai_q1_gpu.sh                   # optional: per-host CUDA producer (--gpu)
@@ -154,12 +154,14 @@ scripts/bonsai.sh onchain   "Notarize this." --chain-confirm   # + BSV third ent
 `gguf_tokenizer_v2.py`.
 **Runtime / receipts:** `infer_int/bonsai_runtime.py` (generate + `emit_and_verify_*` + `load_or_generate_signing_keys`),
 `infer_int/verify.py`, `src/trinote/receipts/` (signing/ledger/verify/bundle).
-**Entry points:** `cli/run_bonsai_cli.py`, `cli/json_mode.py`, `cli/agent_cli.py`, `scripts/bonsai.sh`,
-`bonsai_notary.sh`.
+**Entry points:** `cli/run_bonsai_cli.py`, `cli/json_mode.py`, `cli/receipt_bundle_cli.py`,
+`cli/import_bonsai_gguf_cli.py`, `cli/quality_gate_bonsai_cli.py`, `scripts/bonsai.sh`, and the repo-root
+`bonsai-cli` launcher.
 **Tests:** `tests/test_bonsai_smoke.py` (engine/native parity, samplers, receipts), `tests/test_bonsai_gpu.py`
-(GPU parity gate), `tests/test_receipt_bundle.py`.
-**Specs:** `docs/architecture/{INFERENCE-ENGINE,DETERMINISM,SAMPLER-INTEGER,GPU-INTEGER-KERNEL,PERFORMANCE,BOUNDARY}.md`
-in-repo; `~/research/bonsai-notary/{Q1-BITMATMUL-REFORMULATION,GPU-FEASIBILITY,IMPLEMENT-GPU-MODE,…}.md`.
+(GPU parity gate), `tests/test_receipt_bundle.py`, `tests/test_review_fixes.py`, `tests/test_parity.py`.
+**Design notes (external, not in this repo):** the `Q1-BITMATMUL-REFORMULATION`, `GPU-FEASIBILITY`,
+`IMPLEMENT-GPU-MODE`, `DETERMINISM`, and `SAMPLER-INTEGER` specs live in the author's `bonsai-notary` research
+tree, not under this standalone repo — treat references to them as provenance, not in-repo paths.
 
 ---
 
@@ -170,8 +172,12 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/test_bonsai_smoke.py -q     # en
 PYTHONPATH=src .venv/bin/python -m pytest tests/test_bonsai_gpu.py   -q     # GPU kernels == oracle (skips if no GPU)
 ```
 Every generation also **self-verifies before emitting its receipt** (recomputes commitments + re-executes
-bit-exactly → the `[receipt] … VERIFIED` line). A stored bundle is independently re-verifiable with
-`trinote-receipt-bundle verify --reexec` (offline, on the CPU oracle).
+bit-exactly → the `[receipt] … VERIFIED` line). A stored bundle is independently re-verifiable offline on the CPU
+oracle (no console script is installed — invoke the module directly); `--reexec` requires `--artifact`:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m trinote.cli.receipt_bundle_cli verify <bundle_dir> --reexec --artifact <A.safetensors>
+```
 
 ---
 
