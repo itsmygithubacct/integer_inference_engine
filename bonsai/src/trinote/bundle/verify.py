@@ -370,6 +370,17 @@ def commit_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _failclosed_layer(label: str, fn):
+    """Run a verification layer, converting ANY exception into a failing check (never an escaping raise).
+    A crafted bundle must not be able to crash the public verifier — an unexpected exception on adversarial
+    input is a verification failure, so this catches broadly by design."""
+    try:
+        return fn()
+    except Exception as e:                                   # noqa: BLE001 — security boundary, fail closed
+        return {"ok": False, "checks": [{"check": f"{label}.error", "ok": False,
+                                         "detail": f"{type(e).__name__}: {e}"}]}
+
+
 def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "main",
                   reexec: bool = False, model=None, model_digest: str | None = None,
                   model_pubkey: str | None = None, counterparty_pubkey: str | None = None,
@@ -382,12 +393,17 @@ def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "ma
     to the committed `identity.json` (`agentPubKey`/`counterpartyPubKey`) so the action's own identity is
     enforced unless the caller overrides.
     """
+    # A malformed CONTAINER (unparseable/corrupt archive, missing manifest) raises a typed BundleError — a
+    # deliberate, tested contract the caller catches (test_corrupt_tar_raises_bundle_error). What must NOT
+    # escape is a crash while processing well-formed-but-ADVERSARIAL CONTENT (e.g. a non-integer
+    # trace.sampler.seed makes chain_artifact() raise inside _verify_offline). So load_bundle propagates, and
+    # each content layer below is fail-closed (sibling of receipts.verify_receipt's #10 guard).
     loaded = load_bundle(path)
     manifest = loaded["manifest"]
     result = {"kind": manifest.get("kind"), "bundleHash": manifest.get("bundleHash"),
               "path": loaded["root"]}
 
-    off = _verify_offline(loaded)
+    off = _failclosed_layer("offline", lambda: _verify_offline(loaded))
     result["offline"] = off
     layers_ok = [off["ok"]]
 
@@ -397,7 +413,7 @@ def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "ma
                                  "checks": [{"check": "onchain.localBundle", "ok": True,
                                              "detail": "local bundle has no on-chain third entry (BSV off)"}]}
         else:
-            on = _verify_onchain(loaded, network)
+            on = _failclosed_layer("onchain", lambda: _verify_onchain(loaded, network))
             result["onchain"] = on
             layers_ok.append(on["ok"])
 
@@ -407,11 +423,13 @@ def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "ma
                                 "detail": "re-exec requested but no model supplied"}]}
             layers_ok.append(False)
         else:
-            identity = loaded["obj"].get("identity.json") or {}
-            mpk = model_pubkey or (identity.get("agentPubKey") if manifest.get("kind") == "stateful" else None)
-            cpk = counterparty_pubkey or (identity.get("counterpartyPubKey") if manifest.get("kind") == "stateful" else None)
-            rx = _verify_reexec(loaded, model, model_digest, model_pubkey=mpk, counterparty_pubkey=cpk,
-                                sample_k=sample_k, sample_seed=sample_seed)
+            def _do_reexec():
+                identity = loaded["obj"].get("identity.json") or {}
+                mpk = model_pubkey or (identity.get("agentPubKey") if manifest.get("kind") == "stateful" else None)
+                cpk = counterparty_pubkey or (identity.get("counterpartyPubKey") if manifest.get("kind") == "stateful" else None)
+                return _verify_reexec(loaded, model, model_digest, model_pubkey=mpk, counterparty_pubkey=cpk,
+                                      sample_k=sample_k, sample_seed=sample_seed)
+            rx = _failclosed_layer("reexec", _do_reexec)
             result["reexec"] = rx
             layers_ok.append(rx["ok"])
 

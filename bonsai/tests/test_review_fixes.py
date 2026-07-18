@@ -126,6 +126,69 @@ def test_verify_receipt_failclosed_on_non_dict():
     assert isinstance(res, dict) and res.get("ok") is False
 
 
+# --- review-3 HIGH: empty inputIds must not false-accept via negative-index wrap ------------------
+
+def test_row_predicting_output_refuses_empty_prompt_first_token():
+    """The predicting row for output[0] with empty inputIds is index -1; indexing full[-1] would wrap
+    to the LAST prefill row (a false-accept vector). The helper must fail loud instead."""
+    import numpy as np
+    from trinote.infer_int.verify import _row_predicting_output
+    full = np.arange(30, dtype=np.int64).reshape(3, 10)   # 3 prefill rows
+    # output[0] with no input has no predicting row -> raise, do NOT return full[-1]
+    with pytest.raises(ValueError):
+        _row_predicting_output(model=None, input_ids=[], output_ids=[7], i=0, eff=64, full=full)
+    # sanity: a legitimate prefix still resolves (input=[a], output[0] predicted by row 0)
+    row = _row_predicting_output(model=None, input_ids=[1], output_ids=[7], i=0, eff=64, full=full)
+    assert np.array_equal(row, full[0])
+
+
+def test_verify_receipt_rejects_empty_inputids_bundle():
+    """A crafted bundle with empty inputIds and a non-empty output must be rejected at the boundary,
+    never reaching re-execution (would otherwise be the forged-receipt vector)."""
+    from trinote.receipts.verify import verify_receipt
+    bundle = {"receipt": {"modelHash": "00" * 32,
+                          "inputCommit": "x", "outputCommit": "y", "receiptHash": "z"},
+              "preimage": {"inputIds": [], "outputIds": [4, 5]}}
+    res = verify_receipt(bundle)             # must not raise
+    assert isinstance(res, dict) and res.get("ok") is False and res.get("fullyVerified") is False
+
+
+# --- review-3 MEDIUM: importer must fail loud on non-finite / out-of-range float scales ------------
+
+def test_import_rint_to_fixed_rejects_non_finite():
+    import numpy as np
+    from trinote.infer_int.import_bonsai_gguf import _rint_to_fixed_i64
+    # finite values round correctly
+    out = _rint_to_fixed_i64(np.array([0.5, -0.5, 1.0], dtype=np.float64), 16, "test")
+    assert out.dtype == np.int64 and out[2] == (1 << 16)
+    for bad in (np.nan, np.inf, -np.inf):
+        with pytest.raises(ValueError):
+            _rint_to_fixed_i64(np.array([1.0, bad], dtype=np.float64), 16, "test")
+    # a scale too large to hold in int64 at this frac is rejected, not silently wrapped
+    with pytest.raises(ValueError):
+        _rint_to_fixed_i64(np.array([1e30], dtype=np.float64), 40, "test")
+
+
+def test_import_rejects_out_of_range_frac():
+    import pytest
+    from trinote.infer_int.import_bonsai_gguf import import_bonsai_gguf_to_artifact
+    for bad in (0, 30, -1, 64):
+        with pytest.raises(ValueError):
+            import_bonsai_gguf_to_artifact("/nonexistent.gguf", frac=bad)   # frac checked before file open
+
+
+# --- review-3 MEDIUM: bonsai DP4A L=4 envelope must equal the exact balanced-base-256 capacity ------
+
+def test_dp4a_l4_envelope_matches_balanced_capacity():
+    """The L=4 range guard (host + device) must clamp to the EXACT max magnitude 4 balanced base-256 digits
+    hold — 127*(256^4-1)/255 up, -128*(256^4-1)/255 down — not a looser 2^31 bound, else it would admit
+    values the greedy decomposition can't reconstruct (a silent GPU wrap)."""
+    from trinote.infer_int.gpu_native import _L4_LO, _L4_HI
+    cap = (256 ** 4 - 1) // 255
+    assert _L4_HI == 127 * cap == 2139062143
+    assert _L4_LO == -128 * cap == -2155905152
+
+
 # --- review-2 #2: offline rawTx-binding must fail closed on a truncated rawTx (not crash) ---------
 
 def test_parse_tx_raises_chainreaderror_and_verify_catches_it():

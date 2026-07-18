@@ -126,6 +126,12 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
             raise ValueError("bundle receipt and preimage must be dicts")
         in_ids = _token_ids(preimage["inputIds"], "preimage.inputIds")
         out_ids = _token_ids(preimage["outputIds"], "preimage.outputIds")
+        # A trustless generation receipt MUST commit a non-empty prompt: re-execution derives output[i]
+        # from row (len(input)+i-1), so an empty inputIds makes output[0]'s predicting row index -1 —
+        # NumPy would wrap that to the last prefill row and a crafted bundle could reach fullyVerified for
+        # a token the model never produced. The engine never generates from an empty context, so reject it.
+        if out_ids and not in_ids:
+            raise ValueError("preimage.inputIds is empty — a generation receipt must commit a non-empty prompt")
         _validate_vocab(model, in_ids + out_ids)
         model_hash = str(receipt["modelHash"])
     except (KeyError, TypeError, ValueError) as e:

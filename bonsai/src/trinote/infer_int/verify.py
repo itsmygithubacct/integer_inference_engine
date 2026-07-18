@@ -115,8 +115,18 @@ def _row_predicting_output(model, input_ids, output_ids, i: int, eff: int, full=
     turn fits `eff_ctx`, read it from the single prefill `full`; otherwise forward the SAME clamped
     prefix the engine used (`(input+output[:i])[-eff:]`) and take its last row.
     """
+    # Absolute index of the predicting row. When input is empty AND i==0 this is -1, which would silently
+    # index `full[-1]` (the LAST prefill row) via NumPy negative-index wrap — a false-accept vector: a
+    # bundle with empty inputIds could satisfy `output[0] == argmax(full[-1])` and reach fullyVerified for
+    # a token the model never produced. There is no valid predicting row for the first token of an
+    # empty-prompt turn (nothing precedes it), so fail loud instead of wrapping.
+    predicting = len(input_ids) + i - 1
+    if predicting < 0:
+        raise ValueError(
+            "no predicting row for output[0] with empty inputIds — a generation receipt must commit a "
+            "non-empty prompt; refusing to index full[-1] by negative-index wrap")
     if full is not None:
-        return full[len(input_ids) + i - 1]
+        return full[predicting]
     return model.forward((list(input_ids) + list(output_ids)[:i])[-eff:])[-1]
 
 
