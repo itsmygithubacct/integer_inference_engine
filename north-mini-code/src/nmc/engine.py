@@ -22,6 +22,8 @@ FA, FW = int(os.environ.get("NMC_FA", "16")), 24
 # DP4A pays only on large (compute-bound) matmuls; below this (out_f·rows) the limb-gen overhead regresses it.
 DP4A_MIN_WORK = int(os.environ.get("NMC_DP4A_MIN_WORK", str(1 << 17)))
 _DEFAULT_TOK = str(Path.home() / ".local/integer_inference_engine/north-mini-code/tokenizer")
+_DEFAULT_CONTEXT_LENGTH = 8192
+_MAX_CONTEXT_LENGTH = 1_048_576
 
 
 def select_backend(want=None):
@@ -47,6 +49,11 @@ class Engine:
             sliding_window=kv[f"{A}.attention.sliding_window"], n_experts=kv[f"{A}.expert_count"],
             n_used=kv[f"{A}.expert_used_count"], expert_ffn=kv[f"{A}.expert_feed_forward_length"],
             rope_base=float(kv[f"{A}.rope.freq_base"]), fa=FA, fw=FW)
+        self.context_length = int(kv.get(f"{A}.context_length", _DEFAULT_CONTEXT_LENGTH))
+        if not 1 <= self.context_length <= _MAX_CONTEXT_LENGTH:
+            raise ValueError(
+                f"{A}.context_length must be in [1, {_MAX_CONTEXT_LENGTH}], got {self.context_length}"
+            )
         self.NL = kv[f"{A}.block_count"]; self.DENSE = kv[f"{A}.leading_dense_block_count"]
         self.kn, self.resident, self.bname = select_backend(backend)
         self.fused = self.resident and qk_cuda.moe_ffn_available()
@@ -129,6 +136,7 @@ class Engine:
         attn = self._klin(p + "attn_output.weight", c2.attention_cached(q, cache.k[li], cache.v[li], start, cfg, window))
         if li < self.DENSE:
             gg = c2.silu_int(self._klin(p + "ffn_gate.weight", h), FA); uu = self._klin(p + "ffn_up.weight", h)
+            c2._assert_i64_contraction(c2._absmax_int(gg), c2._absmax_int(uu), 1, "dense FFN silu(gate)*up")
             gu = ((gg * uu) >> FA)                                 # int64 (gg·uu ≲ 2**40 fits) — lever 2
             ffn = self._klin(p + "ffn_down.weight", gu)
         else:
@@ -171,10 +179,20 @@ class Engine:
     def _rope(self, n):
         return c2.build_rope_tables(n, self.cfg.head_dim, base=int(self.cfg.rope_base), frac_bits=FA)
 
+    def _require_context(self, rows: int) -> int:
+        rows = int(rows)
+        if rows < 1:
+            raise ValueError("inference requires at least one input token")
+        if rows > self.context_length:
+            raise ValueError(
+                f"requested {rows} RoPE rows exceeds the committed model context {self.context_length}"
+            )
+        return rows
+
     # --- public inference ---
     def logits_prefill(self, ids):
         """Prefill `ids`; return logits at every position [len(ids), vocab] (teacher-forced predictions)."""
-        cos, sin = self._rope(len(ids))
+        cos, sin = self._rope(self._require_context(len(ids)))
         cache = c2.KVCache(self.NL); x = self._embed(ids)
         for li in range(self.NL):
             x = self._block(x, li, cache, cos, sin)
@@ -187,7 +205,13 @@ class Engine:
         """Prefill `ids` then KV-cached decode up to n_new tokens. Returns the new token ids. on_token(tok) is
         called as each token is produced (for streaming); stop_eos ends early at the tokenizer's eos (so a
         natural answer finishes instead of padding to n_new — n_new is then a cap, not a forced length)."""
-        cos, sin = self._rope(len(ids) + n_new + 1)
+        n_new = int(n_new)
+        if n_new < 0:
+            raise ValueError(f"n_new must be non-negative, got {n_new}")
+        # To emit N tokens, RoPE is consumed by the prompt and the first N-1 generated tokens; the final
+        # sampled token is not fed back through a block. Build exactly the rows that can affect this run.
+        rope_rows = self._require_context(len(ids) + max(n_new - 1, 0))
+        cos, sin = self._rope(rope_rows)
         cache = c2.KVCache(self.NL)
         x = self._embed(ids)
         for li in range(self.NL):

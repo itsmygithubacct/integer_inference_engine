@@ -38,6 +38,15 @@ def _vlog(on, *a):
         print(*a, file=sys.stderr, flush=True)
 
 
+def _receipt_ok(receipts, result):
+    bundle = result.get("verify_bundle") if isinstance(result, dict) else None
+    return (not receipts) or bool(result and result.get("offline_ok") and bundle and bundle.get("ok"))
+
+
+def _report_receipt_failure():
+    print("[nmc] ERROR: receipt failed offline self-verification — bundle is NOT trustworthy", file=sys.stderr)
+
+
 def _streamer(eng):
     """Returns (on_token, get_text). Decodes the FULL accumulated ids each token and writes the new suffix —
     correct for byte-level BPE where one char can span tokens (a naive per-token decode would mangle them)."""
@@ -90,6 +99,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.confirm and not args.broadcast:
         ap.error("--confirm requires --broadcast")
+    if args.broadcast and not args.receipts:
+        # broadcast only happens inside the receipts path; without --receipts it would be silently ignored.
+        ap.error("--broadcast requires --receipts (the on-chain 3rd entry marks a receipt)")
 
     mode, prompt = "oneshot", args.a
     if args.a in ("repl", "json"):
@@ -107,8 +119,11 @@ def main(argv=None):
             except EOFError:
                 print(file=sys.stderr); break
             if line.strip():
-                run_one(eng, line, args.max_new, verbose=True, receipts=args.receipts,    # streams to stdout
-                        broadcast=args.broadcast, confirm=args.confirm, stream=True)
+                _, res = run_one(eng, line, args.max_new, verbose=True, receipts=args.receipts,  # streams to stdout
+                                 broadcast=args.broadcast, confirm=args.confirm, stream=True)
+                if not _receipt_ok(args.receipts, res):
+                    _report_receipt_failure()
+                    return 1
         return 0
 
     if not prompt:
@@ -116,6 +131,7 @@ def main(argv=None):
     stream = (mode != "json")                                     # one-shot streams; json needs the full object
     txt, res = run_one(eng, prompt, args.max_new, verbose=args.verbose, receipts=args.receipts,
                        broadcast=args.broadcast, confirm=args.confirm, stream=stream)
+    receipt_ok = _receipt_ok(args.receipts, res)
     if mode == "json":
         obj = {"output": txt}
         if args.verbose:
@@ -123,11 +139,16 @@ def main(argv=None):
             if res:
                 r = res["receipt"]
                 obj["receipt"] = {"receiptHash": r["receiptHash"], "modelHash": r["modelHash"],
-                                  "verified": bool(res["offline_ok"] and res["verify_bundle"]["ok"]),
+                                  "verified": receipt_ok,
                                   "thirdEntry": res["emission"]["onchain"]["status"],
                                   "bundle": res["bundle"]["path"]}
         print(json.dumps(obj))
     # one-shot already streamed the output to stdout
+    if not receipt_ok:
+        # the receipt failed its own offline/self-verification — surface it loudly and exit nonzero rather
+        # than reporting success for a bundle that would not re-verify.
+        _report_receipt_failure()
+        return 1
     return 0
 
 

@@ -39,23 +39,70 @@ from trinote.infer_int.sampler import SamplerConfig, sample_token    # noqa: E40
 STATE_HOME = Path.home() / ".local/integer_inference_engine/north-mini-code"
 MODEL_LABEL = "north-mini-code-1.0 (integer engine)"
 
+# The RoPE cos/sin tables are rebuilt every run from libm float trig (engine._rope -> build_rope_tables:
+# math.cos/sin + a float `base**(-2/d)` power feeding round()), whose last-ULP results can differ across
+# hosts. Bonsai avoids this by committing the tables into the hashed artifact; nmc regenerates them, so we
+# bind their exact integer values into modelHash instead. The engine enforces the GGUF-declared context limit,
+# and modelHash covers every table row through that limit — not an arbitrary prefix — so every position the
+# engine can consume is bound. A host whose libm rounds one entry differently then produces a different
+# ropeTableHash -> a different modelHash, so the receipt's modelHash/artifactDigest binding catches the
+# divergence (clean `modelHashMatch=False`) instead of silently emitting different tokens that later fail
+# output re-execution as an unattributable "REPRODUCTION FAILED".
+_MAX_ROPE_TABLE_LEN = 1_048_576
+
+
+def _rope_table_hash(eng, ref_len: int | None = None) -> str:
+    """SHA-256 over every supported RoPE row using the engine's exact builder and fixed-point scale."""
+    ref_len = int(ref_len if ref_len is not None else getattr(eng, "context_length", 8192))
+    if not 1 <= ref_len <= _MAX_ROPE_TABLE_LEN:
+        raise ValueError(f"RoPE table length must be in [1, {_MAX_ROPE_TABLE_LEN}], got {ref_len}")
+    cos, sin = eng._rope(ref_len)
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(cos, dtype="<i8").tobytes())
+    h.update(np.ascontiguousarray(sin, dtype="<i8").tobytes())
+    return h.hexdigest()
+
 
 def model_hash(eng):
     """(modelHash, artifactDigest) for the engine. artifactDigest = sha256 of the GGUF TENSOR DATA region (pins
     the exact weights); modelHash = commit(artifactDigest + integer-engine config) — pins weights + fixed-point
-    semantics (fa/fw/arch/RoPE convention), i.e. exactly which deterministic computation the receipt is for."""
+    semantics (fa/fw/arch/RoPE convention + the exact integer RoPE tables), i.e. exactly which deterministic
+    computation the receipt is for."""
     h = hashlib.sha256()
+    hdr = hashlib.sha256()
+    data_start = int(eng.g.data_start)
     with open(eng.g.path, "rb") as f:
-        f.seek(eng.g.data_start)
+        f.seek(0, 2)
+        file_size = f.tell()
+        if not 0 <= data_start <= file_size:
+            raise ValueError(
+                f"GGUF data_start {data_start} is outside file size {file_size}; refusing a partial model hash"
+            )
+        f.seek(0)
+        # header region [0, data_start): magic, metadata KV, and the tensor index (name -> offset/shape/type).
+        # artifactDigest below covers only the tensor DATA, so two files with identical data but a permuted
+        # tensor index would share it; bind the header into modelHash so it uniquely pins the computation.
+        remaining = data_start
+        while remaining > 0:
+            chunk = f.read(min(1 << 20, remaining))
+            if not chunk:
+                raise OSError("unexpected EOF while hashing the GGUF header")
+            hdr.update(chunk)
+            remaining -= len(chunk)
+        header_digest = hdr.hexdigest()
+        f.seek(data_start)
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     artifact = h.hexdigest()
     cfg = eng.cfg
+    context_length = int(getattr(eng, "context_length", 8192))
     config = {"arch": "cohere2moe", "engine": "north-mini-code-integer",
               "fa": cfg.fa, "fw": cfg.fw, "d_model": cfg.d_model, "n_layers": eng.NL,
               "leading_dense": eng.DENSE, "n_heads": cfg.n_heads, "n_kv": cfg.n_kv,
               "head_dim": cfg.head_dim, "n_experts": cfg.n_experts, "n_used": cfg.n_used,
-              "expert_ffn": cfg.expert_ffn, "vocab": cfg.vocab, "rope": "interleaved-norm", "nope_full": True}
+              "expert_ffn": cfg.expert_ffn, "vocab": cfg.vocab, "rope": "interleaved-norm", "nope_full": True,
+              "ropeBase": int(cfg.rope_base), "contextLength": context_length,
+              "ropeTableHash": _rope_table_hash(eng, context_length), "headerDigest": header_digest}
     mh = commit({"artifactDigest": artifact, "config": config})
     return mh, artifact
 
