@@ -52,6 +52,39 @@ def test_qwen35_artifact_roundtrip_preserves_hybrid_schema(tmp_path):
     assert np.array_equal(before, after)
 
 
+def test_qwen35_artifact_write_failure_preserves_existing_destination(tmp_path, monkeypatch):
+    from trinote.infer_int import artifact_io_bonsai as artifact_io
+
+    artifact = random_bonsai35_artifact(seed=10)
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(b"known-good-previous-artifact")
+
+    def interrupted_save(_tensors, temp_path, *, metadata):
+        assert metadata["trinote"]
+        Path(temp_path).write_bytes(b"partial")
+        raise RuntimeError("simulated interrupted import")
+
+    monkeypatch.setattr(artifact_io, "save_file", interrupted_save)
+    with pytest.raises(RuntimeError, match="interrupted import"):
+        artifact_io.save_artifact_bonsai(artifact, path)
+    assert path.read_bytes() == b"known-good-previous-artifact"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_artifact_validation_cli_rejects_partial_file(tmp_path, capsys):
+    from trinote.cli.validate_bonsai_artifact_cli import main
+
+    good = tmp_path / "good.safetensors"
+    save_artifact_bonsai(random_bonsai35_artifact(seed=11), good)
+    assert main(["--artifact", str(good), "--architecture", "qwen35"]) == 0
+    assert '"ok": true' in capsys.readouterr().out
+
+    partial = tmp_path / "partial.safetensors"
+    partial.write_bytes(b"partial")
+    assert main(["--artifact", str(partial), "--architecture", "qwen35"]) == 2
+    assert "validation failed" in capsys.readouterr().err
+
+
 def test_qwen35_cached_prefill_matches_full_forward_last_row():
     model = BonsaiQwen35ReferenceModel(random_bonsai35_artifact(seed=4))
     ids = [7, 3, 11, 2]

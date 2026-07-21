@@ -14,6 +14,8 @@ narrow representation saves roughly 800 MiB for the 27B model.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -157,6 +159,36 @@ def artifact_digest_bonsai(artifact: dict, *, provenance: dict | None = None) ->
     return sha256_hex(_serialize_bonsai(artifact, provenance))
 
 
+def _atomic_artifact_write(path: Path, writer) -> None:
+    """Write a potentially multi-GiB artifact without exposing a partial final path."""
+    fd = -1
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        os.close(fd)
+        fd = -1
+        writer(tmp)
+        fd = os.open(tmp, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+        tmp = ""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path.parent, flags)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+
 def save_artifact_bonsai(artifact: dict, path: str | Path, *, provenance: dict | None = None) -> str:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,10 +200,11 @@ def save_artifact_bonsai(artifact: dict, path: str | Path, *, provenance: dict |
         tensors, meta = flatten_artifact_bonsai_qwen35(artifact)
         if provenance is not None:
             meta["provenance"] = provenance
-        save_file(tensors, str(path), metadata={"trinote": json.dumps(meta, sort_keys=True)})
+        metadata = {"trinote": json.dumps(meta, sort_keys=True)}
+        _atomic_artifact_write(path, lambda tmp: save_file(tensors, tmp, metadata=metadata))
         return sha256_file(path)
     data = _serialize_bonsai(artifact, provenance)
-    path.write_bytes(data)
+    _atomic_artifact_write(path, lambda tmp: Path(tmp).write_bytes(data))
     return sha256_hex(data)
 
 
