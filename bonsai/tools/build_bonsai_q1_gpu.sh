@@ -29,4 +29,22 @@ fi
 
 # NO --use_fast_math / -ffast-math: would relax/reorder arithmetic. Integer kernel only, but assert it.
 # -O3, -fPIC -shared (ctypes), no -arch=native (pin sm explicitly so a wrong-arch .so can't ship).
-exec "$nvcc" -O3 -arch="$arch" -Xcompiler -fPIC -shared "$src" -o "$out"
+# Build beside the destination and publish only after checking the dynamic ABI:
+# CUDA 12.8/GCC 13 has otherwise produced a successful .so with ctx_create
+# internalized, which makes the resident path unavailable at runtime.
+if ! command -v nm >/dev/null 2>&1; then
+  echo "build_bonsai_q1_gpu.sh: nm not found; cannot verify the CUDA ctypes ABI" >&2
+  exit 1
+fi
+tmp="${out}.tmp.$$"
+cleanup() { rm -f "$tmp"; }
+trap cleanup EXIT HUP INT TERM
+"$nvcc" -O3 -arch="$arch" -Xcompiler -fPIC -shared "$src" -o "$tmp"
+for symbol in bonsai_q1_linear_gpu bonsai35_ctx_create; do
+  if ! nm -D --defined-only "$tmp" | awk -v wanted="$symbol" '$3 == wanted { found=1 } END { exit !found }'; then
+    echo "build_bonsai_q1_gpu.sh: required dynamic symbol is missing: $symbol" >&2
+    exit 1
+  fi
+done
+mv -f "$tmp" "$out"
+trap - EXIT HUP INT TERM

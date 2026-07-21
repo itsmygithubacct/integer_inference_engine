@@ -2525,6 +2525,15 @@ static void q35_free_ctx(Bonsai35Ctx& c){
     c.h_x=c.h_logits=c.h_pos=c.h_len=c.h_token=nullptr;c.h_overflow=nullptr;c.alive=false;
 }
 
+// CUDA 12.8 with GCC 13 can internalize this function while lowering the
+// generic allocation lambda, despite the surrounding extern "C" block.  The
+// ctypes ABI then disappears from .dynsym even though the build succeeds.
+// Keep the entry point externally visible across supported nvcc host compilers.
+#if defined(__clang__)
+__attribute__((visibility("default"), used))
+#elif defined(__GNUC__)
+__attribute__((visibility("default"), used, externally_visible))
+#endif
 long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc* layers){
     if(!cfg||!layers||cfg->n_layers<=0||cfg->d<=0||cfg->dff<=0||cfg->H<=0||cfg->Hkv<=0||
        cfg->H%cfg->Hkv||cfg->hd<=0||cfg->cap<=0||cfg->state_size<=0||cfg->state_size>128||
