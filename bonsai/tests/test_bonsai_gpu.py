@@ -32,6 +32,23 @@ def _env(key, val):
 _FRAC = 16
 
 
+@pytest.fixture(autouse=True)
+def _release_process_global_gpu_allocations():
+    """Keep CUDA residency tests isolated inside a shared pytest process.
+
+    The native residency registry is intentionally process-global.  Tests in
+    this module populate it through several APIs, while the Qwen3.5 memory
+    gate deliberately refuses to start if any unrelated weights remain
+    resident.  Always release weights and static buffers after a test so test
+    ordering cannot turn that safety check into a false failure.
+    """
+    try:
+        yield
+    finally:
+        from trinote.infer_int.gpu_native import q1_free_weights
+        q1_free_weights()
+
+
 def _need_gpu():
     if not gpu_available():
         pytest.skip("GPU Q1 kernel (tools/libbonsai_q1_gpu.so) / usable GPU not available")
