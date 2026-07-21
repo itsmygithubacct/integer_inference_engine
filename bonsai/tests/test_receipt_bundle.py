@@ -86,6 +86,15 @@ def test_verify_bundle_failclosed_on_noninteger_seed(tmp_path):
     assert any(not c["ok"] for c in out["offline"]["checks"])
 
 
+def test_nonobject_manifest_raises_typed_bundle_error(tmp_path):
+    """A syntactically valid JSON manifest still has to be an object at the container boundary."""
+    root = tmp_path / "nonobject-manifest"
+    root.mkdir()
+    (root / "manifest.json").write_text("[]\n")
+    with pytest.raises(BundleError, match="manifest.json must contain a JSON object"):
+        verify_bundle(root)
+
+
 def test_tamper_manifest_bundlehash_detected(tmp_path):
     rb = _receipt_bundle()
     receipt = rb["receipt"]
@@ -660,6 +669,20 @@ def test_pack_verify_local_bundle_offline(tmp_path):
     assert "file:transcript.md" in {c["check"] for c in bad["offline"]["checks"] if not c["ok"]}
 
 
+def test_local_bundle_fails_when_onchain_verification_is_required(tmp_path):
+    rb = _receipt_bundle()
+    pack_bundle(bundle=rb, onchain=None, out_dir=tmp_path / "local-onchain-required")
+    out = verify_bundle(tmp_path / "local-onchain-required", onchain=True)
+    assert out["ok"] is False
+    assert out["onchain"]["ok"] is False
+    assert out["onchain"]["skipped"] is True
+    assert out["onchain"]["checks"] == [{
+        "check": "onchain.localBundle",
+        "ok": False,
+        "detail": "on-chain verification was requested, but this local bundle has no BSV third entry",
+    }]
+
+
 def test_local_bundle_tar_roundtrip_includes_transcript(tmp_path):
     rb = _receipt_bundle()
     transcript = {"prompt": "p", "output": "o", "modelLabel": "m"}
@@ -686,6 +709,25 @@ def test_signing_keys_load_or_generate(tmp_path, monkeypatch):
     assert stat.S_IMODE(os.stat(model_key_default()).st_mode) == 0o600
     mk2, ck2 = load_or_generate_signing_keys()              # idempotent: reload, do not regenerate
     assert mk2.secret_hex == mk.secret_hex and ck2.secret_hex == ck.secret_hex
+
+
+def test_signing_key_is_created_private_without_postwrite_chmod(tmp_path, monkeypatch):
+    """The initial file mode must be safe even if a pathname chmod is unavailable."""
+    import os
+    import stat
+    from trinote.receipts.signing_ec import ECKey
+
+    def chmod_unavailable(*_args, **_kwargs):
+        raise OSError("simulated chmod failure")
+
+    monkeypatch.setattr(os, "chmod", chmod_unavailable)
+    previous = os.umask(0)
+    try:
+        path = tmp_path / "issuer.key.json"
+        ECKey.from_secret_hex("33" * 32, label="issuer").save(path)
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_receipt_ec_signature_third_party_verifiable():

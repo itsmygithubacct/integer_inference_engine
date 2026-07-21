@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,11 +135,38 @@ class ECKey:
         import json
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_json(), indent=2, sort_keys=True) + "\n")
+        payload = json.dumps(self.to_json(), indent=2, sort_keys=True) + "\n"
+        fd = -1
+        tmp = ""
         try:
-            os.chmod(p, 0o600)               # a private key — keep it readable only by its owner
-        except OSError:
-            pass
+            # mkstemp creates the file as 0600 before a single secret byte is
+            # written.  Writing the destination first and chmod'ing afterwards
+            # leaves a local disclosure window under a permissive process umask.
+            fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = -1  # owned by fh from here on
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, p)
+            tmp = ""
+            # Persist the rename as well as the file contents. Directory fsync
+            # is supported on the Linux hosts on which the notary runs.
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            dir_fd = os.open(p.parent, flags)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
     @classmethod
     def load_or_generate(cls, path: str | Path, *, label: str = "") -> "ECKey":

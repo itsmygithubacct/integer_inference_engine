@@ -99,6 +99,8 @@ def load_bundle(path: str | Path) -> dict:
         obj = {name: json.loads(b.decode("utf-8")) for name, b in raw.items() if name.endswith(".json")}
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise BundleError(f"bundle member is not valid JSON: {exc}") from exc
+    if not isinstance(obj["manifest.json"], dict):
+        raise BundleError("manifest.json must contain a JSON object")
     return {"root": root, "manifest": obj["manifest.json"], "raw": raw, "obj": obj}
 
 
@@ -409,9 +411,14 @@ def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "ma
 
     if onchain:
         if manifest.get("kind") == "local":
-            result["onchain"] = {"ok": True, "skipped": True,
-                                 "checks": [{"check": "onchain.localBundle", "ok": True,
-                                             "detail": "local bundle has no on-chain third entry (BSV off)"}]}
+            # The caller explicitly required a public-ledger check. A local
+            # bundle has no such entry, so "skipped" must fail the requested
+            # layer rather than silently turning --onchain into offline-only.
+            result["onchain"] = {"ok": False, "skipped": True,
+                                 "checks": [{"check": "onchain.localBundle", "ok": False,
+                                             "detail": "on-chain verification was requested, but this local "
+                                                       "bundle has no BSV third entry"}]}
+            layers_ok.append(False)
         else:
             on = _failclosed_layer("onchain", lambda: _verify_onchain(loaded, network))
             result["onchain"] = on
