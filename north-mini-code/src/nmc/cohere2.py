@@ -211,17 +211,114 @@ def tied_head_int(x_int, W, cfg):
 # Gate: generating with the cache is BYTE-IDENTICAL to re-prefilling the growing sequence from scratch.
 
 class KVCache:
-    """Per-layer post-RoPE K and raw V, each [Hkv, L, hd] int64, grown by `append` per step."""
-    def __init__(self, n_layers):
+    """Per-layer post-RoPE K and raw V, each ``[Hkv, L, hd]``.
+
+    ``k`` and ``v`` remain lists of ordinary NumPy arrays at the logical cache
+    length, but those arrays are views over reusable backing buffers.  Decode
+    appends that fit in the current capacity therefore copy only the new K/V
+    rows instead of copying the entire history with ``np.concatenate``.
+
+    ``initial_capacity`` can reserve a small decode buffer up front.  A
+    ``max_length`` bound is optional; exceeding it fails before either K or V
+    is changed.  ``reset`` retains allocations by default so a cache can be
+    reused for another request without another allocation ramp.
+    """
+    def __init__(self, n_layers, *, initial_capacity=0, max_length=None):
+        if not isinstance(n_layers, (int, np.integer)) or n_layers < 0:
+            raise ValueError("n_layers must be a non-negative integer")
+        if not isinstance(initial_capacity, (int, np.integer)) or initial_capacity < 0:
+            raise ValueError("initial_capacity must be a non-negative integer")
+        if max_length is not None:
+            if not isinstance(max_length, (int, np.integer)) or max_length < 0:
+                raise ValueError("max_length must be a non-negative integer or None")
+            if initial_capacity > max_length:
+                raise ValueError("initial_capacity cannot exceed max_length")
+        n_layers, initial_capacity = int(n_layers), int(initial_capacity)
+        self._initial_capacity = initial_capacity
+        self._max_length = None if max_length is None else int(max_length)
         self.k = [None] * n_layers
         self.v = [None] * n_layers
+        self._k_storage = [None] * n_layers
+        self._v_storage = [None] * n_layers
+        self._lengths = [0] * n_layers
+        self._capacities = [0] * n_layers
 
     def length(self, li=0):
-        return 0 if self.k[li] is None else self.k[li].shape[1]
+        return self._lengths[li]
+
+    def capacity(self, li=0):
+        """Allocated sequence rows for a layer (primarily useful for telemetry/tests)."""
+        return self._capacities[li]
+
+    def _next_capacity(self, current, required):
+        if self._max_length is not None and required > self._max_length:
+            raise ValueError(f"KV cache length {required} exceeds max_length {self._max_length}")
+        if current == 0:
+            target = max(required, self._initial_capacity)
+        else:
+            target = current
+            while target < required:
+                target += max(1, target // 2)       # 1.5x growth: amortised copies without 2x context memory
+        if self._max_length is not None:
+            target = min(target, self._max_length)
+        return target
+
+    @staticmethod
+    def _prepare_storage(storage, new, length, capacity, target_capacity):
+        """Return compatible storage, preserving the logical prefix when reallocation is needed."""
+        dtype = new.dtype if storage is None or length == 0 else np.result_type(storage.dtype, new.dtype)
+        shape = (new.shape[0], target_capacity, new.shape[2])
+        compatible = (storage is not None and storage.shape == shape and storage.dtype == dtype
+                      and capacity == target_capacity)
+        if compatible:
+            return storage
+        out = np.empty(shape, dtype=dtype)
+        if length:
+            out[:, :length, :] = storage[:, :length, :]
+        return out
 
     def append(self, li, k_new, v_new):                      # k_new/v_new [Hkv, m, hd]
-        self.k[li] = k_new if self.k[li] is None else np.concatenate([self.k[li], k_new], axis=1)
-        self.v[li] = v_new if self.v[li] is None else np.concatenate([self.v[li], v_new], axis=1)
+        # Index the lists first to preserve normal list semantics for negative/out-of-range layer indices.
+        k_storage, v_storage = self._k_storage[li], self._v_storage[li]
+        k_new, v_new = np.asarray(k_new), np.asarray(v_new)
+        if k_new.ndim != 3 or v_new.ndim != 3:
+            raise ValueError("k_new and v_new must both have shape [Hkv, m, hd]")
+        if k_new.shape != v_new.shape:
+            raise ValueError(f"k_new and v_new shapes differ: {k_new.shape} != {v_new.shape}")
+
+        length, capacity = self._lengths[li], self._capacities[li]
+        if length:
+            expected = (k_storage.shape[0], k_storage.shape[2])
+            if (k_new.shape[0], k_new.shape[2]) != expected:
+                raise ValueError(f"new K/V outer dimensions {(k_new.shape[0], k_new.shape[2])} "
+                                 f"do not match cached dimensions {expected}")
+        required = length + k_new.shape[1]
+        target_capacity = self._next_capacity(capacity, required)
+
+        # Prepare both buffers before publishing either one.  Allocation/dtype failures cannot leave a
+        # half-updated public cache; the bounded-length error above is likewise atomic.
+        next_k = self._prepare_storage(k_storage, k_new, length, capacity, target_capacity)
+        next_v = self._prepare_storage(v_storage, v_new, length, capacity, target_capacity)
+        next_k[:, length:required, :] = k_new
+        next_v[:, length:required, :] = v_new
+        self._k_storage[li], self._v_storage[li] = next_k, next_v
+        self._lengths[li], self._capacities[li] = required, target_capacity
+        self.k[li], self.v[li] = next_k[:, :required, :], next_v[:, :required, :]
+
+    def reset(self, li=None, *, release=False):
+        """Clear one layer, or every layer, retaining backing allocations unless ``release`` is true."""
+        layers = range(len(self.k)) if li is None else (li,)
+        for layer in layers:
+            # Resolve the index before mutating anything, including Python's usual negative-index behaviour.
+            k_storage, v_storage = self._k_storage[layer], self._v_storage[layer]
+            self._lengths[layer] = 0
+            if release:
+                self._k_storage[layer] = self._v_storage[layer] = None
+                self._capacities[layer] = 0
+                self.k[layer] = self.v[layer] = None
+            else:
+                self.k[layer] = None if k_storage is None else k_storage[:, :0, :]
+                self.v[layer] = None if v_storage is None else v_storage[:, :0, :]
 
 
 def attention_cached(q, ck, cv, start, cfg, window):
@@ -295,7 +392,7 @@ def generate(prompt_ids, embed_fn, layers, head_W, cfg, cos, sin, n_new, pick, *
     nl = len(layers)
     out, seq = [], list(prompt_ids)
     if use_cache:
-        cache = KVCache(nl)
+        cache = KVCache(nl, max_length=len(cos))
         last = _run_layers_cached(np.stack([embed_fn(t) for t in seq]), layers, cfg, cos, sin, cache)[-1:]
         for step in range(n_new):
             tok = int(pick(tied_head_int(last, head_W, cfg)[0], len(seq), seq))
@@ -306,7 +403,9 @@ def generate(prompt_ids, embed_fn, layers, head_W, cfg, cos, sin, n_new, pick, *
     else:
         for step in range(n_new):
             x = np.stack([embed_fn(t) for t in seq])
-            x = _run_layers_cached(x, layers, cfg, cos, sin, KVCache(nl))   # fresh cache = from scratch
+            x = _run_layers_cached(
+                x, layers, cfg, cos, sin, KVCache(nl, max_length=len(cos))
+            )   # fresh cache = from scratch
             tok = int(pick(tied_head_int(x[-1:], head_W, cfg)[0], len(seq), seq))
             out.append(tok); seq.append(tok)
     return out

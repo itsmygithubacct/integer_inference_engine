@@ -151,7 +151,7 @@ def decode_block(x_new, li, cache, cos, sin):
 
 
 cos, sin = c2.build_rope_tables(len(ids) + N_NEW + 1, cfg.head_dim, base=int(cfg.rope_base), frac_bits=FA)
-cache = c2.KVCache(NL)
+cache = c2.KVCache(NL, max_length=len(cos))
 t0 = time.time()
 x = embed(ids)
 for li in range(NL):
@@ -182,7 +182,7 @@ print(f"OURS  : {gen_text!r}", flush=True)
 if os.environ.get("NMC_VERIFY"):
     ref, seq = [], list(ids)
     for _ in range(len(out)):
-        fresh = c2.KVCache(NL); xx = embed(seq)
+        fresh = c2.KVCache(NL, max_length=len(cos)); xx = embed(seq)
         for li in range(NL):
             xx = decode_block(xx, li, fresh, cos, sin)
         nx = int(klin("token_embd.weight", norm(xx[-1:], "output_norm.weight"))[0].argmax())

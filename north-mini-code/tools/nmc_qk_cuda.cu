@@ -8,6 +8,9 @@
 // Per-host, arch-specific (build with tools/build_nmc_cuda.sh, -arch=sm_<cc>). The fp16→fixed conversion
 // (round-half-to-even of d*2^fw) must match the CPU llrint — gated byte-exact.
 #include <stdint.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 #include <cuda_runtime.h>
 
 __device__ __forceinline__ double half_to_double(uint16_t h) {
@@ -180,24 +183,61 @@ extern "C" int qk_linear_cuda(const uint8_t *W, const int64_t *x, long long T, l
 // ----- resident-weight register API (REGISTER-API.md): upload the quantized weights to VRAM ONCE; apply
 // reads the resident bytes (only activations cross PCIe). Keeps the COMPACT quantized form resident (18GB
 // fits 24GB; dequant is still inline in the kernel — dequantized int64 would be ~240GB). -------------------
-// Plain C array registry (no std::vector → no libstdc++ dependency, so the .so stays a pure C/CUDA object that
-// loads on any arch — pulling in libstdc++ broke loading on freshly-built sm_89). Sized for the whole model
-// (442 dense/attn/head + touched experts).
-#define NMC_MAX_REG 16384
+// Heap-grown plain-C registry (no std::vector → no libstdc++ dependency, so the .so stays a pure C/CUDA
+// object that loads on freshly-built hosts). A fixed 16,384-entry table was smaller than the model's 18,432
+// possible expert slices and eventually turned a valid registration into handle -1. Handles are indices, so
+// growing/reallocating this host-side metadata does not invalidate either handles or resident device pointers.
 struct DevWeight { uint8_t *p; long long out_f, n_blocks; int qtype; };
-static struct DevWeight g_reg[NMC_MAX_REG];
-static int g_nreg = 0;
+static struct DevWeight *g_reg = nullptr;
+static size_t g_nreg = 0, g_reg_cap = 0;
+
+// Bump whenever the required exported runtime contract changes.  The Python
+// bridge rejects a stale per-host build instead of silently selecting the old
+// fixed-size registry or allocator-heavy MoE implementation.
+#define NMC_CUDA_ABI_VERSION 2
+extern "C" int qk_cuda_abi_version(void) { return NMC_CUDA_ABI_VERSION; }
+
+static int ensure_reg_capacity(size_t need) {
+    if (need <= g_reg_cap) return 0;
+    size_t cap = g_reg_cap ? g_reg_cap : 1024;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) return 1;
+        cap *= 2;
+    }
+    if (cap > SIZE_MAX / sizeof(struct DevWeight)) return 1;
+    void *p = realloc(g_reg, cap * sizeof(struct DevWeight));
+    if (!p) return 1;
+    g_reg = (struct DevWeight *)p;
+    memset(g_reg + g_reg_cap, 0, (cap - g_reg_cap) * sizeof(struct DevWeight));
+    g_reg_cap = cap;
+    return 0;
+}
+
+static int valid_handle(long long h) {
+    return h >= 0 && (unsigned long long)h < (unsigned long long)g_nreg && g_reg[h].p != nullptr;
+}
+
+// Reserve host registry metadata without allocating VRAM.  Besides avoiding
+// growth jitter during model upload, this makes the former 16,384-entry limit
+// directly regression-testable without issuing thousands of cudaMalloc calls.
+extern "C" int qk_resident_reserve(long long count) {
+    if (count < 0) return 1;
+    return ensure_reg_capacity((size_t)count);
+}
 
 // Upload one weight tensor's raw Q4_K/Q6_K bytes; return a handle (index) or -1.
 extern "C" long long qk_register_weight(const uint8_t *W, long long out_f, long long n_blocks, int qtype) {
-    if (g_nreg >= NMC_MAX_REG) return -1;
-    long long bs = qtype == 0 ? 144 : 210;
-    size_t bytes = (size_t)out_f * n_blocks * bs;
+    if (!W || out_f <= 0 || n_blocks <= 0 || (qtype != 0 && qtype != 1)) return -1;
+    size_t bs = qtype == 0 ? 144 : 210;
+    if ((size_t)out_f > SIZE_MAX / (size_t)n_blocks ||
+        (size_t)out_f * (size_t)n_blocks > SIZE_MAX / bs ||
+        ensure_reg_capacity(g_nreg + 1) != 0) return -1;
+    size_t bytes = (size_t)out_f * (size_t)n_blocks * bs;
     uint8_t *d = nullptr;
     if (cudaMalloc(&d, bytes) != cudaSuccess) return -1;
     if (cudaMemcpy(d, W, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); return -1; }
     g_reg[g_nreg].p = d; g_reg[g_nreg].out_f = out_f; g_reg[g_nreg].n_blocks = n_blocks; g_reg[g_nreg].qtype = qtype;
-    return (long long)(g_nreg++);
+    return (long long)g_nreg++;
 }
 
 // Persistent activation scratch (dx/dout), grown on demand and REUSED across applies — decode does ~1350
@@ -215,10 +255,84 @@ static int64_t *scratch(int64_t **p, size_t *cap, size_t need) {
     return *p;
 }
 
+// qk_moe_ffn used to allocate/free 12 device buffers per layer call (and the batched path allocated ten).
+// cudaMalloc/cudaFree are synchronizing operations, so that allocator churn dominated the many small decode
+// calls. Retain one process-local workspace per buffer role, growing a role only when a later shape needs it.
+// The resident API already uses process-global activation scratch and is intentionally serialized by its
+// Python caller; these buffers have the same lifetime/concurrency contract and are released by qk_free_all.
+enum MoeScratchSlot {
+    MS_PG, MS_PU, MS_PD, MS_QG, MS_QU, MS_QD, MS_H, MS_GATES,
+    MS_GATE_OUT, MS_UP_OUT, MS_DOWN_OUT, MS_OUT, MS_TOK, MS_COUNT
+};
+struct DeviceScratch { void *p; size_t cap; };
+static struct DeviceScratch g_moe_scratch[MS_COUNT];
+static unsigned long long g_moe_scratch_allocations = 0;
+
+static void *moe_scratch(int slot, size_t need) {
+    if (slot < 0 || slot >= MS_COUNT || need == 0) return nullptr;
+    struct DeviceScratch *s = &g_moe_scratch[slot];
+    if (s->cap >= need) return s->p;
+    void *p = nullptr;
+    if (cudaMalloc(&p, need) != cudaSuccess) return nullptr;
+    if (s->p) cudaFree(s->p);
+    s->p = p; s->cap = need;
+    g_moe_scratch_allocations++;
+    return p;
+}
+
+static void free_moe_scratch(void) {
+    for (int i = 0; i < MS_COUNT; i++) {
+        if (g_moe_scratch[i].p) cudaFree(g_moe_scratch[i].p);
+        g_moe_scratch[i].p = nullptr; g_moe_scratch[i].cap = 0;
+    }
+    g_moe_scratch_allocations = 0;
+}
+
+static size_t moe_scratch_bytes(void) {
+    size_t total = 0;
+    for (int i = 0; i < MS_COUNT; i++) {
+        if (g_moe_scratch[i].cap > SIZE_MAX - total) return SIZE_MAX;
+        total += g_moe_scratch[i].cap;
+    }
+    return total;
+}
+
+static unsigned char *g_moe_host = nullptr;
+static size_t g_moe_host_cap = 0;
+
+// Drop prefill-sized activation buffers without invalidating resident weight
+// handles.  Decode will lazily allocate only its much smaller one-token shape.
+extern "C" void qk_moe_workspace_release(void) {
+    free_moe_scratch();
+    free(g_moe_host); g_moe_host = nullptr; g_moe_host_cap = 0;
+}
+
+// Batched MoE also rebuilt four host metadata arrays per layer. Keep them in one realloc-grown C allocation;
+// offsets use the allocation capacity (not the current P), so the four arrays never overlap after reuse.
+static int moe_host_scratch(size_t need, uint8_t ***pg, uint8_t ***pu, uint8_t ***pd, int **tok) {
+    if (need == 0 || need > SIZE_MAX / (3 * sizeof(uint8_t *) + sizeof(int))) return 1;
+    if (g_moe_host_cap < need) {
+        size_t cap = g_moe_host_cap ? g_moe_host_cap : 64;
+        while (cap < need) {
+            if (cap > SIZE_MAX / 2) return 1;
+            cap *= 2;
+        }
+        size_t bytes = cap * (3 * sizeof(uint8_t *) + sizeof(int));
+        void *p = realloc(g_moe_host, bytes);
+        if (!p) return 1;
+        g_moe_host = (unsigned char *)p; g_moe_host_cap = cap;
+    }
+    *pg = (uint8_t **)g_moe_host;
+    *pu = *pg + g_moe_host_cap;
+    *pd = *pu + g_moe_host_cap;
+    *tok = (int *)(*pd + g_moe_host_cap);
+    return 0;
+}
+
 // Apply a resident weight: y[t,o] = (Σ_i W_fixed[o,i]·x[t,i]) >> fw. Only x is H2D'd, y D2H'd — no weight
 // transfer. Byte-identical to qk_linear (same kernel, resident pointer). Returns 0 ok.
 extern "C" int qk_apply_resident(long long h, const int64_t *x, long long T, int fw, int64_t *out) {
-    if (h < 0 || h >= g_nreg || g_reg[h].p == nullptr) return 1;
+    if (!valid_handle(h)) return 1;
     struct DevWeight &w = g_reg[h];
     long long in_f = w.n_blocks * 256;
     int64_t *dx = scratch(&g_dx, &g_dx_cap, (size_t)T * in_f * 8);
@@ -234,14 +348,20 @@ extern "C" int qk_apply_resident(long long h, const int64_t *x, long long T, int
 }
 
 extern "C" void qk_free_all(void) {
-    for (int i = 0; i < g_nreg; i++) if (g_reg[i].p) cudaFree(g_reg[i].p);
-    g_nreg = 0;
+    for (size_t i = 0; i < g_nreg; i++) if (g_reg[i].p) cudaFree(g_reg[i].p);
+    free(g_reg); g_reg = nullptr; g_nreg = 0; g_reg_cap = 0;
     if (g_dx) { cudaFree(g_dx); g_dx = nullptr; g_dx_cap = 0; }
     if (g_dout) { cudaFree(g_dout); g_dout = nullptr; g_dout_cap = 0; }
     if (g_xl) { cudaFree(g_xl); g_xl = nullptr; g_xl_cap = 0; }
     if (g_xs) { cudaFree(g_xs); g_xs = nullptr; g_xs_cap = 0; }
+    qk_moe_workspace_release();
 }
 extern "C" long long qk_resident_count(void) { return (long long)g_nreg; }
+extern "C" long long qk_resident_capacity(void) { return (long long)g_reg_cap; }
+extern "C" long long qk_moe_workspace_allocations(void) { return (long long)g_moe_scratch_allocations; }
+extern "C" unsigned long long qk_moe_workspace_bytes(void) {
+    return (unsigned long long)moe_scratch_bytes();
+}
 
 // Fused batched MoE expert-FFN on the GPU: out[d_model] = Σ_e gate_e · down_e( silu(gate_e·h) * up_e·h ).
 // gate_h/up_h/down_h are resident handles for the n_e selected experts; gates[e] = sigmoid(router logit).
@@ -250,26 +370,36 @@ extern "C" long long qk_resident_count(void) { return (long long)g_nreg; }
 extern "C" int qk_moe_ffn(const long long *gate_h, const long long *up_h, const long long *down_h, int n_e,
                           const int64_t *h, const int64_t *gates, long long d_model, long long e_ffn,
                           int fa, int fw, int64_t *out) {
-    if (n_e <= 0 || n_e > 256) return 1;
+    if (!gate_h || !up_h || !down_h || !h || !gates || !out || n_e <= 0 || n_e > 256 ||
+        d_model <= 0 || e_ffn <= 0 || d_model % 256 != 0 || e_ffn % 256 != 0) return 1;
+    long long nb_in = d_model / 256, nb_dn = e_ffn / 256;
     uint8_t *pg[256], *pu[256], *pd[256]; int qg[256], qu[256], qd[256];
     for (int e = 0; e < n_e; e++) {
         long long g = gate_h[e], u = up_h[e], d = down_h[e];
-        if (g < 0 || g >= g_nreg || u < 0 || u >= g_nreg || d < 0 || d >= g_nreg) return 1;
+        if (!valid_handle(g) || !valid_handle(u) || !valid_handle(d) ||
+            g_reg[g].out_f != e_ffn || g_reg[g].n_blocks != nb_in ||
+            g_reg[u].out_f != e_ffn || g_reg[u].n_blocks != nb_in ||
+            g_reg[d].out_f != d_model || g_reg[d].n_blocks != nb_dn) return 1;
         pg[e] = g_reg[g].p; pu[e] = g_reg[u].p; pd[e] = g_reg[d].p;
         qg[e] = g_reg[g].qtype; qu[e] = g_reg[u].qtype; qd[e] = g_reg[d].qtype;
     }
-    long long nb_in = d_model / 256, nb_dn = e_ffn / 256;
-    uint8_t **dpg = 0, **dpu = 0, **dpd = 0; int *dqg = 0, *dqu = 0, *dqd = 0;
-    int64_t *dh = 0, *dg = 0, *du = 0, *dd = 0, *dgs = 0, *dout = 0;
-    int rc = 1;
-    #define A(p, sz) if (cudaMalloc(&(p), (sz)) != cudaSuccess) goto done
-    A(dpg, n_e * sizeof(uint8_t *)); A(dpu, n_e * sizeof(uint8_t *)); A(dpd, n_e * sizeof(uint8_t *));
-    A(dqg, n_e * sizeof(int)); A(dqu, n_e * sizeof(int)); A(dqd, n_e * sizeof(int));
-    A(dh, d_model * 8); A(dgs, (long long)n_e * 8);
-    A(dg, (long long)n_e * e_ffn * 8); A(du, (long long)n_e * e_ffn * 8);
-    A(dd, (long long)n_e * d_model * 8); A(dout, d_model * 8);
-    #undef A
-    #define H2D(d, s, sz) if (cudaMemcpy((d), (s), (sz), cudaMemcpyHostToDevice) != cudaSuccess) goto done
+    size_t ne = (size_t)n_e, dm = (size_t)d_model, ef = (size_t)e_ffn;
+    if (dm > SIZE_MAX / 8 || ef > SIZE_MAX / ne || ne * ef > SIZE_MAX / 8 ||
+        dm > SIZE_MAX / ne || ne * dm > SIZE_MAX / 8) return 1;
+    uint8_t **dpg = (uint8_t **)moe_scratch(MS_PG, ne * sizeof(uint8_t *));
+    uint8_t **dpu = (uint8_t **)moe_scratch(MS_PU, ne * sizeof(uint8_t *));
+    uint8_t **dpd = (uint8_t **)moe_scratch(MS_PD, ne * sizeof(uint8_t *));
+    int *dqg = (int *)moe_scratch(MS_QG, ne * sizeof(int));
+    int *dqu = (int *)moe_scratch(MS_QU, ne * sizeof(int));
+    int *dqd = (int *)moe_scratch(MS_QD, ne * sizeof(int));
+    int64_t *dh = (int64_t *)moe_scratch(MS_H, dm * 8);
+    int64_t *dgs = (int64_t *)moe_scratch(MS_GATES, ne * 8);
+    int64_t *dg = (int64_t *)moe_scratch(MS_GATE_OUT, ne * ef * 8);
+    int64_t *du = (int64_t *)moe_scratch(MS_UP_OUT, ne * ef * 8);
+    int64_t *dd = (int64_t *)moe_scratch(MS_DOWN_OUT, ne * dm * 8);
+    int64_t *dout = (int64_t *)moe_scratch(MS_OUT, dm * 8);
+    if (!dpg || !dpu || !dpd || !dqg || !dqu || !dqd || !dh || !dgs || !dg || !du || !dd || !dout) return 1;
+    #define H2D(d, s, sz) if (cudaMemcpy((d), (s), (sz), cudaMemcpyHostToDevice) != cudaSuccess) return 1
     H2D(dpg, pg, n_e * sizeof(uint8_t *)); H2D(dpu, pu, n_e * sizeof(uint8_t *)); H2D(dpd, pd, n_e * sizeof(uint8_t *));
     H2D(dqg, qg, n_e * sizeof(int)); H2D(dqu, qu, n_e * sizeof(int)); H2D(dqd, qd, n_e * sizeof(int));
     H2D(dh, h, d_model * 8); H2D(dgs, gates, (long long)n_e * 8);
@@ -284,13 +414,8 @@ extern "C" int qk_moe_ffn(const long long *gate_h, const long long *up_h, const 
         matmul_multi_k<<<(ngd + tpb - 1) / tpb, tpb>>>(dpd, dqd, dg, 1, d_model, nb_dn, fw, dd, n_e); // down(gu)
         combine_k<<<(d_model + tpb - 1) / tpb, tpb>>>(dd, n_e, d_model, dgs, fa, dout);               // Σ gate·down
     }
-    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) goto done;
-    if (cudaMemcpy(out, dout, d_model * 8, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
-    rc = 0;
-done:
-    cudaFree(dpg); cudaFree(dpu); cudaFree(dpd); cudaFree(dqg); cudaFree(dqu); cudaFree(dqd);
-    cudaFree(dh); cudaFree(dgs); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dout);
-    return rc;
+    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return 1;
+    return cudaMemcpy(out, dout, d_model * 8, cudaMemcpyDeviceToHost) == cudaSuccess ? 0 : 1;
 }
 
 // ---- DP4A path (CUDA-KERNEL.md §7): Q6_K resident apply via base-256 activation limbs + __dp4a, byte-exact
@@ -358,7 +483,7 @@ __global__ void qk_q6k_dp4a(const uint8_t *W, const int8_t *xlimb, long long T, 
 // Apply a resident Q6_K weight via DP4A. x int64 [T,in_f] -> out [T,out_f]. Ln = activation limbs (caller picks
 // from max|x|). Byte-identical to qk_apply_resident for the same handle when Ln covers x. Returns 0 ok, 2 = not Q6_K.
 extern "C" int qk_apply_resident_q6k_dp4a(long long h, const int64_t *x, long long T, int fw, int Ln, int64_t *out) {
-    if (h < 0 || h >= g_nreg || g_reg[h].p == nullptr) return 1;
+    if (!valid_handle(h)) return 1;
     if (g_reg[h].qtype != 1) return 2;                        // Q6_K only (qtype 1)
     struct DevWeight &w = g_reg[h];
     long long in_f = w.n_blocks * 256, nx = T * in_f;
@@ -429,7 +554,7 @@ __global__ void qk_q4k_dp4a(const uint8_t *W, const int8_t *xlimb, const int64_t
 }
 
 extern "C" int qk_apply_resident_q4k_dp4a(long long h, const int64_t *x, long long T, int fw, int Ln, int64_t *out) {
-    if (h < 0 || h >= g_nreg || g_reg[h].p == nullptr) return 1;
+    if (!valid_handle(h)) return 1;
     if (g_reg[h].qtype != 0) return 2;                     // Q4_K only (qtype 0)
     struct DevWeight &w = g_reg[h];
     long long in_f = w.n_blocks * 256, nx = T * in_f, nxs = T * w.n_blocks * 8;
@@ -541,7 +666,7 @@ extern "C" int qk_moe_ffn_dp4a(const long long *gate_h, const long long *up_h, c
     int qg = -1, qu = -1, qd = -1;
     for (int e = 0; e < n_e; e++) {
         long long g = gate_h[e], u = up_h[e], d = down_h[e];
-        if (g < 0 || g >= g_nreg || u < 0 || u >= g_nreg || d < 0 || d >= g_nreg) return 1;
+        if (!valid_handle(g) || !valid_handle(u) || !valid_handle(d)) return 1;
         pg[e] = g_reg[g].p; pu[e] = g_reg[u].p; pd[e] = g_reg[d].p;
         int eg = g_reg[g].qtype, eu = g_reg[u].qtype, ed = g_reg[d].qtype;
         if (e == 0) { qg = eg; qu = eu; qd = ed; }
@@ -626,28 +751,38 @@ extern "C" int qk_moe_ffn_batched(const long long *gate_h, const long long *up_h
                                   int m, int k, const int64_t *h, const int64_t *gates, long long d_model,
                                   long long e_ffn, int fa, int fw, int64_t *out) {
     long long P = (long long)m * k;
-    if (m <= 0 || k <= 0) return 1;
-    uint8_t **pg = (uint8_t **)malloc(P * sizeof(uint8_t *)), **pu = (uint8_t **)malloc(P * sizeof(uint8_t *)),
-            **pd = (uint8_t **)malloc(P * sizeof(uint8_t *));
-    int *tok = (int *)malloc(P * sizeof(int)), qg = -1, qu = -1, qd = -1, ok = 1;
-    if (!pg || !pu || !pd || !tok) ok = 0;
-    for (long long p = 0; ok && p < P; p++) {
-        long long g = gate_h[p], u = up_h[p], d = down_h[p];
-        if (g < 0 || g >= g_nreg || u < 0 || u >= g_nreg || d < 0 || d >= g_nreg) { ok = 0; break; }
-        pg[p] = g_reg[g].p; pu[p] = g_reg[u].p; pd[p] = g_reg[d].p; tok[p] = (int)(p / k);
-        qg = g_reg[g].qtype; qu = g_reg[u].qtype; qd = g_reg[d].qtype;
-    }
+    if (!gate_h || !up_h || !down_h || !h || !gates || !out || m <= 0 || k <= 0 || P > INT_MAX ||
+        d_model <= 0 || e_ffn <= 0 || d_model % 256 != 0 || e_ffn % 256 != 0) return 1;
+    size_t np = (size_t)P, nm = (size_t)m, dm = (size_t)d_model, ef = (size_t)e_ffn;
+    if (dm > SIZE_MAX / nm || nm * dm > SIZE_MAX / 8 || ef > SIZE_MAX / np || np * ef > SIZE_MAX / 8 ||
+        dm > SIZE_MAX / np || np * dm > SIZE_MAX / 8) return 1;
+    uint8_t **pg = nullptr, **pu = nullptr, **pd = nullptr;
+    int *tok = nullptr, qg = -1, qu = -1, qd = -1;
+    if (moe_host_scratch(np, &pg, &pu, &pd, &tok) != 0) return 1;
     long long nb_in = d_model / 256, nb_dn = e_ffn / 256;
-    uint8_t **dpg = 0, **dpu = 0, **dpd = 0; int *dtok = 0;
-    int64_t *dh = 0, *dg = 0, *du = 0, *dd = 0, *dgs = 0, *dout = 0;
-    int rc = 1;
-    if (!ok) goto done;
-    #define A(p, sz) if (cudaMalloc(&(p), (sz)) != cudaSuccess) goto done
-    A(dpg, P * sizeof(uint8_t *)); A(dpu, P * sizeof(uint8_t *)); A(dpd, P * sizeof(uint8_t *)); A(dtok, P * sizeof(int));
-    A(dh, (long long)m * d_model * 8); A(dgs, P * 8); A(dout, (long long)m * d_model * 8);
-    A(dg, P * e_ffn * 8); A(du, P * e_ffn * 8); A(dd, P * d_model * 8);
-    #undef A
-    #define H2D(d, s, sz) if (cudaMemcpy((d), (s), (sz), cudaMemcpyHostToDevice) != cudaSuccess) goto done
+    for (long long p = 0; p < P; p++) {
+        long long g = gate_h[p], u = up_h[p], d = down_h[p];
+        if (!valid_handle(g) || !valid_handle(u) || !valid_handle(d) ||
+            g_reg[g].out_f != e_ffn || g_reg[g].n_blocks != nb_in ||
+            g_reg[u].out_f != e_ffn || g_reg[u].n_blocks != nb_in ||
+            g_reg[d].out_f != d_model || g_reg[d].n_blocks != nb_dn) return 1;
+        pg[p] = g_reg[g].p; pu[p] = g_reg[u].p; pd[p] = g_reg[d].p; tok[p] = (int)(p / k);
+        int eg = g_reg[g].qtype, eu = g_reg[u].qtype, ed = g_reg[d].qtype;
+        if (p == 0) { qg = eg; qu = eu; qd = ed; }
+        else if (qg != eg || qu != eu || qd != ed) return 1; // matmul_multi_tok takes one qtype per stage
+    }
+    uint8_t **dpg = (uint8_t **)moe_scratch(MS_PG, np * sizeof(uint8_t *));
+    uint8_t **dpu = (uint8_t **)moe_scratch(MS_PU, np * sizeof(uint8_t *));
+    uint8_t **dpd = (uint8_t **)moe_scratch(MS_PD, np * sizeof(uint8_t *));
+    int *dtok = (int *)moe_scratch(MS_TOK, np * sizeof(int));
+    int64_t *dh = (int64_t *)moe_scratch(MS_H, nm * dm * 8);
+    int64_t *dgs = (int64_t *)moe_scratch(MS_GATES, np * 8);
+    int64_t *dout = (int64_t *)moe_scratch(MS_OUT, nm * dm * 8);
+    int64_t *dg = (int64_t *)moe_scratch(MS_GATE_OUT, np * ef * 8);
+    int64_t *du = (int64_t *)moe_scratch(MS_UP_OUT, np * ef * 8);
+    int64_t *dd = (int64_t *)moe_scratch(MS_DOWN_OUT, np * dm * 8);
+    if (!dpg || !dpu || !dpd || !dtok || !dh || !dgs || !dout || !dg || !du || !dd) return 1;
+    #define H2D(d, s, sz) if (cudaMemcpy((d), (s), (sz), cudaMemcpyHostToDevice) != cudaSuccess) return 1
     H2D(dpg, pg, P * sizeof(uint8_t *)); H2D(dpu, pu, P * sizeof(uint8_t *)); H2D(dpd, pd, P * sizeof(uint8_t *));
     H2D(dtok, tok, P * sizeof(int)); H2D(dh, h, (long long)m * d_model * 8); H2D(dgs, gates, P * 8);
     #undef H2D
@@ -660,14 +795,8 @@ extern "C" int qk_moe_ffn_batched(const long long *gate_h, const long long *up_h
         matmul_multi_tok<<<(ngd + tpb - 1) / tpb, tpb>>>(dpd, qd, dg, 1, dtok, d_model, nb_dn, fw, (int)P, dd);
         combine_tok<<<((long long)m * d_model + tpb - 1) / tpb, tpb>>>(dd, m, k, d_model, dgs, fa, dout);
     }
-    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) goto done;
-    if (cudaMemcpy(out, dout, (long long)m * d_model * 8, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
-    rc = 0;
-done:
-    free(pg); free(pu); free(pd); free(tok);
-    cudaFree(dpg); cudaFree(dpu); cudaFree(dpd); cudaFree(dtok);
-    cudaFree(dh); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dgs); cudaFree(dout);
-    return rc;
+    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return 1;
+    return cudaMemcpy(out, dout, (long long)m * d_model * 8, cudaMemcpyDeviceToHost) == cudaSuccess ? 0 : 1;
 }
 
 extern "C" int qk_cuda_available(void) {     // 0 = a usable GPU is present

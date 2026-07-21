@@ -420,7 +420,13 @@ def run_verification(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
         print("[gpu-real] proving residency and constructing CUDA graph", file=sys.stderr, flush=True)
         create_started = time.perf_counter()
-        executor, feasibility = Bonsai35GpuExecutor.try_create_reported(artifact)
+        executor, feasibility = Bonsai35GpuExecutor.try_create_reported(
+            artifact,
+            # Full parity exports every post-layer residual.  The populated-
+            # context throughput gate intentionally measures the production
+            # graph without those diagnostic copy nodes.
+            capture_trace=not throughput_mode,
+        )
         report["gpu_feasibility"] = feasibility.as_dict()
         report["timing"] = {"executor_create_seconds": time.perf_counter() - create_started}
         if executor is None:
@@ -473,6 +479,17 @@ def run_verification(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise VerificationFailure("gpu_decode", "internal consumed-token count drift", EXIT_GPU_RUNTIME)
 
         stats = executor.stats()
+        graph_metadata = executor.graph_metadata()
+        report["cuda_graph"] = graph_metadata
+        print(
+            "[gpu-real] captured graph "
+            f"nodes={graph_metadata['graph_nodes']} "
+            f"kernels={graph_metadata['kernel_nodes']} "
+            f"memcpy={graph_metadata['memcpy_nodes']} "
+            f"trace={'on' if graph_metadata['trace_enabled'] else 'off'}",
+            file=sys.stderr,
+            flush=True,
+        )
         memory_at_target = gpu_memory_info()
         if throughput_mode:
             throughput = build_throughput_summary(
@@ -494,6 +511,10 @@ def run_verification(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 **throughput["timing"],
             })
             report["acceptance"] = throughput_acceptance(throughput)
+            report["acceptance"]["diagnostic_trace_disabled"] = (
+                graph_metadata["trace_enabled"] is False
+                and graph_metadata["trace_copy_nodes_per_launch"] == 0
+            )
             accepted = all(report["acceptance"].values())
             report["status"] = "pass" if accepted else "fail"
             # No CPU replay or multi-GiB cache export is part of this mode.

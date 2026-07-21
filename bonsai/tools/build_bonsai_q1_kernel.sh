@@ -61,7 +61,7 @@ fi
 # result reflects whether this compiler can actually build/link an OpenMP object.
 openmp_flags=()
 tmp_omp="$(mktemp --suffix=.c 2>/dev/null || mktemp)"
-trap 'rm -f "$tmp_omp" "${tmp_omp%.c}.o"' EXIT
+trap 'rm -f "$tmp_omp" "${tmp_omp%.c}.o" "${tmp_omp%.c}.march.o"' EXIT
 cat >"$tmp_omp" <<'EOF'
 #include <omp.h>
 int main(void) {
@@ -86,7 +86,14 @@ march_flags=()
 arch="$(uname -m)"
 case "$arch" in
   x86_64)
-    march_flags=(-march=x86-64-v2)
+    # GCC 9 (the stock compiler on Ubuntu 20.04) predates the x86-64-v2
+    # spelling.  Compile-test it and retain a portable x86-64 fallback so a
+    # fresh Turing-era host can still build the canonical CPU oracle.
+    if "$cc" -march=x86-64-v2 -c "$tmp_omp" -o "${tmp_omp%.c}.march.o" >/dev/null 2>&1; then
+      march_flags=(-march=x86-64-v2)
+    else
+      march_flags=(-march=x86-64)
+    fi
     ;;
   aarch64)
     march_flags=(-march=armv8-a)
@@ -103,6 +110,8 @@ esac
 # Built kernel goes to $BONSAI_NOTARY_HOME/bin (build artifacts are not source); the loader prefers it and
 # falls back to <repo>/tools for back-compat. Override the location with $BONSAI_BIN_DIR.
 BIN_DIR="${BONSAI_BIN_DIR:-${BONSAI_NOTARY_HOME:-$HOME/.local/trinote}/bin}"; mkdir -p "$BIN_DIR"
+rm -f "$tmp_omp" "${tmp_omp%.c}.o" "${tmp_omp%.c}.march.o"
+trap - EXIT
 exec "$cc" -O3 "${march_flags[@]}" -mtune=generic -fwrapv -fno-strict-overflow -fPIC -shared "${openmp_flags[@]}" \
   "$ROOT/tools/bonsai_q1_kernel.c" \
   -o "$BIN_DIR/libbonsai_q1_kernel.so"

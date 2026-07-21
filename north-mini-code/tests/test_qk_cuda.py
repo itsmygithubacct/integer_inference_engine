@@ -1,6 +1,8 @@
 """CUDA kernel parity gate: the GPU `qk_linear_cuda` MUST be byte-identical to the CPU kernel AND the numpy
 oracle, for Q4_K and Q6_K, across shapes/seeds/token-counts. Synthetic blocks — no model/weights needed.
 Skips when no GPU / no .so (CPU-only or unbuilt host)."""
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 
@@ -95,6 +97,22 @@ def test_cuda_moe_ffn_matches_cpu():
     uh = [qk_cuda.register_weight(up_raw[e], e_ffn, nb_in, Q) for e in range(n_e)]
     dh = [qk_cuda.register_weight(down_raw[e], d_model, nb_dn, Q) for e in range(n_e)]
     got = qk_cuda.moe_ffn(gh, uh, dh, h, gates, d_model, e_ffn, fa, fw)
+    workspace_grows = qk_cuda.moe_workspace_allocations()
+    got_reused = qk_cuda.moe_ffn(gh, uh, dh, h, gates, d_model, e_ffn, fa, fw)
+    assert np.array_equal(got_reused, got)
+    if workspace_grows is not None:
+        assert workspace_grows > 0
+        assert qk_cuda.moe_workspace_allocations() == workspace_grows  # same shape performs no cudaMalloc
+
+    # ctypes releases the GIL.  The Python bridge must serialize calls that
+    # share the process-global CUDA workspace; every queued result remains
+    # byte-identical under real concurrent callers.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        concurrent = list(pool.map(
+            lambda _: qk_cuda.moe_ffn(gh, uh, dh, h, gates, d_model, e_ffn, fa, fw),
+            range(8),
+        ))
+    assert all(np.array_equal(result, got) for result in concurrent)
 
     def silu(x):
         s = fixed_point_sigmoid(np.asarray(x, np.int64), fa)
@@ -189,11 +207,39 @@ def test_cuda_moe_ffn_batched_matches():
     dh = [down[e] for t in range(m) for e in sel[t]]
     gflat = [int(g) for t in range(m) for g in gts[t]]
     got = qk_cuda.moe_ffn_batched(gh, uh, dh, m, k, h, gflat, d_model, e_ffn, fa, fw)
+    workspace_grows = qk_cuda.moe_workspace_allocations()
+    got_reused = qk_cuda.moe_ffn_batched(gh, uh, dh, m, k, h, gflat, d_model, e_ffn, fa, fw)
+    assert np.array_equal(got_reused, got)
+    if workspace_grows is not None:
+        assert qk_cuda.moe_workspace_allocations() == workspace_grows  # same shape performs no cudaMalloc
+    retained_bytes = qk_cuda.moe_workspace_bytes()
+    resident_weights = qk_cuda.resident_count()
+    if retained_bytes is not None:
+        assert retained_bytes > 0
+        assert qk_cuda.release_moe_workspace()
+        assert qk_cuda.moe_workspace_bytes() == 0
+        assert qk_cuda.resident_count() == resident_weights  # scratch release must not invalidate weights
     ref = np.empty((m, d_model), np.int64)
     for t in range(m):
         ref[t] = qk_cuda.moe_ffn([gate[e] for e in sel[t]], [up[e] for e in sel[t]], [down[e] for e in sel[t]],
                                  h[t], gts[t], d_model, e_ffn, fa, fw)
     assert got is not None and np.array_equal(got, ref)
+    qk_cuda.free_all()
+
+
+def test_cuda_registry_metadata_grows_beyond_old_limit():
+    """The host registry crosses the removed 16,384-entry ceiling without allocating one VRAM block per slot."""
+    if not qk_cuda.resident_available():
+        pytest.skip("resident API not in the .so")
+    qk_cuda.free_all()
+    assert qk_cuda.reserve_resident_capacity(16_385)
+    assert qk_cuda.resident_capacity() >= 16_385
+    assert qk_cuda.resident_count() == 0
+
+    raw = _q4k_raw(qk.random_q4k(991))
+    handle = qk_cuda.register_weight(raw, 1, 1, qk_cuda.Q4_K)
+    x = np.arange(256, dtype=np.int64)
+    assert qk_cuda.apply_resident(handle, x, 1, FW) is not None
     qk_cuda.free_all()
 
 
@@ -205,8 +251,10 @@ def test_cuda_free_all_then_reregister():
     raw = b"".join(_q6k_raw(qk.random_q6k(s)) for s in range(8 * 4))
     x = np.random.default_rng(0).integers(-(1 << 16), 1 << 16, size=(1, 4 * 256), dtype=np.int64)
     h1 = qk_cuda.register_weight(raw, 8, 4, qk_cuda.Q6_K)
+    assert qk_cuda.resident_capacity() >= qk_cuda.resident_count() >= 1
     r1 = qk_cuda.apply_resident(h1, x, 8, FW)
     qk_cuda.free_all()
+    assert qk_cuda.resident_capacity() == 0
     h2 = qk_cuda.register_weight(raw, 8, 4, qk_cuda.Q6_K)     # fresh handle after free
     r2 = qk_cuda.apply_resident(h2, x, 8, FW)
     assert np.array_equal(r1, r2)

@@ -1643,6 +1643,12 @@ struct Bonsai35Ctx {
     Bonsai35Config c; std::vector<Bonsai35LayerDesc> layers; bool alive,poisoned;
     long long t,nrec,natt,conv_dim,max_k,graph_launches,input_mode;
     long long token_submissions,embedded_submissions,model_input_host_bytes;
+    // Post-layer residual snapshots are a parity/debug facility, not part of
+    // production inference.  Keeping this off removes one D2D memcpy graph
+    // node for the embedding plus one after every transformer layer.
+    bool capture_trace;
+    long long graph_nodes,graph_kernel_nodes,graph_memcpy_nodes;
+    long long graph_memset_nodes,graph_other_nodes;
     long long *state,*conv_hist;
     int *K,*V;  // guarded Q16 cache: every append proves exact int32 narrowing
     long long *x,*norm,*tmp,*qkv,*z,*alpha,*beta,*conv;
@@ -2425,10 +2431,12 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
         cudaMemcpyAsync(c.token,c.h_token,8,cudaMemcpyHostToDevice,c.stream);
         q35_embedding_row_bmma_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(
             embed.dbits,embed.dscale32,embed.out_f,embed.n_blocks,c.token,c.x,c.overflow);
-        cudaMemcpyAsync(c.trace,c.x,(size_t)g.d*8,cudaMemcpyDeviceToDevice,c.stream);
+        if(c.capture_trace)
+            cudaMemcpyAsync(c.trace,c.x,(size_t)g.d*8,cudaMemcpyDeviceToDevice,c.stream);
     }else{
         cudaMemcpyAsync(c.x,c.h_x,(size_t)g.d*8,cudaMemcpyHostToDevice,c.stream);
-        cudaMemcpyAsync(c.trace,c.h_x,(size_t)g.d*8,cudaMemcpyHostToDevice,c.stream);
+        if(c.capture_trace)
+            cudaMemcpyAsync(c.trace,c.h_x,(size_t)g.d*8,cudaMemcpyHostToDevice,c.stream);
     }
     cudaMemcpyAsync(c.pos,c.h_pos,8,cudaMemcpyHostToDevice,c.stream);
     cudaMemcpyAsync(c.len,c.h_len,8,cudaMemcpyHostToDevice,c.stream);
@@ -2502,13 +2510,50 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
         mulshift_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffu,c.ffh,g.dff,g.frac);
         q35_prepare_digits(c,c.ffh,g.dff);q35_apply_prepared(c,l.w2,c.tmp);
         add_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(c.x,c.tmp,c.x,g.d);
-        cudaMemcpyAsync(c.trace+(size_t)(li+1)*g.d,c.x,(size_t)g.d*8,cudaMemcpyDeviceToDevice,c.stream);
+        if(c.capture_trace)
+            cudaMemcpyAsync(c.trace+(size_t)(li+1)*g.d,c.x,(size_t)g.d*8,
+                            cudaMemcpyDeviceToDevice,c.stream);
     }
     rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(g.final_gain),c.norm,c.overflow);
     q35_prepare_digits(c,c.norm,g.d);q35_apply_prepared(c,g.out_head,c.logits);
     cudaMemcpyAsync(c.h_logits,c.logits,(size_t)g.vocab*8,cudaMemcpyDeviceToHost,c.stream);
     cudaMemcpyAsync(c.h_overflow,c.overflow,sizeof(int),cudaMemcpyDeviceToHost,c.stream);
     return cudaGetLastError()==cudaSuccess;
+}
+
+// Record the instantiated schedule shape without putting timers or callbacks
+// into the hot graph.  Unknown/new CUDA node kinds are deliberately grouped as
+// "other" so this ABI remains useful across CUDA toolkit versions.
+static void q35_measure_graph(Bonsai35Ctx& c){
+    c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=0;
+    c.graph_memset_nodes=c.graph_other_nodes=0;
+    size_t count=0;
+    if(!c.graph||cudaGraphGetNodes(c.graph,nullptr,&count)!=cudaSuccess){
+        c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=-1;
+        c.graph_memset_nodes=c.graph_other_nodes=-1;
+        cudaGetLastError();return;
+    }
+    std::vector<cudaGraphNode_t> nodes;
+    try{nodes.resize(count);}catch(...){
+        c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=-1;
+        c.graph_memset_nodes=c.graph_other_nodes=-1;return;
+    }
+    if(count&&cudaGraphGetNodes(c.graph,nodes.data(),&count)!=cudaSuccess){
+        c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=-1;
+        c.graph_memset_nodes=c.graph_other_nodes=-1;
+        cudaGetLastError();return;
+    }
+    c.graph_nodes=(long long)count;
+    for(size_t i=0;i<count;++i){
+        cudaGraphNodeType type;
+        if(cudaGraphNodeGetType(nodes[i],&type)!=cudaSuccess){
+            c.graph_other_nodes++;cudaGetLastError();continue;
+        }
+        if(type==cudaGraphNodeTypeKernel)c.graph_kernel_nodes++;
+        else if(type==cudaGraphNodeTypeMemcpy)c.graph_memcpy_nodes++;
+        else if(type==cudaGraphNodeTypeMemset)c.graph_memset_nodes++;
+        else c.graph_other_nodes++;
+    }
 }
 
 static void q35_free_ctx(Bonsai35Ctx& c){
@@ -2539,6 +2584,8 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
        cfg->H%cfg->Hkv||cfg->hd<=0||cfg->cap<=0||cfg->state_size<=0||cfg->state_size>128||
        cfg->conv_k<2||cfg->inner!=cfg->value_heads*cfg->state_size)return -1;
     Bonsai35Ctx c{};c.c=*cfg;c.alive=false;c.poisoned=false;c.t=0;c.graph_launches=0;c.graph_ready=false;
+    c.capture_trace=false;c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=0;
+    c.graph_memset_nodes=c.graph_other_nodes=0;
     c.input_mode=0;c.token_submissions=0;c.embedded_submissions=0;c.model_input_host_bytes=0;
     c.layers.assign(layers,layers+cfg->n_layers);c.nrec=0;c.natt=0;
     for(const auto& l:c.layers){if(l.kind==0)c.nrec++;else if(l.kind==1)c.natt++;else return -1;}
@@ -2572,7 +2619,7 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
     cm(&c.aout,Q*8);cm(&c.agated,Q*8);cm(&c.ffg,(size_t)cfg->dff*8);cm(&c.ffu,(size_t)cfg->dff*8);
     cm(&c.ffh,(size_t)cfg->dff*8);cm(&c.scores,(size_t)cfg->H*cfg->cap*8);
     cm(&c.digits,(size_t)(c.max_k/128)*4*128);cm(&c.logits,(size_t)cfg->vocab*8);
-    cm(&c.trace,(size_t)(cfg->n_layers+1)*cfg->d*8);cm(&c.pos,8);cm(&c.len,8);cm(&c.token,8);
+    cm(&c.pos,8);cm(&c.len,8);cm(&c.token,8);
     cm(&c.maxk,(size_t)c.natt*cfg->Hkv*8);cm(&c.maxv,(size_t)c.natt*cfg->Hkv*8);cm(&c.overflow,sizeof(int));
     if(ok)ok=(cudaHostAlloc(&c.h_x,(size_t)cfg->d*8,cudaHostAllocPortable)==cudaSuccess);
     if(ok)ok=(cudaHostAlloc(&c.h_logits,(size_t)cfg->vocab*8,cudaHostAllocPortable)==cudaSuccess);
@@ -2587,6 +2634,25 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
     c.alive=true;g_bonsai35.push_back(std::move(c));return (long long)g_bonsai35.size()-1;
 }
 
+// Trace mode must be selected before the first decode captures the graph.  It
+// cannot be toggled after capture because that would make the reported graph
+// shape and its data dependencies disagree with the caller's expectation.
+int bonsai35_ctx_set_trace(long long handle,int enabled){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.graph_ready||c.t!=0)return 1;
+    if(enabled){
+        if(!c.trace&&cudaMalloc(&c.trace,(size_t)(c.c.n_layers+1)*c.c.d*8)!=cudaSuccess){
+            cudaGetLastError();return 2;
+        }
+        c.capture_trace=true;
+    }else{
+        if(c.trace&&cudaFree(c.trace)!=cudaSuccess){cudaGetLastError();return 2;}
+        c.trace=nullptr;c.capture_trace=false;
+    }
+    return 0;
+}
+
 int bonsai35_decode_step(long long handle,const long long* x_host,long long pos,long long* logits_host){
     if(handle<0||(size_t)handle>=g_bonsai35.size()||!x_host||!logits_host)return 1;
     Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap)return 1;
@@ -2596,6 +2662,7 @@ int bonsai35_decode_step(long long handle,const long long* x_host,long long pos,
         if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return 2;
         bool ok=q35_enqueue_decode(c,false);
         if(!ok||cudaStreamEndCapture(c.stream,&c.graph)!=cudaSuccess)return 2;
+        q35_measure_graph(c);
         if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return 2;
         c.graph_ready=true;c.input_mode=1;
     }
@@ -2619,6 +2686,7 @@ int bonsai35_decode_token(long long handle,long long token,long long pos,long lo
         if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return 2;
         bool ok=q35_enqueue_decode(c,true);
         if(!ok||cudaStreamEndCapture(c.stream,&c.graph)!=cudaSuccess)return 2;
+        q35_measure_graph(c);
         if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return 2;
         c.graph_ready=true;c.input_mode=2;
     }
@@ -2647,7 +2715,7 @@ void bonsai35_ctx_free(long long handle){
 int bonsai35_ctx_export(long long handle,long long* state_host,long long* conv_host,
                         long long* k_host,long long* v_host,long long* trace_host){
     if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
-    if(!c.alive||c.poisoned)return 1;const auto& g=c.c;bool ok=true;
+    if(!c.alive||c.poisoned||(!c.capture_trace&&trace_host))return 1;const auto& g=c.c;bool ok=true;
     const size_t S=(size_t)c.nrec*g.value_heads*g.state_size*g.state_size;
     const size_t CH=(size_t)c.nrec*(g.conv_k-1)*c.conv_dim;
     if(state_host)ok=ok&&(cudaMemcpy(state_host,c.state,S*8,cudaMemcpyDeviceToHost)==cudaSuccess);
@@ -2682,6 +2750,20 @@ int bonsai35_ctx_input_stats(long long handle,long long* input_mode,long long* t
     if(token_submissions)*token_submissions=c.token_submissions;
     if(embedded_submissions)*embedded_submissions=c.embedded_submissions;
     if(model_input_host_bytes)*model_input_host_bytes=c.model_input_host_bytes;return 0;
+}
+
+int bonsai35_ctx_graph_stats(long long handle,long long* total_nodes,long long* kernel_nodes,
+                             long long* memcpy_nodes,long long* memset_nodes,
+                             long long* other_nodes,int* trace_enabled){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;
+    const Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive)return 1;
+    if(total_nodes)*total_nodes=c.graph_nodes;
+    if(kernel_nodes)*kernel_nodes=c.graph_kernel_nodes;
+    if(memcpy_nodes)*memcpy_nodes=c.graph_memcpy_nodes;
+    if(memset_nodes)*memset_nodes=c.graph_memset_nodes;
+    if(other_nodes)*other_nodes=c.graph_other_nodes;
+    if(trace_enabled)*trace_enabled=c.capture_trace?1:0;
+    return 0;
 }
 
 // ---- M=B fully-resident batched decode: stateful context (KV persists on device across steps) ------------
