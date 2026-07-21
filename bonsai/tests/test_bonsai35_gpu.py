@@ -43,6 +43,24 @@ def test_qwen35_memory_probe_no_gpu_is_clean(monkeypatch):
     assert not report.available and not report.feasible and handles is None
 
 
+def test_qwen35_executor_rejects_stale_graph_abi_before_model_upload(monkeypatch):
+    import trinote.infer_int.gpu_bonsai35 as g
+
+    class StaleLibrary:
+        bonsai35_ctx_create = object()
+
+    monkeypatch.setattr(g, "_load_lib", lambda: StaleLibrary())
+
+    def upload_must_not_run(*args, **kwargs):
+        raise AssertionError("stale graph ABI attempted a residency proof")
+
+    monkeypatch.setattr(g, "prove_bonsai35_gpu_memory", upload_must_not_run)
+    executor, report = g.Bonsai35GpuExecutor.try_create_reported(_artifact(90))
+    assert executor is None
+    assert not report.available and not report.feasible
+    assert "unavailable or stale" in report.reason
+
+
 def test_qwen35_memory_probe_rejects_conflict_before_upload(monkeypatch):
     import trinote.infer_int.gpu_bonsai35 as g
     artifact = _artifact(9)
@@ -83,7 +101,12 @@ def test_qwen35_real_shape_memory_components():
     assert c["attention_k_cache"] == c["attention_v_cache"] == 536870912
     assert c["attention_guard_maxima"] == 1024
     assert c["token_id_input"] == 8
+    assert c["debug_layer_trace"] == 0
     assert sum(c.values()) < 2.0 * (1 << 30)
+
+    traced = qwen35_workspace_components(artifact, kv_bits=64, capture_trace=True)
+    assert traced["debug_layer_trace"] == 65 * 5120 * 8
+    assert sum(traced.values()) - sum(c.values()) == traced["debug_layer_trace"]
 
     c32 = qwen35_workspace_components(artifact, kv_bits=32)
     assert c32["attention_k_cache"] == c32["attention_v_cache"] == 268435456
@@ -215,7 +238,7 @@ def test_qwen35_resident_graph_full_trace_and_poison_reset():
     _need_gpu()
     art = _artifact(5); ids = [2, 3, 4]
     cpu = cpu_oracle_trace(art, ids)
-    executor = Bonsai35GpuExecutor.try_create(art)
+    executor = Bonsai35GpuExecutor.try_create(art, capture_trace=True)
     assert executor is not None
     try:
         logits = executor.prefill(ids)
@@ -223,6 +246,14 @@ def test_qwen35_resident_graph_full_trace_and_poison_reset():
         assert logits is not None and gpu is not None and np.array_equal(logits, cpu["logits"])
         for key in ("trace", "state", "conv", "k", "v"):
             assert np.array_equal(gpu[key], cpu[key]), key
+        graph = executor.graph_metadata()
+        assert graph["trace_enabled"] is True
+        assert graph["trace_copy_nodes_per_launch"] == len(art["layers"]) + 1
+        assert graph["graph_nodes"] == sum(
+            graph[key] for key in (
+                "kernel_nodes", "memcpy_nodes", "memset_nodes", "other_nodes"
+            )
+        )
         stats = executor.stats()
         assert stats == {
             "graph_launches": len(ids), "position": len(ids),
@@ -260,6 +291,48 @@ def test_qwen35_resident_graph_full_trace_and_poison_reset():
         assert dstats["model_input_host_bytes"] == 2 * int(art["config"]["dModel"]) * 8
     finally:
         diagnostic.close()
+
+
+def test_qwen35_production_graph_omits_debug_trace_copies():
+    _need_gpu()
+    art = _artifact(51)
+
+    def run(capture_trace):
+        executor = Bonsai35GpuExecutor.try_create(art, capture_trace=capture_trace)
+        assert executor is not None
+        try:
+            with pytest.raises(RuntimeError, match="decode at least one token"):
+                executor.graph_metadata()
+            logits = []
+            for token in (2, 3, 4):
+                row = executor.decode_token(token)
+                assert row is not None
+                logits.append(row.copy())
+            graph = executor.graph_metadata()
+            if not capture_trace:
+                with pytest.raises(RuntimeError, match="capture_trace=True"):
+                    executor.debug_snapshot()
+                snapshot = executor.state_snapshot()
+            else:
+                snapshot = executor.debug_snapshot()
+            assert snapshot is not None
+            return np.stack(logits), snapshot, graph
+        finally:
+            executor.close()
+
+    production_logits, production_state, production = run(False)
+    diagnostic_logits, diagnostic_state, diagnostic = run(True)
+    assert np.array_equal(production_logits, diagnostic_logits)
+    for key in ("state", "conv", "k", "v"):
+        assert np.array_equal(production_state[key], diagnostic_state[key]), key
+    expected_copies = len(art["layers"]) + 1
+    assert production["trace_enabled"] is False
+    assert production["trace_copy_nodes_per_launch"] == 0
+    assert production["trace_copy_bytes_per_launch"] == 0
+    assert diagnostic["graph_nodes"] - production["graph_nodes"] == expected_copies
+    assert diagnostic["memcpy_nodes"] - production["memcpy_nodes"] == expected_copies
+    assert diagnostic["kernel_nodes"] == production["kernel_nodes"]
+    assert diagnostic["memset_nodes"] == production["memset_nodes"]
 
 
 def test_qwen35_tied_embedding_output_reuses_one_resident_handle():

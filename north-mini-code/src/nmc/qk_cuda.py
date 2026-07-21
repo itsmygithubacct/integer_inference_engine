@@ -7,15 +7,53 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
+from nmc.qk_native import _require_weight_bytes   # shared Q4_K/Q6_K superblock buffer-length guard
+
 Q4_K, Q6_K = 0, 1
 _DP4A_SAFE_LIMBS = 4
+_CUDA_ABI_VERSION = 2
+# The resident registry and reusable activation workspaces are process-global
+# in the CUDA library.  CDLL calls release the GIL, so the bridge must enforce
+# the single-caller contract rather than merely documenting it.
+_CUDA_LOCK = threading.RLock()
+_REQUIRED_CUDA_SYMBOLS = (
+    "qk_cuda_abi_version",
+    "qk_linear_cuda",
+    "qk_cuda_available",
+    "qk_register_weight",
+    "qk_resident_reserve",
+    "qk_apply_resident",
+    "qk_free_all",
+    "qk_resident_count",
+    "qk_resident_capacity",
+    "qk_moe_workspace_allocations",
+    "qk_moe_workspace_bytes",
+    "qk_moe_workspace_release",
+    "qk_moe_ffn",
+    "qk_moe_ffn_batched",
+)
 
-from nmc.qk_native import _require_weight_bytes   # shared buffer-length guard (Q4_K=144B, Q6_K=210B superblocks)
+
+class CudaRegistrationError(RuntimeError):
+    """A resident weight could not be committed to the CUDA registry/VRAM."""
+
+
+def _has_current_abi(lib) -> bool:
+    """Return whether a loaded per-host library implements this bridge's exact runtime contract."""
+    try:
+        if any(not hasattr(lib, name) for name in _REQUIRED_CUDA_SYMBOLS):
+            return False
+        lib.qk_cuda_abi_version.restype = ctypes.c_int
+        with _CUDA_LOCK:
+            return int(lib.qk_cuda_abi_version()) == _CUDA_ABI_VERSION
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
 
 
 def _so_path() -> Path:
@@ -37,7 +75,8 @@ def _lib():
         return None
     try:
         lib = ctypes.CDLL(str(p))
-        lib.qk_linear_cuda; lib.qk_cuda_available  # noqa: B018 — probe symbols
+        if not _has_current_abi(lib):
+            return None
     except (OSError, AttributeError):
         return None
     lib.qk_linear_cuda.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
@@ -48,10 +87,18 @@ def _lib():
     try:
         lib.qk_register_weight.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int]
         lib.qk_register_weight.restype = ctypes.c_int64
+        lib.qk_resident_reserve.argtypes = [ctypes.c_int64]
+        lib.qk_resident_reserve.restype = ctypes.c_int
         lib.qk_apply_resident.argtypes = [ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int, ctypes.c_void_p]
         lib.qk_apply_resident.restype = ctypes.c_int
         lib.qk_free_all.restype = None
         lib.qk_resident_count.restype = ctypes.c_int64
+        if hasattr(lib, "qk_resident_capacity"):
+            lib.qk_resident_capacity.restype = ctypes.c_int64
+        if hasattr(lib, "qk_moe_workspace_allocations"):
+            lib.qk_moe_workspace_allocations.restype = ctypes.c_int64
+        lib.qk_moe_workspace_bytes.restype = ctypes.c_uint64
+        lib.qk_moe_workspace_release.restype = None
         P64 = ctypes.POINTER(ctypes.c_int64)
         lib.qk_moe_ffn.argtypes = [P64, P64, P64, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
                                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
@@ -71,8 +118,9 @@ def _lib():
     except AttributeError:
         pass
     try:
-        if lib.qk_cuda_available() != 0:
-            return None                               # lib loaded but no usable GPU -> fall back
+        with _CUDA_LOCK:
+            if lib.qk_cuda_available() != 0:
+                return None                           # lib loaded but no usable GPU -> fall back
     except OSError:
         return None
     return lib
@@ -105,14 +153,24 @@ def resident_available() -> bool:
 
 
 def register_weight(weight_raw: bytes, out_f: int, n_blocks: int, qtype: int):
-    """Upload one weight tensor's raw bytes to VRAM ONCE; return a handle (>=0) or None. Reused across applies."""
+    """Upload one weight tensor's raw bytes to VRAM once.
+
+    Returns ``None`` only when the resident API is unavailable. Once that API is selected, a failed registry
+    growth/allocation/upload raises instead of returning a sentinel that an engine could cache as a handle.
+    """
     lib = _lib()
     if lib is None or not hasattr(lib, "qk_register_weight"):
         return None
     _require_weight_bytes(weight_raw, out_f, n_blocks, qtype)   # fail loud on a short buffer (no OOB VRAM upload)
     wbuf = (ctypes.c_char * len(weight_raw)).from_buffer_copy(weight_raw)
-    h = lib.qk_register_weight(ctypes.cast(wbuf, ctypes.c_void_p), out_f, n_blocks, qtype)
-    return None if h < 0 else int(h)
+    with _CUDA_LOCK:
+        h = lib.qk_register_weight(ctypes.cast(wbuf, ctypes.c_void_p), out_f, n_blocks, qtype)
+    if h < 0:
+        raise CudaRegistrationError(
+            f"CUDA resident weight registration failed for shape [{out_f}, {n_blocks * 256}] "
+            f"(qtype={qtype}); check dimensions and available VRAM"
+        )
+    return int(h)
 
 
 def apply_resident(handle: int, x_int: np.ndarray, out_f: int, fw: int):
@@ -123,19 +181,73 @@ def apply_resident(handle: int, x_int: np.ndarray, out_f: int, fw: int):
     x = np.ascontiguousarray(np.atleast_2d(np.asarray(x_int, dtype=np.int64)))
     T = x.shape[0]
     out = np.empty((T, out_f), dtype=np.int64)
-    rc = lib.qk_apply_resident(int(handle), x.ctypes.data, T, int(fw), out.ctypes.data)
+    with _CUDA_LOCK:
+        rc = lib.qk_apply_resident(int(handle), x.ctypes.data, T, int(fw), out.ctypes.data)
     return None if rc != 0 else out
 
 
 def free_all():
     lib = _lib()
     if lib is not None and hasattr(lib, "qk_free_all"):
-        lib.qk_free_all()
+        with _CUDA_LOCK:
+            lib.qk_free_all()
 
 
 def resident_count() -> int:
     lib = _lib()
-    return int(lib.qk_resident_count()) if lib is not None and hasattr(lib, "qk_resident_count") else 0
+    if lib is None or not hasattr(lib, "qk_resident_count"):
+        return 0
+    with _CUDA_LOCK:
+        return int(lib.qk_resident_count())
+
+
+def resident_capacity() -> int:
+    """Current host metadata capacity of the growable resident registry (diagnostic only)."""
+    lib = _lib()
+    if lib is None or not hasattr(lib, "qk_resident_capacity"):
+        return 0
+    with _CUDA_LOCK:
+        return int(lib.qk_resident_capacity())
+
+
+def reserve_resident_capacity(count: int) -> bool:
+    """Reserve registry metadata only; no weight bytes or VRAM are allocated."""
+    count = int(count)
+    if count < 0:
+        raise ValueError("resident capacity must be non-negative")
+    lib = _lib()
+    if lib is None or not hasattr(lib, "qk_resident_reserve"):
+        return False
+    with _CUDA_LOCK:
+        return lib.qk_resident_reserve(count) == 0
+
+
+def moe_workspace_allocations() -> int | None:
+    """Number of device-buffer grows since ``free_all``; ``None`` for older CUDA libraries."""
+    lib = _lib()
+    if lib is None or not hasattr(lib, "qk_moe_workspace_allocations"):
+        return None
+    with _CUDA_LOCK:
+        return int(lib.qk_moe_workspace_allocations())
+
+
+def moe_workspace_bytes() -> int | None:
+    """Currently retained device bytes across the reusable MoE buffer roles."""
+    lib = _lib()
+    if lib is None or not hasattr(lib, "qk_moe_workspace_bytes"):
+        return None
+    with _CUDA_LOCK:
+        return int(lib.qk_moe_workspace_bytes())
+
+
+def release_moe_workspace() -> bool:
+    """Release prefill-sized MoE scratch while preserving every resident weight handle."""
+    lib = _lib()
+    if lib is None or not hasattr(lib, "qk_moe_workspace_release"):
+        return False
+    with _CUDA_LOCK:
+        lib.qk_moe_workspace_release()
+    return True
 
 
 def dp4a_available() -> bool:
@@ -214,7 +326,8 @@ def apply_resident_dp4a(handle: int, x_int: np.ndarray, out_f: int, fw: int, qty
     if ln is None:
         return None                                     # exact int128 fallback: outside DP4A's safe envelope
     out = np.empty((T, out_f), dtype=np.int64)
-    rc = fn(int(handle), x.ctypes.data, T, int(fw), int(ln), out.ctypes.data)
+    with _CUDA_LOCK:
+        rc = fn(int(handle), x.ctypes.data, T, int(fw), int(ln), out.ctypes.data)
     return None if rc != 0 else out
 
 
@@ -245,12 +358,19 @@ def moe_ffn_batched(gate_h, up_h, down_h, m: int, k: int, h, gates, d_model: int
     if lib is None or not hasattr(lib, "qk_moe_ffn_batched"):
         return None
     P = m * k
+    if m <= 0 or k <= 0:
+        raise ValueError(f"batched MoE requires positive m and k, got m={m}, k={k}")
+    if len(gate_h) != P or len(up_h) != P or len(down_h) != P:
+        raise ValueError(f"batched MoE requires exactly m*k={P} handles for each projection")
     arr = lambda hs: (ctypes.c_int64 * P)(*[int(x) for x in hs])
     hh = np.ascontiguousarray(np.asarray(h, np.int64).reshape(-1))
     gg = np.ascontiguousarray(np.asarray(gates, np.int64).reshape(-1))
+    if hh.size != m * d_model or gg.size != P:
+        raise ValueError(f"batched MoE expected h.size={m * d_model} and gates.size={P}, got {hh.size} and {gg.size}")
     out = np.empty((m, d_model), dtype=np.int64)
-    rc = lib.qk_moe_ffn_batched(arr(gate_h), arr(up_h), arr(down_h), int(m), int(k), hh.ctypes.data,
-                                gg.ctypes.data, int(d_model), int(e_ffn), int(fa), int(fw), out.ctypes.data)
+    with _CUDA_LOCK:
+        rc = lib.qk_moe_ffn_batched(arr(gate_h), arr(up_h), arr(down_h), int(m), int(k), hh.ctypes.data,
+                                    gg.ctypes.data, int(d_model), int(e_ffn), int(fa), int(fw), out.ctypes.data)
     return None if rc != 0 else out
 
 
@@ -263,10 +383,15 @@ def moe_ffn(gate_h, up_h, down_h, h, gates, d_model: int, e_ffn: int, fa: int, f
     if fn is None:
         return None
     n_e = len(gate_h)
+    if n_e <= 0 or len(up_h) != n_e or len(down_h) != n_e:
+        raise ValueError("MoE requires the same positive number of gate, up, and down handles")
     arr = lambda hs: (ctypes.c_int64 * n_e)(*[int(x) for x in hs])
     hh = np.ascontiguousarray(np.asarray(h, np.int64).reshape(-1))
     gg = np.ascontiguousarray(np.asarray(gates, np.int64).reshape(-1))
+    if hh.size != d_model or gg.size != n_e:
+        raise ValueError(f"MoE expected h.size={d_model} and gates.size={n_e}, got {hh.size} and {gg.size}")
     out = np.empty(int(d_model), dtype=np.int64)
-    rc = fn(arr(gate_h), arr(up_h), arr(down_h), n_e, hh.ctypes.data, gg.ctypes.data,
-            int(d_model), int(e_ffn), int(fa), int(fw), out.ctypes.data)
+    with _CUDA_LOCK:
+        rc = fn(arr(gate_h), arr(up_h), arr(down_h), n_e, hh.ctypes.data, gg.ctypes.data,
+                int(d_model), int(e_ffn), int(fa), int(fw), out.ctypes.data)
     return None if rc != 0 else out

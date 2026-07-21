@@ -13,7 +13,7 @@ allocations; it is not just a spreadsheet estimate.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 import ctypes
 import hashlib
@@ -121,13 +121,19 @@ def _static_i64_tensors(artifact: dict):
             yield f"layers.{li}.{key}", value
 
 
-def qwen35_workspace_components(artifact: dict, *, kv_bits: int = 64) -> dict[str, int]:
+def qwen35_workspace_components(
+    artifact: dict,
+    *,
+    kv_bits: int = 64,
+    capture_trace: bool = False,
+) -> dict[str, int]:
     """Return exact allocation sizes for a one-sequence, 4K-capable graph.
 
     The arena aliases mutually exclusive recurrent/full-attention temporaries,
-    but does not alias persistent state, convolution history, or KV.  A 64 MiB
-    separately allocated graph/scheduler reserve keeps the proof conservative
-    until CUDA graph node storage is measured by the final executor.
+    but does not alias persistent state, convolution history, or KV.  The
+    diagnostic residual buffer is included only when ``capture_trace`` is
+    requested.  A separately allocated graph/scheduler reserve keeps the proof
+    conservative until driver graph storage is measured by the final executor.
     """
     if kv_bits not in (32, 64):
         raise ValueError("kv_bits must be 32 or 64")
@@ -175,7 +181,9 @@ def qwen35_workspace_components(artifact: dict, *, kv_bits: int = 64) -> dict[st
         "q1_bmma_activation_bitplanes": _checked_product(max_q1_input // 128, 4, 128),
         "output_logits": _checked_product(vocab, 8),
         "layer_descriptors": _checked_product(len(layers), 32, 8),
-        "debug_layer_trace": _checked_product(len(layers) + 1, d, 8),
+        "debug_layer_trace": (
+            _checked_product(len(layers) + 1, d, 8) if capture_trace else 0
+        ),
         # CUDA graph instantiation on the real 64-layer schedule consumes
         # substantially more driver memory than its tensor arenas.  Reserve
         # 576 MiB (measured graph overhead plus margin), not an optimistic
@@ -246,6 +254,7 @@ def prove_bonsai35_gpu_memory(
     kv_bits: int = 64,
     ceiling_bytes: int = DEFAULT_DEVICE_CEILING,
     retain: bool = False,
+    capture_trace: bool = False,
 ) -> "tuple[Bonsai35GpuFeasibility, dict | None]":
     """Upload the real model and prove a complete resident allocation.
 
@@ -253,6 +262,8 @@ def prove_bonsai35_gpu_memory(
     reservation is released before return.  With ``retain=True`` the caller
     receives opaque handles for immediate executor construction and assumes
     cleanup responsibility via :func:`release_bonsai35_gpu_residency`.
+    ``capture_trace`` includes the optional post-layer residual allocation in
+    that proof.
     """
     started = monotonic()
     if not gpu_available():
@@ -261,7 +272,11 @@ def prove_bonsai35_gpu_memory(
     if baseline is None:
         return _unavailable("CUDA memory-query ABI unavailable", kv_bits, ceiling_bytes), None
 
-    components = qwen35_workspace_components(artifact, kv_bits=kv_bits)
+    components = qwen35_workspace_components(
+        artifact,
+        kv_bits=kv_bits,
+        capture_trace=capture_trace,
+    )
     logical_weight_bytes = sum(
         int(np.asarray(bits).nbytes + np.asarray(scale).nbytes)
         for _, bits, scale in _q1_tensors(artifact)
@@ -362,7 +377,9 @@ def prove_bonsai35_gpu_memory(
                 handles["buffers"][name] = handle
                 buffer_count += 1
             else:
-                reserved = gpu_reservation_create(components.values())
+                reserved = gpu_reservation_create(
+                    value for value in components.values() if value > 0
+                )
                 if reserved is None:
                     reason = f"CUDA OOM reserving complete Qwen3.5 graph ({kv_bits}-bit KV)"
                 else:
@@ -677,11 +694,20 @@ class Bonsai35GpuExecutor:
     replay on the CPU oracle—no partially mutated GPU cache is reused.
     """
 
-    def __init__(self, artifact: dict, report: Bonsai35GpuFeasibility, handles: dict, ctx: int):
+    def __init__(
+        self,
+        artifact: dict,
+        report: Bonsai35GpuFeasibility,
+        handles: dict,
+        ctx: int,
+        *,
+        capture_trace: bool,
+    ):
         self.artifact = artifact
         self.report = report
         self.handles = handles
         self.ctx = int(ctx)
+        self.capture_trace = bool(capture_trace)
         self.position = 0
         self.closed = False
 
@@ -691,9 +717,20 @@ class Bonsai35GpuExecutor:
         artifact: dict,
         *,
         ceiling_bytes: int = DEFAULT_DEVICE_CEILING,
+        capture_trace: bool = False,
     ) -> "Bonsai35GpuExecutor | None":
-        """Return a ready executor or ``None`` after complete cleanup/fallback."""
-        executor, _ = cls.try_create_reported(artifact, ceiling_bytes=ceiling_bytes)
+        """Return a ready executor or ``None`` after complete cleanup/fallback.
+
+        ``capture_trace`` retains every post-layer residual for parity
+        diagnostics.  Normal inference leaves it disabled so the decode graph
+        does not schedule 65 otherwise-unused copies for the 64-layer release
+        model.
+        """
+        executor, _ = cls.try_create_reported(
+            artifact,
+            ceiling_bytes=ceiling_bytes,
+            capture_trace=capture_trace,
+        )
         return executor
 
     @classmethod
@@ -702,10 +739,27 @@ class Bonsai35GpuExecutor:
         artifact: dict,
         *,
         ceiling_bytes: int = DEFAULT_DEVICE_CEILING,
+        capture_trace: bool = False,
     ) -> "tuple[Bonsai35GpuExecutor | None, Bonsai35GpuFeasibility]":
         """Return both the optional executor and its auditable launch report."""
+        lib = _load_lib()
+        required_graph_abi = (
+            "bonsai35_ctx_create",
+            "bonsai35_ctx_set_trace",
+            "bonsai35_ctx_graph_stats",
+        )
+        if lib is None or any(not hasattr(lib, name) for name in required_graph_abi):
+            return None, _unavailable(
+                "CUDA Qwen3.5 graph ABI is unavailable or stale; rebuild libbonsai_q1_gpu.so",
+                32,
+                ceiling_bytes,
+            )
         report, handles = prove_bonsai35_gpu_memory(
-            artifact, kv_bits=32, ceiling_bytes=ceiling_bytes, retain=True
+            artifact,
+            kv_bits=32,
+            ceiling_bytes=ceiling_bytes,
+            retain=True,
+            capture_trace=capture_trace,
         )
         if not report.feasible or handles is None:
             return None, report
@@ -714,10 +768,6 @@ class Bonsai35GpuExecutor:
         reservation = handles.pop("reservation", None)
         if reservation is not None:
             gpu_reservation_free(int(reservation))
-        lib = _load_lib()
-        if lib is None or not hasattr(lib, "bonsai35_ctx_create"):
-            q1_free_weights()
-            return None, report
         w, b = handles["weights"], handles["buffers"]
         cfg = artifact["config"]
         descs = []
@@ -785,7 +835,27 @@ class Bonsai35GpuExecutor:
         if ctx < 0:
             q1_free_weights()
             return None, report
-        return cls(artifact, report, handles, ctx), report
+        set_trace = lib.bonsai35_ctx_set_trace
+        set_trace.argtypes = [ctypes.c_int64, ctypes.c_int]
+        set_trace.restype = ctypes.c_int
+        if set_trace(ctypes.c_int64(ctx), ctypes.c_int(bool(capture_trace))) != 0:
+            free_ctx = lib.bonsai35_ctx_free
+            free_ctx.argtypes = [ctypes.c_int64]
+            free_ctx.restype = None
+            free_ctx(ctypes.c_int64(ctx))
+            q1_free_weights()
+            return None, replace(
+                report,
+                feasible=False,
+                reason="CUDA Qwen3.5 context rejected its pre-capture trace mode",
+            )
+        return cls(
+            artifact,
+            report,
+            handles,
+            ctx,
+            capture_trace=capture_trace,
+        ), report
 
     def decode_embedded(self, x_fp: np.ndarray) -> "np.ndarray | None":
         if self.closed:
@@ -872,6 +942,19 @@ class Bonsai35GpuExecutor:
         """Export compact caches and every post-layer residual for parity tests."""
         if self.closed:
             return None
+        if not self.capture_trace:
+            raise RuntimeError(
+                "layer trace capture is disabled; create the executor with capture_trace=True"
+            )
+        return self._export_snapshot(include_trace=True)
+
+    def state_snapshot(self) -> "dict[str, np.ndarray] | None":
+        """Export recurrent/conv/KV state without requiring diagnostic layer traces."""
+        if self.closed:
+            return None
+        return self._export_snapshot(include_trace=False)
+
+    def _export_snapshot(self, *, include_trace: bool) -> "dict[str, np.ndarray] | None":
         cfg = self.artifact["config"]
         nrec = sum(layer["kind"] == "recurrent" for layer in self.artifact["layers"])
         natt = len(self.artifact["layers"]) - nrec
@@ -884,7 +967,10 @@ class Bonsai35GpuExecutor:
         conv = np.empty((nrec, ck - 1, conv_dim), dtype=np.int64)
         k = np.empty((natt, hkv, self.position, hd), dtype=np.int64)
         v = np.empty_like(k)
-        trace = np.empty((len(self.artifact["layers"]) + 1, int(cfg["dModel"])), dtype=np.int64)
+        trace = (
+            np.empty((len(self.artifact["layers"]) + 1, int(cfg["dModel"])), dtype=np.int64)
+            if include_trace else None
+        )
         lib = _load_lib()
         fn = lib.bonsai35_ctx_export
         fn.argtypes = [ctypes.c_int64] + [ctypes.c_void_p] * 5
@@ -892,11 +978,48 @@ class Bonsai35GpuExecutor:
         rc = fn(
             ctypes.c_int64(self.ctx), state.ctypes.data, conv.ctypes.data,
             k.ctypes.data if k.size else ctypes.c_void_p(),
-            v.ctypes.data if v.size else ctypes.c_void_p(), trace.ctypes.data,
+            v.ctypes.data if v.size else ctypes.c_void_p(),
+            trace.ctypes.data if trace is not None else ctypes.c_void_p(),
         )
         if rc != 0:
             return None
-        return {"state": state, "conv": conv, "k": k, "v": v, "trace": trace}
+        result = {"state": state, "conv": conv, "k": k, "v": v}
+        if trace is not None:
+            result["trace"] = trace
+        return result
+
+    def graph_metadata(self) -> dict[str, int | bool]:
+        """Return the exact captured CUDA graph shape and trace overhead."""
+        if self.closed:
+            raise RuntimeError("Bonsai35GpuExecutor is closed")
+        if not self.stats()["graph_ready"]:
+            raise RuntimeError("CUDA graph is not captured; decode at least one token first")
+        lib = _load_lib()
+        fn = lib.bonsai35_ctx_graph_stats
+        fn.argtypes = [ctypes.c_int64] + [ctypes.c_void_p] * 6
+        fn.restype = ctypes.c_int
+        values = [ctypes.c_int64() for _ in range(5)]
+        trace_enabled = ctypes.c_int()
+        rc = fn(
+            ctypes.c_int64(self.ctx),
+            *(ctypes.byref(value) for value in values),
+            ctypes.byref(trace_enabled),
+        )
+        if rc != 0:
+            raise RuntimeError("cannot query Bonsai35 CUDA graph metadata")
+        layers = len(self.artifact["layers"])
+        d_model = int(self.artifact["config"]["dModel"])
+        trace_copy_nodes = layers + 1 if trace_enabled.value else 0
+        return {
+            "graph_nodes": int(values[0].value),
+            "kernel_nodes": int(values[1].value),
+            "memcpy_nodes": int(values[2].value),
+            "memset_nodes": int(values[3].value),
+            "other_nodes": int(values[4].value),
+            "trace_enabled": bool(trace_enabled.value),
+            "trace_copy_nodes_per_launch": trace_copy_nodes,
+            "trace_copy_bytes_per_launch": trace_copy_nodes * d_model * 8,
+        }
 
     def stats(self) -> dict[str, int | bool | str]:
         lib = _load_lib()

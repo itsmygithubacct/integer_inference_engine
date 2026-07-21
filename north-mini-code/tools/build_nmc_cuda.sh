@@ -23,4 +23,30 @@ arch="${arch:-sm_86}"     # RTX 3070/3090 default
 echo "build_nmc_cuda.sh: nvcc $($nvcc --version | grep -oE 'release [0-9.]+' | head -1)  arch=$arch -> $out"
 # --cudart static: self-contained .so (no runtime libcudart.so dependency) so ctypes loads it even when CUDA
 # isn't on the default loader path (e.g. vast.ai -devel containers without ldconfig'd /usr/local/cuda/lib64).
-exec "$nvcc" -O3 -arch="$arch" --cudart static -Xcompiler -fPIC -shared "$src" -o "$out"
+if ! command -v nm >/dev/null 2>&1; then
+  echo "build_nmc_cuda.sh: nm not found; cannot verify the CUDA ctypes ABI" >&2
+  exit 1
+fi
+tmp="${out}.tmp.$$"
+cleanup() { rm -f "$tmp"; }
+trap cleanup EXIT HUP INT TERM
+"$nvcc" -O3 -arch="$arch" --cudart static -Xcompiler -fPIC -shared "$src" -o "$tmp"
+for symbol in \
+  qk_cuda_abi_version \
+  qk_cuda_available \
+  qk_register_weight \
+  qk_resident_reserve \
+  qk_resident_capacity \
+  qk_moe_ffn \
+  qk_moe_ffn_batched \
+  qk_moe_workspace_allocations \
+  qk_moe_workspace_bytes \
+  qk_moe_workspace_release
+do
+  if ! nm -D --defined-only "$tmp" | awk -v wanted="$symbol" '$3 == wanted { found=1 } END { exit !found }'; then
+    echo "build_nmc_cuda.sh: required dynamic symbol is missing: $symbol" >&2
+    exit 1
+  fi
+done
+mv -f "$tmp" "$out"
+trap - EXIT HUP INT TERM

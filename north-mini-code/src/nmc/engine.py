@@ -73,12 +73,21 @@ class Engine:
             self._h.clear()          # registry is cleared -> drop the stale handle cache so the next call
             self._rchecked = False   # re-registers (else reuse after free() hits freed handles -> None)
 
+    @staticmethod
+    def _cuda_result(result, operation):
+        if result is None:
+            raise RuntimeError(f"CUDA resident {operation} failed")
+        return result
+
     # --- kernel linears (resident-aware) ---
     def _klin(self, name, x):
         t = self.g.tensors[name]; ne0, ne1, qt = t["shape"][0], t["shape"][1], self._QT[t["type"]]
         if self.resident:
             if name not in self._h:
-                self._h[name] = (qk_cuda.register_weight(self.g.read_raw(name), ne1, ne0 // 256, qt), ne1)
+                handle = qk_cuda.register_weight(self.g.read_raw(name), ne1, ne0 // 256, qt)
+                if handle is None:
+                    raise RuntimeError("CUDA resident registration API became unavailable")
+                self._h[name] = (handle, ne1)
             hh, of = self._h[name]
             # DP4A only when the matmul is large enough to be compute-bound (the tied head, large-m prefill);
             # for small per-token decode matmuls it's overhead-bound and regresses, so use the int128 kernel.
@@ -87,7 +96,7 @@ class Engine:
                 r = qk_cuda.apply_resident_dp4a(hh, x, of, FW, qt)
                 if r is not None:
                     return r
-            return qk_cuda.apply_resident(hh, x, of, FW)
+            return self._cuda_result(qk_cuda.apply_resident(hh, x, of, FW), f"apply for {name}")
         return self.kn.qk_linear(self.g.read_raw(name), x, ne1, ne0 // 256, FW, qt)
 
     def _klin_expert(self, name, e, x):
@@ -95,15 +104,22 @@ class Engine:
         if self.resident:
             key = (name, e)
             if key not in self._h:
-                self._h[key] = (qk_cuda.register_weight(raw, ne1, ne0 // 256, qt), ne1)
-            hh, of = self._h[key]; return qk_cuda.apply_resident(hh, x, of, FW)
+                handle = qk_cuda.register_weight(raw, ne1, ne0 // 256, qt)
+                if handle is None:
+                    raise RuntimeError("CUDA resident registration API became unavailable")
+                self._h[key] = (handle, ne1)
+            hh, of = self._h[key]
+            return self._cuda_result(qk_cuda.apply_resident(hh, x, of, FW), f"expert apply for {name}[{e}]")
         return self.kn.qk_linear(raw, x, ne1, ne0 // 256, FW, qt)
 
     def _ehandle(self, name, e):
         key = (name, e)
         if key not in self._h:
             raw, ne0, ne1, tt = self.g.expert_raw(name, e)
-            self._h[key] = (qk_cuda.register_weight(raw, ne1, ne0 // 256, self._QT[tt]), ne1)
+            handle = qk_cuda.register_weight(raw, ne1, ne0 // 256, self._QT[tt])
+            if handle is None:
+                raise RuntimeError("CUDA resident registration API became unavailable")
+            self._h[key] = (handle, ne1)
         return self._h[key][0]
 
     def _norm(self, x, gname):
@@ -152,6 +168,7 @@ class Engine:
                     uh += [self._ehandle(p + "ffn_up_exps.weight", e) for e in sel]
                     dh += [self._ehandle(p + "ffn_down_exps.weight", e) for e in sel]
                 ffn = qk_cuda.moe_ffn_batched(gh, uh, dh, m, cfg.n_used, h, gflat, cfg.d_model, cfg.expert_ffn, FA, FW)
+                ffn = self._cuda_result(ffn, f"batched MoE for layer {li}")
             elif self.fused:
                 ffn = np.empty((m, cfg.d_model), dtype=np.int64)
                 for t in range(m):
@@ -160,7 +177,8 @@ class Engine:
                     gh = [self._ehandle(p + "ffn_gate_exps.weight", e) for e in sel]
                     uh = [self._ehandle(p + "ffn_up_exps.weight", e) for e in sel]
                     dh = [self._ehandle(p + "ffn_down_exps.weight", e) for e in sel]
-                    ffn[t] = qk_cuda.moe_ffn(gh, uh, dh, h[t], gates, cfg.d_model, cfg.expert_ffn, FA, FW)
+                    result = qk_cuda.moe_ffn(gh, uh, dh, h[t], gates, cfg.d_model, cfg.expert_ffn, FA, FW)
+                    ffn[t] = self._cuda_result(result, f"MoE for layer {li}, token {t}")
             else:
                 ffn = np.zeros((m, cfg.d_model), dtype=object)
                 for t in range(m):
@@ -193,9 +211,16 @@ class Engine:
     def logits_prefill(self, ids):
         """Prefill `ids`; return logits at every position [len(ids), vocab] (teacher-forced predictions)."""
         cos, sin = self._rope(self._require_context(len(ids)))
-        cache = c2.KVCache(self.NL); x = self._embed(ids)
-        for li in range(self.NL):
-            x = self._block(x, li, cache, cos, sin)
+        cache = c2.KVCache(self.NL, max_length=len(ids)); x = self._embed(ids)
+        try:
+            for li in range(self.NL):
+                x = self._block(x, li, cache, cos, sin)
+        finally:
+            # Batched prefill scratch scales with prompt_tokens * selected_experts
+            # (about 2 GiB at the supported 8K shape).  Keep resident weights but
+            # return that transient arena before the output head or another run.
+            if self.resident:
+                qk_cuda.release_moe_workspace()
         return self._klin("token_embd.weight", self._norm(x, "output_norm.weight"))
 
     def next_token(self, ids):
@@ -212,10 +237,17 @@ class Engine:
         # sampled token is not fed back through a block. Build exactly the rows that can affect this run.
         rope_rows = self._require_context(len(ids) + max(n_new - 1, 0))
         cos, sin = self._rope(rope_rows)
-        cache = c2.KVCache(self.NL)
+        # Clamp geometric growth to this request's already-validated RoPE span.
+        # Near an 8K boundary an unconstrained 1.5x growth step could otherwise
+        # reserve 12,138 rows for 8,192 logical positions in every layer.
+        cache = c2.KVCache(self.NL, max_length=rope_rows)
         x = self._embed(ids)
-        for li in range(self.NL):
-            x = self._block(x, li, cache, cos, sin)
+        try:
+            for li in range(self.NL):
+                x = self._block(x, li, cache, cos, sin)
+        finally:
+            if self.resident:
+                qk_cuda.release_moe_workspace()
         last = x[-1:]
         eos = self.tok.eos_id if stop_eos else None
         out, seq = [], list(ids)

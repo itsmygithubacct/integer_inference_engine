@@ -40,7 +40,12 @@ tmp="${out}.tmp.$$"
 cleanup() { rm -f "$tmp"; }
 trap cleanup EXIT HUP INT TERM
 "$nvcc" -O3 -arch="$arch" -Xcompiler -fPIC -shared "$src" -o "$tmp"
-for symbol in bonsai_q1_linear_gpu bonsai35_ctx_create; do
+for symbol in \
+  bonsai_q1_linear_gpu \
+  bonsai35_ctx_create \
+  bonsai35_ctx_set_trace \
+  bonsai35_ctx_graph_stats
+do
   if ! nm -D --defined-only "$tmp" | awk -v wanted="$symbol" '$3 == wanted { found=1 } END { exit !found }'; then
     echo "build_bonsai_q1_gpu.sh: required dynamic symbol is missing: $symbol" >&2
     exit 1
