@@ -31,6 +31,43 @@ SCHEME_EC = "secp256k1-ecdsa@v1"
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
+def _fsync_directory(path: Path) -> None:
+    """Durably persist a directory-entry change on supported Unix hosts."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    dir_fd = os.open(path, flags)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_private_temp(path: Path, payload: str) -> str:
+    """Write and sync *payload* to a private temporary sibling of *path*."""
+    fd = -1
+    tmp = ""
+    try:
+        # mkstemp creates the file as 0600 before a single secret byte is
+        # written. Writing the destination first and chmod'ing afterwards
+        # leaves a local disclosure window under a permissive process umask.
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1  # owned by fh from here on
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return tmp
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+        raise
+
+
 def _verifying_key(pub_hex: str) -> VerifyingKey:
     """Decode a compressed (or uncompressed) secp256k1 public key from hex."""
     return VerifyingKey.from_string(bytes.fromhex(pub_hex), curve=SECP256k1, hashfunc=hashlib.sha256)
@@ -136,32 +173,39 @@ class ECKey:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.to_json(), indent=2, sort_keys=True) + "\n"
-        fd = -1
-        tmp = ""
+        tmp = _write_private_temp(p, payload)
         try:
-            # mkstemp creates the file as 0600 before a single secret byte is
-            # written.  Writing the destination first and chmod'ing afterwards
-            # leaves a local disclosure window under a permissive process umask.
-            fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fd = -1  # owned by fh from here on
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
             os.replace(tmp, p)
             tmp = ""
             # Persist the rename as well as the file contents. Directory fsync
             # is supported on the Linux hosts on which the notary runs.
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            dir_fd = os.open(p.parent, flags)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            _fsync_directory(p.parent)
         finally:
-            if fd >= 0:
-                os.close(fd)
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+
+    def _install_if_absent(self, path: Path) -> bool:
+        """Atomically install this key without replacing a concurrent winner."""
+        import json
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self.to_json(), indent=2, sort_keys=True) + "\n"
+        tmp = _write_private_temp(path, payload)
+        try:
+            try:
+                # A hard link within one directory is an atomic no-replace
+                # publication primitive. Unlike exists()+replace(), it cannot
+                # let two first-use callers return different private keys.
+                os.link(tmp, path)
+            except FileExistsError:
+                return False
+            os.unlink(tmp)
+            tmp = ""
+            _fsync_directory(path.parent)
+            return True
+        finally:
             if tmp:
                 try:
                     os.unlink(tmp)
@@ -176,8 +220,11 @@ class ECKey:
         if p.exists():
             return cls.from_json(json.loads(p.read_text()))
         key = cls.generate(label=label)
-        key.save(p)
-        return key
+        if key._install_if_absent(p):
+            return key
+        # Another process won the atomic install. Its fully written, fsynced
+        # key is the canonical identity and every contender must return it.
+        return cls.from_json(json.loads(p.read_text()))
 
 
 def ec_keygen(*, label: str = "", secret_hex: str | None = None) -> ECKey:

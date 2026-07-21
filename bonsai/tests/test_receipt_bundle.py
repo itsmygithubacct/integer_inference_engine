@@ -730,6 +730,31 @@ def test_signing_key_is_created_private_without_postwrite_chmod(tmp_path, monkey
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_concurrent_first_use_returns_one_persisted_identity(tmp_path, monkeypatch):
+    """Concurrent installers must all return the one key that wins the atomic publication."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from trinote.receipts.signing_ec import ECKey
+
+    original_generate = ECKey.generate.__func__
+    both_generated = Barrier(2)
+
+    def synchronized_generate(cls, *, label="", secret_hex=None):
+        key = original_generate(cls, label=label, secret_hex=secret_hex)
+        both_generated.wait(timeout=5)
+        return key
+
+    monkeypatch.setattr(ECKey, "generate", classmethod(synchronized_generate))
+    path = tmp_path / "shared.key.json"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        keys = list(pool.map(lambda _: ECKey.load_or_generate(path, label="shared"), range(2)))
+
+    persisted = ECKey.from_json(json.loads(path.read_text()))
+    assert keys[0].secret_hex == keys[1].secret_hex == persisted.secret_hex
+    assert not list(tmp_path.glob(".shared.key.json.*.tmp"))
+
+
 def test_receipt_ec_signature_third_party_verifiable():
     """A receipt signed with real EC keys is verifiable from the committed PUBLIC key alone (no shared secret)
     — the authenticity property the demo HMAC keys lacked. (Keys passed explicitly to bypass the pytest demo path.)"""
