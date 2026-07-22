@@ -702,12 +702,14 @@ class Bonsai35GpuExecutor:
         ctx: int,
         *,
         capture_trace: bool,
+        group_projections: bool,
     ):
         self.artifact = artifact
         self.report = report
         self.handles = handles
         self.ctx = int(ctx)
         self.capture_trace = bool(capture_trace)
+        self.group_projections = bool(group_projections)
         self.position = 0
         self.closed = False
 
@@ -718,18 +720,22 @@ class Bonsai35GpuExecutor:
         *,
         ceiling_bytes: int = DEFAULT_DEVICE_CEILING,
         capture_trace: bool = False,
+        group_projections: bool = True,
     ) -> "Bonsai35GpuExecutor | None":
         """Return a ready executor or ``None`` after complete cleanup/fallback.
 
         ``capture_trace`` retains every post-layer residual for parity
         diagnostics.  Normal inference leaves it disabled so the decode graph
         does not schedule 65 otherwise-unused copies for the 64-layer release
-        model.
+        model.  ``group_projections`` combines independent BMMA output grids
+        which consume the same prepared activation; disabling it retains the
+        legacy schedule as an exact benchmark/parity control.
         """
         executor, _ = cls.try_create_reported(
             artifact,
             ceiling_bytes=ceiling_bytes,
             capture_trace=capture_trace,
+            group_projections=group_projections,
         )
         return executor
 
@@ -740,13 +746,16 @@ class Bonsai35GpuExecutor:
         *,
         ceiling_bytes: int = DEFAULT_DEVICE_CEILING,
         capture_trace: bool = False,
+        group_projections: bool = True,
     ) -> "tuple[Bonsai35GpuExecutor | None, Bonsai35GpuFeasibility]":
         """Return both the optional executor and its auditable launch report."""
         lib = _load_lib()
         required_graph_abi = (
             "bonsai35_ctx_create",
             "bonsai35_ctx_set_trace",
+            "bonsai35_ctx_set_projection_grouping",
             "bonsai35_ctx_graph_stats",
+            "bonsai35_ctx_projection_stats",
         )
         if lib is None or any(not hasattr(lib, name) for name in required_graph_abi):
             return None, _unavailable(
@@ -838,7 +847,14 @@ class Bonsai35GpuExecutor:
         set_trace = lib.bonsai35_ctx_set_trace
         set_trace.argtypes = [ctypes.c_int64, ctypes.c_int]
         set_trace.restype = ctypes.c_int
-        if set_trace(ctypes.c_int64(ctx), ctypes.c_int(bool(capture_trace))) != 0:
+        set_grouping = lib.bonsai35_ctx_set_projection_grouping
+        set_grouping.argtypes = [ctypes.c_int64, ctypes.c_int]
+        set_grouping.restype = ctypes.c_int
+        schedule_ok = (
+            set_grouping(ctypes.c_int64(ctx), ctypes.c_int(bool(group_projections))) == 0
+            and set_trace(ctypes.c_int64(ctx), ctypes.c_int(bool(capture_trace))) == 0
+        )
+        if not schedule_ok:
             free_ctx = lib.bonsai35_ctx_free
             free_ctx.argtypes = [ctypes.c_int64]
             free_ctx.restype = None
@@ -847,7 +863,7 @@ class Bonsai35GpuExecutor:
             return None, replace(
                 report,
                 feasible=False,
-                reason="CUDA Qwen3.5 context rejected its pre-capture trace mode",
+                reason="CUDA Qwen3.5 context rejected its pre-capture schedule",
             )
         return cls(
             artifact,
@@ -855,6 +871,7 @@ class Bonsai35GpuExecutor:
             handles,
             ctx,
             capture_trace=capture_trace,
+            group_projections=group_projections,
         ), report
 
     def decode_embedded(self, x_fp: np.ndarray) -> "np.ndarray | None":
@@ -1007,6 +1024,18 @@ class Bonsai35GpuExecutor:
         )
         if rc != 0:
             raise RuntimeError("cannot query Bonsai35 CUDA graph metadata")
+        projection_fn = lib.bonsai35_ctx_projection_stats
+        projection_fn.argtypes = [ctypes.c_int64] + [ctypes.c_void_p] * 3
+        projection_fn.restype = ctypes.c_int
+        grouping_enabled = ctypes.c_int()
+        logical_applies = ctypes.c_int64()
+        projection_nodes = ctypes.c_int64()
+        rc = projection_fn(
+            ctypes.c_int64(self.ctx), ctypes.byref(grouping_enabled),
+            ctypes.byref(logical_applies), ctypes.byref(projection_nodes),
+        )
+        if rc != 0:
+            raise RuntimeError("cannot query Bonsai35 CUDA projection metadata")
         layers = len(self.artifact["layers"])
         d_model = int(self.artifact["config"]["dModel"])
         trace_copy_nodes = layers + 1 if trace_enabled.value else 0
@@ -1019,6 +1048,12 @@ class Bonsai35GpuExecutor:
             "trace_enabled": bool(trace_enabled.value),
             "trace_copy_nodes_per_launch": trace_copy_nodes,
             "trace_copy_bytes_per_launch": trace_copy_nodes * d_model * 8,
+            "projection_grouping_enabled": bool(grouping_enabled.value),
+            "logical_projection_applies_per_launch": int(logical_applies.value),
+            "projection_kernel_nodes_per_launch": int(projection_nodes.value),
+            "projection_kernel_nodes_saved_per_launch": (
+                int(logical_applies.value) - int(projection_nodes.value)
+            ),
         }
 
     def stats(self) -> dict[str, int | bool | str]:

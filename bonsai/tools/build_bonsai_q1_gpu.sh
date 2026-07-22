@@ -44,6 +44,8 @@ for symbol in \
   bonsai_q1_linear_gpu \
   bonsai35_ctx_create \
   bonsai35_ctx_set_trace \
+  bonsai35_ctx_set_projection_grouping \
+  bonsai35_ctx_projection_stats \
   bonsai35_ctx_graph_stats
 do
   if ! nm -D --defined-only "$tmp" | awk -v wanted="$symbol" '$3 == wanted { found=1 } END { exit !found }'; then

@@ -249,6 +249,8 @@ def test_qwen35_resident_graph_full_trace_and_poison_reset():
         graph = executor.graph_metadata()
         assert graph["trace_enabled"] is True
         assert graph["trace_copy_nodes_per_launch"] == len(art["layers"]) + 1
+        assert graph["projection_grouping_enabled"] is True
+        assert graph["projection_kernel_nodes_saved_per_launch"] > 0
         assert graph["graph_nodes"] == sum(
             graph[key] for key in (
                 "kernel_nodes", "memcpy_nodes", "memset_nodes", "other_nodes"
@@ -291,6 +293,55 @@ def test_qwen35_resident_graph_full_trace_and_poison_reset():
         assert dstats["model_input_host_bytes"] == 2 * int(art["config"]["dModel"]) * 8
     finally:
         diagnostic.close()
+
+
+def test_qwen35_grouped_projection_graph_matches_ungrouped_exactly():
+    _need_gpu()
+    art = _artifact(57)
+    ids = (2, 3, 4)
+
+    def run(group_projections):
+        executor = Bonsai35GpuExecutor.try_create(
+            art,
+            capture_trace=True,
+            group_projections=group_projections,
+        )
+        assert executor is not None
+        try:
+            logits = []
+            for token in ids:
+                row = executor.decode_token(token)
+                assert row is not None
+                logits.append(row.copy())
+            snapshot = executor.debug_snapshot()
+            assert snapshot is not None
+            return np.stack(logits), snapshot, executor.graph_metadata()
+        finally:
+            executor.close()
+
+    baseline_logits, baseline_state, baseline = run(False)
+    grouped_logits, grouped_state, grouped = run(True)
+    assert np.array_equal(grouped_logits, baseline_logits)
+    for key in ("trace", "state", "conv", "k", "v"):
+        assert np.array_equal(grouped_state[key], baseline_state[key]), key
+
+    recurrent = sum(layer["kind"] == "recurrent" for layer in art["layers"])
+    attention = len(art["layers"]) - recurrent
+    logical_applies = 8 * recurrent + 7 * attention + 1
+    grouped_nodes = 4 * len(art["layers"]) + 1
+    saved_nodes = logical_applies - grouped_nodes
+    assert baseline["projection_grouping_enabled"] is False
+    assert grouped["projection_grouping_enabled"] is True
+    assert baseline["logical_projection_applies_per_launch"] == logical_applies
+    assert grouped["logical_projection_applies_per_launch"] == logical_applies
+    assert baseline["projection_kernel_nodes_per_launch"] == logical_applies
+    assert grouped["projection_kernel_nodes_per_launch"] == grouped_nodes
+    assert baseline["projection_kernel_nodes_saved_per_launch"] == 0
+    assert grouped["projection_kernel_nodes_saved_per_launch"] == saved_nodes
+    assert baseline["graph_nodes"] - grouped["graph_nodes"] == saved_nodes
+    assert baseline["kernel_nodes"] - grouped["kernel_nodes"] == saved_nodes
+    for key in ("memcpy_nodes", "memset_nodes", "other_nodes"):
+        assert grouped[key] == baseline[key], key
 
 
 def test_qwen35_production_graph_omits_debug_trace_copies():
