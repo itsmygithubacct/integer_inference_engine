@@ -283,15 +283,16 @@ __global__ void q1_bmma_activation_kernel(const long long* x,long long n_blocks,
     planes[((b*4+group)*8+col)*4+word]=packed;
 }
 
-__global__ void q1_bmma_apply_scale32_kernel(
+// Arithmetic for one eight-row BMMA output tile.  Both the single-projection
+// and grouped-projection launchers call this exact routine, so grouping changes
+// only CUDA scheduling: weight bytes, bitplane reads, block order, scale
+// multiply, per-block floor, and modulo-2^64 accumulation remain identical.
+__device__ __forceinline__ void q1_bmma_apply_scale32_tile(
         const unsigned int* planes,const unsigned char* bits,const int* scale,
-        long long out_f,long long n_blocks,long long frac,long long* out){
+        long long out_f,long long n_blocks,long long frac,long long* out,
+        long long out_base,int lane,int* tile){
 #if __CUDA_ARCH__ >= 750
     using namespace nvcuda;
-    const int lane=threadIdx.x&31,warp_in_block=threadIdx.x>>5;
-    const long long warp=(long long)blockIdx.x*(blockDim.x/32)+warp_in_block;
-    const long long out_base=warp*8;if(out_base>=out_f)return;
-    __shared__ int smem[4][64];int* tile=smem[warp_in_block];
     unsigned long long total=0;
     for(long long b=0;b<n_blocks;++b){
         wmma::fragment<wmma::matrix_a,8,8,128,wmma::experimental::precision::b1,wmma::row_major> af;
@@ -318,6 +319,53 @@ __global__ void q1_bmma_apply_scale32_kernel(
             total+=(unsigned long long)arshift_i64_floor((long long)prod,frac);}
     }
     if(lane<8)out[out_base+lane]=(long long)total;
+#endif
+}
+
+__global__ void q1_bmma_apply_scale32_kernel(
+        const unsigned int* planes,const unsigned char* bits,const int* scale,
+        long long out_f,long long n_blocks,long long frac,long long* out){
+#if __CUDA_ARCH__ >= 750
+    const int lane=threadIdx.x&31,warp_in_block=threadIdx.x>>5;
+    const long long warp=(long long)blockIdx.x*(blockDim.x/32)+warp_in_block;
+    const long long out_base=warp*8;if(out_base>=out_f)return;
+    __shared__ int smem[4][64];
+    q1_bmma_apply_scale32_tile(
+        planes,bits,scale,out_f,n_blocks,frac,out,out_base,lane,smem[warp_in_block]);
+#endif
+}
+
+// Same prepared activation, up to four independent resident weights.  A warp
+// is assigned one ordinary eight-row output tile and then executes the same
+// tile routine as the legacy one-projection kernel above.  Combining grids
+// removes launch/graph nodes without concatenating weights or outputs and
+// without changing any reduction order.
+__global__ void q1_bmma_apply_scale32_group4_kernel(
+        const unsigned int* planes,
+        const unsigned char* bits0,const int* scale0,long long out_f0,long long* out0,
+        const unsigned char* bits1,const int* scale1,long long out_f1,long long* out1,
+        const unsigned char* bits2,const int* scale2,long long out_f2,long long* out2,
+        const unsigned char* bits3,const int* scale3,long long out_f3,long long* out3,
+        long long n_blocks,long long frac){
+#if __CUDA_ARCH__ >= 750
+    const int lane=threadIdx.x&31,warp_in_block=threadIdx.x>>5;
+    long long tile_index=(long long)blockIdx.x*(blockDim.x/32)+warp_in_block;
+    const long long tiles0=out_f0/8,tiles1=out_f1/8,tiles2=out_f2/8,tiles3=out_f3/8;
+    if(tile_index>=tiles0+tiles1+tiles2+tiles3)return;
+    const unsigned char* bits=bits0;const int* scale=scale0;
+    long long out_f=out_f0;long long* out=out0;
+    if(tile_index>=tiles0){
+        tile_index-=tiles0;bits=bits1;scale=scale1;out_f=out_f1;out=out1;
+        if(tile_index>=tiles1){
+            tile_index-=tiles1;bits=bits2;scale=scale2;out_f=out_f2;out=out2;
+            if(tile_index>=tiles2){
+                tile_index-=tiles2;bits=bits3;scale=scale3;out_f=out_f3;out=out3;
+            }
+        }
+    }
+    __shared__ int smem[4][64];
+    q1_bmma_apply_scale32_tile(
+        planes,bits,scale,out_f,n_blocks,frac,out,tile_index*8,lane,smem[warp_in_block]);
 #endif
 }
 
@@ -1646,7 +1694,7 @@ struct Bonsai35Ctx {
     // Post-layer residual snapshots are a parity/debug facility, not part of
     // production inference.  Keeping this off removes one D2D memcpy graph
     // node for the embedding plus one after every transformer layer.
-    bool capture_trace;
+    bool capture_trace,group_projections;
     long long graph_nodes,graph_kernel_nodes,graph_memcpy_nodes;
     long long graph_memset_nodes,graph_other_nodes;
     long long *state,*conv_hist;
@@ -2419,6 +2467,26 @@ static void q35_apply_prepared(Bonsai35Ctx& c, long long wh, long long* out) {
             c.digits,w.dbits,w.dscale,w.out_f,w.n_blocks,c.c.frac,out);
 }
 
+static void q35_apply_prepared_group4(
+        Bonsai35Ctx& c,
+        long long wh0,long long* out0,long long wh1,long long* out1,
+        long long wh2,long long* out2,long long wh3,long long* out3) {
+    const ResidentWeight& w0=g_weights[(size_t)wh0];
+    const ResidentWeight& w1=wh1>=0?g_weights[(size_t)wh1]:w0;
+    const ResidentWeight& w2=wh2>=0?g_weights[(size_t)wh2]:w0;
+    const ResidentWeight& w3=wh3>=0?g_weights[(size_t)wh3]:w0;
+    const long long f1=wh1>=0?w1.out_f:0,f2=wh2>=0?w2.out_f:0,f3=wh3>=0?w3.out_f:0;
+    const long long tiles=(w0.out_f+f1+f2+f3)/8;
+    const unsigned blocks=(unsigned)((tiles+3)/4); // four warps/block
+    q1_bmma_apply_scale32_group4_kernel<<<blocks,128,0,c.stream>>>(
+        reinterpret_cast<unsigned int*>(c.digits),
+        w0.dbits,w0.dscale32,w0.out_f,out0,
+        w1.dbits,w1.dscale32,f1,out1?out1:out0,
+        w2.dbits,w2.dscale32,f2,out2?out2:out0,
+        w3.dbits,w3.dscale32,f3,out3?out3:out0,
+        w0.n_blocks,c.c.frac);
+}
+
 static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
     const Bonsai35Config& g=c.c; const long long T=MONO_TPB;
     const long long LOG2E_Q16=94548,sh=16-g.frac;
@@ -2445,8 +2513,12 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
         rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(l.n1),c.norm,c.overflow);
         if(l.kind==0){ // recurrent
             q35_prepare_digits(c,c.norm,g.d);
-            q35_apply_prepared(c,l.wqkv,c.qkv);q35_apply_prepared(c,l.wz,c.z);
-            q35_apply_prepared(c,l.walpha,c.alpha);q35_apply_prepared(c,l.wbeta,c.beta);
+            if(c.group_projections)
+                q35_apply_prepared_group4(c,l.wqkv,c.qkv,l.wz,c.z,l.walpha,c.alpha,l.wbeta,c.beta);
+            else{
+                q35_apply_prepared(c,l.wqkv,c.qkv);q35_apply_prepared(c,l.wz,c.z);
+                q35_apply_prepared(c,l.walpha,c.alpha);q35_apply_prepared(c,l.wbeta,c.beta);
+            }
             bonsai35_conv_decode_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
                 c.qkv,c.conv_hist,q35_buf(l.conv),l.slot,c.conv_dim,g.conv_k,g.frac,c.conv);
             silu_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
@@ -2474,7 +2546,11 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
             q35_prepare_digits(c,c.rgated,g.inner);q35_apply_prepared(c,l.wout,c.tmp);
         }else{ // full attention
             q35_prepare_digits(c,c.norm,g.d);
-            q35_apply_prepared(c,l.wqg,c.qg);q35_apply_prepared(c,l.wk,c.ak);q35_apply_prepared(c,l.wv,c.av);
+            if(c.group_projections)
+                q35_apply_prepared_group4(c,l.wqg,c.qg,l.wk,c.ak,l.wv,c.av,-1,nullptr);
+            else{
+                q35_apply_prepared(c,l.wqg,c.qg);q35_apply_prepared(c,l.wk,c.ak);q35_apply_prepared(c,l.wv,c.av);
+            }
             bonsai35_split_qgate_kernel<<<mono_blocks(g.H*g.hd),T,0,c.stream>>>(c.qg,c.aq,c.agate,g.H,g.hd);
             rmsnorm_fast_i32_kernel<<<(unsigned)g.H,256,0,c.stream>>>(
                 c.aq,g.H,g.hd,g.frac,g.eps,q35_buf(l.q_norm),c.aq,c.overflow);
@@ -2505,7 +2581,10 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
         }
         add_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(c.x,c.tmp,c.x,g.d);
         rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(l.n2),c.norm,c.overflow);
-        q35_prepare_digits(c,c.norm,g.d);q35_apply_prepared(c,l.w1,c.ffg);q35_apply_prepared(c,l.wu,c.ffu);
+        q35_prepare_digits(c,c.norm,g.d);
+        if(c.group_projections)
+            q35_apply_prepared_group4(c,l.w1,c.ffg,l.wu,c.ffu,-1,nullptr,-1,nullptr);
+        else{q35_apply_prepared(c,l.w1,c.ffg);q35_apply_prepared(c,l.wu,c.ffu);}
         silu_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffg,g.dff,g.frac,log2e,dclip);
         mulshift_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffu,c.ffh,g.dff,g.frac);
         q35_prepare_digits(c,c.ffh,g.dff);q35_apply_prepared(c,l.w2,c.tmp);
@@ -2584,7 +2663,8 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
        cfg->H%cfg->Hkv||cfg->hd<=0||cfg->cap<=0||cfg->state_size<=0||cfg->state_size>128||
        cfg->conv_k<2||cfg->inner!=cfg->value_heads*cfg->state_size)return -1;
     Bonsai35Ctx c{};c.c=*cfg;c.alive=false;c.poisoned=false;c.t=0;c.graph_launches=0;c.graph_ready=false;
-    c.capture_trace=false;c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=0;
+    c.capture_trace=false;c.group_projections=true;
+    c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=0;
     c.graph_memset_nodes=c.graph_other_nodes=0;
     c.input_mode=0;c.token_submissions=0;c.embedded_submissions=0;c.model_input_host_bytes=0;
     c.layers.assign(layers,layers+cfg->n_layers);c.nrec=0;c.natt=0;
@@ -2592,16 +2672,23 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
     c.conv_dim=2*cfg->key_heads*cfg->state_size+cfg->inner;c.max_k=cfg->d;
     if(cfg->dff>c.max_k)c.max_k=cfg->dff;if(cfg->inner>c.max_k)c.max_k=cfg->inner;
     auto vw=[](long long h){return q35_weight_ok(h)&&g_weights[(size_t)h].scale_bits==32&&g_weights[(size_t)h].layout==2;};
+    auto ww=[&](long long h,long long out_f,long long in_f){
+        return vw(h)&&g_weights[(size_t)h].out_f==out_f&&g_weights[(size_t)h].n_blocks*128==in_f;
+    };
     auto vb=[](long long h){return q35_buf_ok(h);};
-    if(!vw(cfg->embed)||!vw(cfg->out_head)||!vb(cfg->final_gain)||!vb(cfg->cos_buf)||!vb(cfg->sin_buf)||
+    if(!ww(cfg->embed,cfg->vocab,cfg->d)||!ww(cfg->out_head,cfg->vocab,cfg->d)||
+       !vb(cfg->final_gain)||!vb(cfg->cos_buf)||!vb(cfg->sin_buf)||
        !vb(cfg->soft_buf)||!vb(cfg->exp_buf))return -1;
-    const ResidentWeight& ew=g_weights[(size_t)cfg->embed];
-    if(ew.out_f!=cfg->vocab||ew.n_blocks*128!=cfg->d)return -1;
     for(const auto& l:c.layers){
-        if(!vb(l.n1)||!vb(l.n2)||!vw(l.w1)||!vw(l.wu)||!vw(l.w2))return -1;
-        if(l.kind==0&&(!vw(l.wqkv)||!vw(l.wz)||!vw(l.walpha)||!vw(l.wbeta)||!vw(l.wout)||
+        if(!vb(l.n1)||!vb(l.n2)||!ww(l.w1,cfg->dff,cfg->d)||
+           !ww(l.wu,cfg->dff,cfg->d)||!ww(l.w2,cfg->d,cfg->dff))return -1;
+        if(l.kind==0&&(!ww(l.wqkv,c.conv_dim,cfg->d)||!ww(l.wz,cfg->inner,cfg->d)||
+           !ww(l.walpha,cfg->value_heads,cfg->d)||!ww(l.wbeta,cfg->value_heads,cfg->d)||
+           !ww(l.wout,cfg->d,cfg->inner)||
            !vb(l.conv)||!vb(l.dt_bias)||!vb(l.ssm_a)||!vb(l.ssm_norm)))return -1;
-        if(l.kind==1&&(!vw(l.wqg)||!vw(l.wk)||!vw(l.wv)||!vw(l.wo)||!vb(l.q_norm)||!vb(l.k_norm)))return -1;
+        if(l.kind==1&&(!ww(l.wqg,2*cfg->H*cfg->hd,cfg->d)||
+           !ww(l.wk,cfg->Hkv*cfg->hd,cfg->d)||!ww(l.wv,cfg->Hkv*cfg->hd,cfg->d)||
+           !ww(l.wo,cfg->d,cfg->H*cfg->hd)||!vb(l.q_norm)||!vb(l.k_norm)))return -1;
     }
     bool ok=true;auto cm=[&](auto** p,size_t n){if(ok)ok=(cudaMalloc((void**)p,n)==cudaSuccess);};
     const size_t S=(size_t)c.nrec*cfg->value_heads*cfg->state_size*cfg->state_size;
@@ -2651,6 +2738,16 @@ int bonsai35_ctx_set_trace(long long handle,int enabled){
         c.trace=nullptr;c.capture_trace=false;
     }
     return 0;
+}
+
+// Projection grouping is a pre-capture scheduling choice.  Disabling it is
+// retained as an exact same-binary control for parity and same-host AB tests;
+// production defaults to the grouped graph.
+int bonsai35_ctx_set_projection_grouping(long long handle,int enabled){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.graph_ready||c.t!=0)return 1;
+    c.group_projections=enabled!=0;return 0;
 }
 
 int bonsai35_decode_step(long long handle,const long long* x_host,long long pos,long long* logits_host){
@@ -2763,6 +2860,18 @@ int bonsai35_ctx_graph_stats(long long handle,long long* total_nodes,long long* 
     if(memset_nodes)*memset_nodes=c.graph_memset_nodes;
     if(other_nodes)*other_nodes=c.graph_other_nodes;
     if(trace_enabled)*trace_enabled=c.capture_trace?1:0;
+    return 0;
+}
+
+int bonsai35_ctx_projection_stats(long long handle,int* grouping_enabled,
+                                  long long* logical_applies,long long* kernel_nodes){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;
+    const Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive)return 1;
+    const long long logical=8*c.nrec+7*c.natt+1; // includes the output head
+    const long long scheduled=c.group_projections?4*(c.nrec+c.natt)+1:logical;
+    if(grouping_enabled)*grouping_enabled=c.group_projections?1:0;
+    if(logical_applies)*logical_applies=logical;
+    if(kernel_nodes)*kernel_nodes=scheduled;
     return 0;
 }
 

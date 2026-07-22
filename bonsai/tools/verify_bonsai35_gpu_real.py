@@ -486,6 +486,7 @@ def run_verification(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             f"nodes={graph_metadata['graph_nodes']} "
             f"kernels={graph_metadata['kernel_nodes']} "
             f"memcpy={graph_metadata['memcpy_nodes']} "
+            f"projection_grouping={'on' if graph_metadata['projection_grouping_enabled'] else 'off'} "
             f"trace={'on' if graph_metadata['trace_enabled'] else 'off'}",
             file=sys.stderr,
             flush=True,
@@ -514,6 +515,10 @@ def run_verification(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             report["acceptance"]["diagnostic_trace_disabled"] = (
                 graph_metadata["trace_enabled"] is False
                 and graph_metadata["trace_copy_nodes_per_launch"] == 0
+            )
+            report["acceptance"]["projection_grouping_enabled"] = (
+                graph_metadata["projection_grouping_enabled"] is True
+                and graph_metadata["projection_kernel_nodes_saved_per_launch"] > 0
             )
             accepted = all(report["acceptance"].values())
             report["status"] = "pass" if accepted else "fail"
