@@ -39,6 +39,64 @@ workers own disjoint output-row chunks and never share a reduction, so their sch
 Set `TRINOTE_ORACLE_Q1_THREADS=1` for the historical serial-oracle baseline. Use one BLAS thread unless a
 controlled benchmark proves otherwise.
 
+The Python entry points also accept `--cpu-threads N` (an alias of `--threads`) and set OpenMP, OpenBLAS, MKL,
+BLIS, NumExpr, VecLib, and the pure-oracle Q1 row workers consistently before model/shared-library load. This is the appropriate interface for
+notary automation that does not enter through the shell launcher.
+
+## Verified-token latency and deterministic routing
+
+Generation throughput alone is not the product latency: a receipt-bound turn also constructs the receipt,
+re-executes every committed output with a fresh oracle, and emits the ledger entry. Use `--run-report PATH` on
+`trinote-run-bonsai` or `trinote-receipt-bundle verify` to atomically retain a `receipt-run/v1` record with these
+phases separated. The record contains hashes, engine/strategy paths, thread/resource bounds, token counts, and
+cleanup state; it deliberately excludes prompt text and signing-key paths, redacts host-local absolute paths,
+and is created mode `0600`.
+
+The release verifier workload is checked in as
+`tests/fixtures/bonsai35_19x64_golden.json`. Its 19 input IDs, 64 output IDs, visible-byte commitment, artifact
+digest, and GGUF digest are the acceptance boundary. Benchmark the exact 20-output product baseline across fresh
+processes (required for trustworthy OpenMP settings) with:
+
+```bash
+PYTHONPATH=src .venv/bin/python tools/bench_bonsai35_verifier.py \
+  --artifact "$BONSAI_INTEGER_27B_ARTIFACT" \
+  --threads 1,2,4,8,16 --output-counts 20 \
+  --out /tmp/bonsai35-verifier-benchmark.json \
+  --policy-out /tmp/bonsai35-verifier-policy.json \
+  --oracle-policy-out /tmp/bonsai35-verifier-oracle-policy.json
+```
+
+Every cell must reproduce all committed tokens. The variants are pure-oracle teacher forcing, byte-identical
+native teacher forcing, and byte-identical native cached replay. The generated `receipt-verifier-policy/v1` is
+bound to the artifact SHA-256 and routes deterministically by committed input/output token counts. Generated
+policies fail closed for a token-count pair absent from the measured matrix, or when that point does not select
+an exact first-match rule with the measured thread count. Each benchmark cell records requested and effective
+workers separately and cannot publish a policy when they differ. Add the product lengths you intend to verify
+to `--output-counts` instead of extrapolating a timing winner. Apply it with:
+
+```bash
+trinote-receipt-bundle verify receipt.tar.gz --reexec \
+  --artifact "$BONSAI_INTEGER_27B_ARTIFACT" \
+  --strategy-policy /tmp/bonsai35-verifier-policy.json \
+  --run-report /tmp/receipt-verify-run.json
+```
+
+An explicit `--verifier-engine native` fails if the native kernel cannot be enabled; it never silently turns a
+measured native route into an oracle run. Strategy selection changes only the exact recomputation schedule and
+never enables sampled/partial verification. The policy also pins the single measured process-wide thread count;
+an explicit conflicting `--cpu-threads` is rejected instead of silently applying an unmeasured performance route.
+When a policy is supplied, explicit verifier-engine/strategy overrides are rejected: the measured route is
+authoritative, and run evidence never labels an overridden route as policy-applied.
+
+Fresh-oracle receipt issuance can use the same routing machinery without relaxing its independent-verifier gate.
+Pass the benchmark's oracle-only policy as
+`trinote-run-bonsai --verify-mode fresh-oracle --receipt-verify-policy POLICY.json`. Issuance rejects a policy
+whose selected rule names the native engine; native policies remain valid for later third-party bundle replay.
+
+For the producer, `--require-gpu` implies `--gpu` and fails on residency failure or a later CUDA range/launch
+guard. Normal `--gpu` retains canonical CPU replay as a portability policy. Release acceptance and CI must use
+the fail-closed flag so a CPU fallback cannot be mislabeled as GPU evidence.
+
 ## Controlled JSON benchmark
 
 `tools/bench_bonsai35.py` is a controller/worker harness. The controller imports no NumPy. It sets thread policy,
@@ -176,6 +234,50 @@ For GPU measurements, the regular PrismML Bonsai-27B process (about 4.17 GiB) an
 (6,362,562,560 bytes observed live, with a 6,740,049,920-byte proof peak) are mutually exclusive on the 8 GiB
 RTX 3070. Stop/unload PrismML before a resident integer GPU run, record that transition, and restore it only after
 cleanup. A launcher result that fell back to CPU because PrismML owned the card is a CPU result, not a GPU benchmark.
+
+## Accepted GPU hardware evidence
+
+The fail-closed GPU hardware gate passed on 2026-07-22 on an RTX 4090 compiled for `sm_89`. It was bound to
+source snapshot `5c7f866c2c52361f8011511a36e26de101839c5b6a31bd1077e893125c1ecff0` (base `d1cd090`,
+196 entries) and artifact SHA-256 `7eab414ceff3fff1489053d415d0c6adb1e646e552d091cc1a898d0456adf3fb`.
+The operator-local deploy results are `20260722-195649_bonsai-hardware-gate-summary.json` and
+`20260722-195649_bonsai-hardware-gate-evidence.tar.gz`. Their three bound reports passed: `golden19x64`
+(`ef50f06773716d2431c64d1337a169611c1b3f675edc9aa437c63eeca9676847`), `full128Parity`
+(`fcbb405898c176b989e6849c71649df372373e0ce70e3f803284cb445fe9f351`), and `populated4kThroughput`
+(`2291fdde3ef830adb9ef5618139c3ddb22bc1977d7e784675af2d019cb2dc1e2`).
+
+The 19-input/64-output golden record passed all 16 gates. Its output-ID SHA-256 is
+`6528f94af6398d9bfa8c85099b5d1e2047ac133eafb0b20be00f494d71f125bf`, and its visible-byte SHA-256 is
+`0326877dd8a72d427519acf2c33070dbe5049dd91136c29b5e6cbee7ff306c05`.
+
+The full-128 record passed all seven acceptance fields: `array_parity`, `artifact_bound`,
+`device_resident_token_embedding`, `device_under_7_5_gib_ceiling`, `generated_token_parity`,
+`one_graph_submission_per_consumed_token`, and `raw_hi_next_token_11`. For prompt IDs `[12675]`, CPU and GPU
+consumed and generated exactly 128 tokens. The generated int64-LE token SHA-256 was
+`8faec4eb5a7a17d0d472474f76a8113c74974bf725c4729b13be04998ade6704`; the first eight IDs were
+`[11, 353, 2688, 4313, 310, 1791, 264, 4145]`, and the last eight were
+`[2081, 13, 353, 599, 264, 1103, 314, 3470]`. Every CPU/GPU int64 array was equal:
+
+| Array | Shape | Shared SHA-256 |
+|---|---|---|
+| convolution history | `[48, 3, 10240]` | `8062c45545594ff8ddbe1e3fd1691292952603949d148d4e8b8593565eb16a0a` |
+| K cache | `[16, 4, 128, 256]` | `2225963b49a54382fd7be1c2ea2b75ab854c14e2f0073b1700b7c0783a4ebdc5` |
+| logits | `[248320]` | `0daa98539fea4101c4f2d7a8f76916acd74a3936b6db467ff7a8f301e4358ac3` |
+| recurrent state | `[48, 48, 128, 128]` | `b1b6839a6b1487efa0e54eaaf98272f331e36060651d03160c8514daf53fa011` |
+| layer trace | `[65, 5120]` | `c76b8559102bceca02361d5fdbda546df24be63a934adecd4f4b9889ce14c2db` |
+| V cache | `[16, 4, 128, 256]` | `95792b453b08fa251fe7e2f322119cd54261e0af7d817df5eb3e967a283e5a8b` |
+
+The canonical NumPy oracle took 1,646.6276 seconds; steady GPU decode reached 22.6762 tokens/second. The populated
+4K record passed all 15 acceptance fields: `consumed_id_count_exact`, `context_not_poisoned`,
+`context_position_exact`, `device_embedding_only`, `device_under_7_5_gib_ceiling`, `diagnostic_trace_disabled`,
+`generated_id_count_exact`, `graph_ready`, `last_32_at_least_10_tokens_per_second`,
+`live_memory_queries_available`, `model_input_host_bytes_exact`, `one_graph_submission_per_consumed_token`,
+`projection_grouping_enabled`, `raw_hi_next_token_11`, and `token_id_input_mode`. It completed 4,096 consumed
+positions and 4,096 graph launches, with a last-32 median of 18.7055 tokens/second. Live use was 6,202,458,112
+bytes and the proof peak was 6,795,952,128 bytes, both below the 8,053,063,680-byte ceiling.
+
+This was local hardware acceptance evidence; no chain transaction was broadcast. It does not complete or replace
+the still-pending selected-executor CPU tuning matrix described above.
 
 ## Q1 hardware counters
 

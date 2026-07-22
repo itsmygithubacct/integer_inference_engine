@@ -566,6 +566,136 @@ def test_reexec_layer_fails_on_invalid_signature(tmp_path, monkeypatch):
     assert out["reexec"]["ok"] is False        # a bad signature now fails the layer (was ignored)
 
 
+@pytest.mark.parametrize(
+    ("signature_fields", "expected_ok"),
+    [
+        ({}, False),
+        ({
+            "sigModelOk": True,
+            "sigModelAuthenticated": True,
+        }, False),
+        ({
+            "sigModelOk": True,
+            "sigCounterpartyOk": True,
+            "sigModelAuthenticated": True,
+            "sigCounterpartyAuthenticated": True,
+        }, True),
+    ],
+)
+def test_reexec_signature_pinning_requires_both_authenticated_signatures(
+    tmp_path, monkeypatch, signature_fields, expected_ok
+):
+    import trinote.receipts.verify as rv
+
+    d = _standalone_bundle_dir(tmp_path, "strict-signatures")
+
+    def fake_verify_receipt(bundle, **kw):
+        return {
+            "structuralOk": True,
+            "reexecOk": True,
+            "artifactBoundOk": True,
+            "artifactBindingOk": True,
+            "modelHashMatch": True,
+            "signatureOk": (
+                True if signature_fields.get("sigModelOk") is True
+                and signature_fields.get("sigCounterpartyOk") is True else None
+            ),
+            "reexec": {"ok": True, "strategy": "greedy", "checked": 3},
+            "ok": True,
+            **signature_fields,
+        }
+
+    monkeypatch.setattr(rv, "verify_receipt", fake_verify_receipt)
+    out = verify_bundle(
+        d,
+        reexec=True,
+        model=object(),
+        model_digest="x",
+        model_pubkey="02" + "11" * 32,
+        counterparty_pubkey="03" + "22" * 32,
+    )
+    assert out["reexec"]["ok"] is expected_ok
+    assert out["reexec"]["signaturePinned"] is expected_ok
+    assert out["ok"] is expected_ok
+
+
+def test_receipt_verifier_treats_missing_required_ec_signatures_as_invalid():
+    from trinote.receipts.verify import verify_receipt
+
+    bundle = _receipt_bundle()
+    for key in (
+        "sigModel", "sigModelPubKey", "sigModelKeyId",
+        "sigCounterparty", "sigCounterpartyPubKey", "sigCounterpartyKeyId",
+    ):
+        bundle["receipt"].pop(key, None)
+    result = verify_receipt(
+        bundle,
+        model_pubkey="02" + "11" * 32,
+        counterparty_pubkey="03" + "22" * 32,
+    )
+    assert result["sigModelOk"] is False
+    assert result["sigCounterpartyOk"] is False
+    assert result["signatureOk"] is False
+
+
+@pytest.mark.parametrize("bad_pin", ["", "02" + "AA" * 32, "04" + "11" * 32, "02ff"])
+def test_receipt_verifier_rejects_noncanonical_identity_pins(bad_pin):
+    from trinote.receipts.verify import verify_receipt
+
+    result = verify_receipt(_receipt_bundle(), model_pubkey=bad_pin)
+    assert result["ok"] is False
+    assert "canonical lowercase compressed" in result["error"]
+
+
+def test_reexec_reports_one_requested_pin_without_claiming_both(tmp_path, monkeypatch):
+    import trinote.receipts.verify as rv
+
+    d = _standalone_bundle_dir(tmp_path, "one-pin")
+
+    def fake_verify_receipt(bundle, **kw):
+        return {
+            "structuralOk": True,
+            "reexecOk": True,
+            "artifactBoundOk": True,
+            "artifactBindingOk": True,
+            "modelHashMatch": True,
+            "signatureOk": True,
+            "sigModelOk": True,
+            "sigModelAuthenticated": True,
+            "reexec": {"ok": True, "strategy": "greedy", "checked": 3},
+            "ok": True,
+        }
+
+    monkeypatch.setattr(rv, "verify_receipt", fake_verify_receipt)
+    out = verify_bundle(
+        d,
+        reexec=True,
+        model=object(),
+        model_digest="x",
+        model_pubkey="02" + "11" * 32,
+    )
+    rx = out["reexec"]
+    assert out["ok"] is True
+    assert rx["requestedSignaturePinsAuthenticated"] is True
+    assert rx["signaturePinned"] is False
+    assert next(c for c in rx["checks"] if c["check"] == "signaturePins")["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("key_field", "source_field"),
+    [
+        ("model_pubkey", "model_pin_source"),
+        ("counterparty_pubkey", "counterparty_pin_source"),
+    ],
+)
+def test_reexec_helper_rejects_pin_source_without_a_pin(key_field, source_field):
+    from trinote.bundle.verify import _verify_reexec
+
+    arguments = {key_field: None, source_field: "caller"}
+    with pytest.raises(ValueError, match="pin and pin source"):
+        _verify_reexec({}, object(), "ab" * 32, **arguments)
+
+
 def test_reexec_stateful_defaults_pinned_identity(tmp_path, monkeypatch):
     import trinote.receipts.verify as rv
     rb = _receipt_bundle()
@@ -577,12 +707,22 @@ def test_reexec_stateful_defaults_pinned_identity(tmp_path, monkeypatch):
         captured.update(kw)
         return {"structuralOk": True, "reexecOk": True, "artifactBoundOk": True,
                 "artifactBindingOk": True, "modelHashMatch": True, "signatureOk": True,
+                "sigModelOk": True, "sigCounterpartyOk": True,
+                "sigModelAuthenticated": True, "sigCounterpartyAuthenticated": True,
                 "reexec": {"ok": True, "strategy": "greedy", "checked": 3}, "ok": True}
 
     monkeypatch.setattr(rv, "verify_receipt", fake_verify_receipt)
-    verify_bundle(tmp_path / "sp", reexec=True, model=object(), model_digest="x")
+    result = verify_bundle(tmp_path / "sp", reexec=True, model=object(), model_digest="x")
     assert captured.get("model_pubkey") == identity["agentPubKey"]
     assert captured.get("counterparty_pubkey") == identity["counterpartyPubKey"]
+    reexec = result["reexec"]
+    assert reexec["modelSignaturePinSource"] == "bundle-identity"
+    assert reexec["counterpartySignaturePinSource"] == "bundle-identity"
+    assert reexec["modelSignaturePinRequested"] is False
+    assert reexec["counterpartySignaturePinRequested"] is False
+    assert reexec["requestedSignaturePinsAuthenticated"] is None
+    assert reexec["effectiveSignaturePinsAuthenticated"] is True
+    assert reexec["signaturePinned"] is False
 
 
 # --------------------------------------------------------------------------------------------------

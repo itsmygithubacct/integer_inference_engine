@@ -87,14 +87,26 @@ class LiveNativeSession:
         eos: int | None = None,
         on_token: TokenCallback | None = None,
         on_gpu_fallback: Callable[[], None] | None = None,
+        sampler_cfg=None,
     ) -> LiveGeneration:
         ids = tuple(int(v) for v in input_ids)
         if not ids or int(n_new) <= 0:
             return LiveGeneration([], 0)
         if self.architecture == "qwen35" and self.gpu is not None:
-            output, reused, complete = self._generate_gpu(
-                ids, int(n_new), pick, eos=eos, on_token=on_token
+            device_sampler = (
+                sampler_cfg is not None
+                and hasattr(self.gpu, "sample_device")
+                and hasattr(self.gpu, "decode_token_device")
+                and (hasattr(self.gpu, "prefill_device") or hasattr(self.gpu, "_prefill_device"))
             )
+            if device_sampler:
+                output, reused, complete = self._generate_gpu_device(
+                    ids, int(n_new), sampler_cfg, eos=eos, on_token=on_token
+                )
+            else:
+                output, reused, complete = self._generate_gpu(
+                    ids, int(n_new), pick, eos=eos, on_token=on_token
+                )
             if complete:
                 return LiveGeneration(output, reused)
             # A failed resident graph is poisoned. Replay the exact input on the
@@ -135,7 +147,8 @@ class LiveNativeSession:
 
     def _prepare_gpu(self, ids: tuple[int, ...]) -> tuple[np.ndarray | None, int]:
         reusable = (
-            _is_prefix(self._gpu_ids, ids)
+            bool(self._gpu_ids)
+            and _is_prefix(self._gpu_ids, ids)
             and int(getattr(self.gpu, "position", -1)) == len(self._gpu_ids)
         )
         reused = len(self._gpu_ids) if reusable else 0
@@ -182,6 +195,64 @@ class LiveNativeSession:
             self._gpu_ids = tuple(seq)
             self._gpu_logits = np.asarray(next_logits)
             logits = self._gpu_logits
+            if final:
+                break
+        return output, reused, True
+
+    def _prepare_gpu_device(self, ids: tuple[int, ...]) -> tuple[bool, int]:
+        reusable = (
+            bool(self._gpu_ids)
+            and _is_prefix(self._gpu_ids, ids)
+            and int(getattr(self.gpu, "position", -1)) == len(self._gpu_ids)
+        )
+        reused = len(self._gpu_ids) if reusable else 0
+        if reusable:
+            for token in ids[len(self._gpu_ids):]:
+                if not self.gpu.decode_token_device(int(token)):
+                    self._gpu_ids = ()
+                    self._gpu_logits = None
+                    return False, reused
+            self._gpu_ids = ids
+            self._gpu_logits = None
+            return True, reused
+        if not self.gpu.reset():
+            return False, 0
+        prefill = getattr(self.gpu, "prefill_device", None)
+        if prefill is None:
+            prefill = self.gpu._prefill_device
+        if not prefill(ids):
+            self._gpu_ids = ()
+            return False, 0
+        self._gpu_ids = ids
+        self._gpu_logits = None
+        return True, 0
+
+    def _generate_gpu_device(self, ids: tuple[int, ...], n_new: int, sampler_cfg,
+                             *, eos: int | None, on_token: TokenCallback | None):
+        ready, reused = self._prepare_gpu_device(ids)
+        if not ready:
+            return [], reused, False
+        seq = list(ids)
+        output: list[int] = []
+        for step in range(n_new):
+            token = self.gpu.sample_device(sampler_cfg, seq, len(seq))
+            if token is None:
+                self._gpu_ids = ()
+                return output, reused, False
+            token = int(token)
+            seq.append(token)
+            output.append(token)
+            if on_token is not None:
+                on_token(token)
+            final = (eos is not None and token == int(eos)) or step + 1 == n_new
+            if not self.gpu.decode_token_device(token):
+                self._gpu_ids = ()
+                self._gpu_logits = None
+                # The sampled final token is already exact; only future prefix
+                # reuse is lost if consuming it fails after selection.
+                return output, reused, final
+            self._gpu_ids = tuple(seq)
+            self._gpu_logits = None
             if final:
                 break
         return output, reused, True

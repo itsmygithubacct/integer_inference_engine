@@ -23,7 +23,7 @@ from ..infer_int.bonsai_runtime import (
 )
 from ..infer_int.gguf_tokenizer_v2 import load_gguf_tokens, llama_tokenize, token_bytes
 from ..infer_int.import_gguf_v2 import _GGUFReader
-from ..infer_int.reference_bonsai import BonsaiReferenceModel
+from ..infer_int.reference_bonsai import BonsaiReferenceModel, oracle_q1_worker_count
 from ..infer_int.reference_bonsai35 import BonsaiQwen35ReferenceModel
 from ..infer_int.gpu_bonsai35 import Bonsai35GpuExecutor
 from ..infer_int.prompt_cache_bonsai35 import (
@@ -42,6 +42,9 @@ from .context_window import parse_context_size, resolve_context_window
 from .conversation import ContextOverflow, Conversation
 from .live_session import LiveNativeSession
 from .repl import TerminalNoise, TerminalRepl, parse_command
+from .run_evidence import ReceiptRunEvidence
+from .thread_bootstrap import maybe_reexec_with_threads
+from .verifier_policy import load_verifier_policy, route_verification
 
 # All generated state (bundles, ledgers, session logs) lives OUTSIDE the repo under
 # $BONSAI_NOTARY_HOME (default ~/.local/trinote) — see trinote.notary_paths.
@@ -407,14 +410,45 @@ def _validate_args(args) -> int:
     if args.n_gpu_layers is not None and args.n_gpu_layers < 0:
         print("[bonsai] --n-gpu-layers must be >= 0", file=sys.stderr)
         return 2
+    if int(getattr(args, "threads", 0)) < 0:
+        print("[bonsai] --threads must be >= 0", file=sys.stderr)
+        return 2
     if args.fast_required and not args.fast:
         print("[bonsai] --fast-required requires --fast", file=sys.stderr)
         return 2
+    if getattr(args, "require_gpu", False):
+        if args.engine != "native":
+            print("[bonsai] --require-gpu requires --engine native", file=sys.stderr)
+            return 2
+        if args.json:
+            print("[bonsai] --require-gpu is not supported by --json mode", file=sys.stderr)
+            return 2
+        if args.prompt_cache:
+            print("[bonsai] --require-gpu cannot be combined with --prompt-cache", file=sys.stderr)
+            return 2
+        # A fail-closed request is also an opt-in request; requiring callers to
+        # repeat both flags invites an accidental fallback configuration.
+        args.gpu = True
     if args.prompt_cache and args.engine != "native":
         print("[bonsai] --prompt-cache requires --engine native", file=sys.stderr)
         return 2
     if args.verify_mode == "fresh-oracle" and not args.receipt:
         print("[bonsai] --verify-mode fresh-oracle requires receipts to be enabled", file=sys.stderr)
+        return 2
+    if getattr(args, "receipt_verify_policy", None) and not args.receipt:
+        print("[bonsai] --receipt-verify-policy requires receipts to be enabled", file=sys.stderr)
+        return 2
+    if (getattr(args, "receipt_verify_policy", None)
+            and args.verify_mode != "fresh-oracle"):
+        print("[bonsai] --receipt-verify-policy requires --verify-mode fresh-oracle", file=sys.stderr)
+        return 2
+    if (getattr(args, "receipt_verify_policy", None)
+            and getattr(args, "receipt_verify_strategy", "auto") != "auto"):
+        print(
+            "[bonsai] --receipt-verify-policy is authoritative and cannot be combined with "
+            "--receipt-verify-strategy",
+            file=sys.stderr,
+        )
         return 2
     return 0
 
@@ -483,10 +517,25 @@ def _generate_native_turn(
     live_session: LiveNativeSession | None = None,
 ) -> list[int]:
     """Dispatch one turn without changing producer/fallback semantics."""
+    # Side-channel only for per-turn operational evidence.  Token output and
+    # callback behavior remain the function's public contract.
+    args._last_generation_path = {
+        "actualProducer": "cpu",
+        "gpuAttempted": False,
+        "gpuFallback": False,
+    }
     if live_session is not None:
         frac = int(ref.cfg["frac"])
+        require_gpu = bool(getattr(args, "require_gpu", False))
+        live_gpu = getattr(live_session, "gpu", None) is not None
+        args._last_generation_path["gpuAttempted"] = live_gpu
+        required_gpu_tokens: list[int] = []
 
         def fallback_notice() -> None:
+            if getattr(args, "require_gpu", False):
+                raise RuntimeError(
+                    "--require-gpu set and the resident CUDA range/launch guard fired"
+                )
             print(
                 "\n[bonsai] CUDA range/launch guard fired; replaying prompt on CPU oracle",
                 file=sys.stderr,
@@ -499,33 +548,70 @@ def _generate_native_turn(
                 row, cfg, position=pos, frac_bits=frac, history_ids=hist
             ),
             eos=eos,
-            on_token=on_token,
+            # A fail-closed run buffers user-visible bytes until CUDA reports
+            # completion, so a poisoned partial prefix cannot be mistaken for
+            # successful output by an automation wrapper.
+            on_token=(required_gpu_tokens.append if require_gpu else on_token),
             on_gpu_fallback=fallback_notice,
+            sampler_cfg=cfg,
         )
+        if require_gpu:
+            if result.gpu_fallback:
+                raise RuntimeError("--require-gpu set and the live CUDA session fell back")
+            for token in required_gpu_tokens:
+                on_token(int(token))
+        args._last_generation_path = {
+            "actualProducer": "cpu" if result.gpu_fallback or not live_gpu else "resident-cuda",
+            "gpuAttempted": bool(live_gpu or result.gpu_fallback),
+            "gpuFallback": bool(result.gpu_fallback),
+        }
         return result.output_ids
     if gpu_executor is not None:
+        args._last_generation_path = {
+            "actualProducer": "resident-cuda",
+            "gpuAttempted": True,
+            "gpuFallback": False,
+        }
         frac = int(ref.cfg["frac"])
         gpu_partial: list[int] = []
 
         def gpu_on_token(tok: int) -> None:
             gpu_partial.append(int(tok))
-            on_token(int(tok))
+            if not getattr(args, "require_gpu", False):
+                on_token(int(tok))
 
-        output_ids, gpu_complete = gpu_executor.generate(
-            input_ids,
-            args.max_new,
-            lambda row, pos, hist: sample_token(
-                row, cfg, position=pos, frac_bits=frac, history_ids=hist
-            ),
-            eos=eos,
-            on_token=gpu_on_token,
-        )
+        if hasattr(gpu_executor, "generate_device"):
+            output_ids, gpu_complete = gpu_executor.generate_device(
+                input_ids, args.max_new, cfg, eos=eos, on_token=gpu_on_token
+            )
+        else:
+            output_ids, gpu_complete = gpu_executor.generate(
+                input_ids,
+                args.max_new,
+                lambda row, pos, hist: sample_token(
+                    row, cfg, position=pos, frac_bits=frac, history_ids=hist
+                ),
+                eos=eos,
+                on_token=gpu_on_token,
+            )
         if gpu_complete:
+            if getattr(args, "require_gpu", False):
+                for tok in gpu_partial:
+                    on_token(int(tok))
             return output_ids
+        if getattr(args, "require_gpu", False):
+            raise RuntimeError(
+                "--require-gpu set and the resident CUDA range/launch guard fired"
+            )
         # The GPU guard poisons the device context before returning an
         # untrusted row. Replay canonically from the original prompt.
         print("\n[bonsai] CUDA range/launch guard fired; replaying prompt on CPU oracle",
               file=sys.stderr)
+        args._last_generation_path = {
+            "actualProducer": "cpu",
+            "gpuAttempted": True,
+            "gpuFallback": True,
+        }
         replay_index = 0
 
         def replay_on_token(tok: int) -> None:
@@ -561,7 +647,8 @@ def _generate_native_turn(
 
 def _run_native(args, cfg: SamplerConfig) -> int:
     # OMP_NUM_THREADS is set in main() before dispatch (single-query default = nproc-1).
-    t_load0 = time.time()
+    evidence = getattr(args, "_run_evidence", None)
+    t_load0 = time.monotonic()
     r = _GGUFReader(args.gguf)
     eos = int(r.kv.get("tokenizer.ggml.eos_token_id", -1))
     tokens = load_gguf_tokens(args.gguf)
@@ -602,6 +689,14 @@ def _run_native(args, cfg: SamplerConfig) -> int:
         return 2
     if args.prompt_cache and artifact_arch != "qwen35":
         raise ValueError("--prompt-cache currently supports only Bonsai-27B/Qwen3.5")
+    if getattr(args, "require_gpu", False) and artifact_arch != "qwen35":
+        raise ValueError("--require-gpu currently supports only Bonsai-27B/Qwen3.5")
+    verifier_policy = getattr(args, "_receipt_verify_policy", None)
+    if verifier_policy is not None and info["digest"] != verifier_policy["artifactSha256"]:
+        raise ValueError(
+            "receipt verifier policy is bound to artifact "
+            f"{verifier_policy['artifactSha256']}, but the loaded artifact is {info['digest']}"
+        )
     if args.receipt and artifact_arch == "qwen35":
         if args.verify_mode != "fresh-oracle":
             raise ValueError(
@@ -609,7 +704,16 @@ def _run_native(args, cfg: SamplerConfig) -> int:
             )
         validate_bonsai35_receipt_identity(args.identity, info["digest"])
     ref = ref_class(art)
-    t_load = time.time() - t_load0
+    t_load = time.monotonic() - t_load0
+    if evidence:
+        evidence.add_phase("artifact-tokenizer-load", t_load)
+        evidence.update(
+            "model",
+            artifactDigest=info["digest"],
+            architecture=artifact_arch,
+            ggufArchitecture=gguf_arch,
+            contextTokens=context_profile.effective,
+        )
     print(f"[bonsai] engine={engine_name} sampler={cfg.mode} seed={cfg.seed} "
           f"receipt-bound={is_receipt_safe(cfg)}", file=sys.stderr)
     print(
@@ -621,40 +725,66 @@ def _run_native(args, cfg: SamplerConfig) -> int:
     )
     if getattr(args, "gpu", False):
         os.environ["TRINOTE_GPU"] = "1"   # opt-in toggle read by _gpu_enabled() per Q1 apply (needs --fast)
-        if not args.fast:
+        if not args.fast and artifact_arch != "qwen35":
             print("[bonsai] note: --gpu has no effect without --fast (GPU accelerates the native engine)",
                   file=sys.stderr)
     if args.fast:
-        t_fast0 = time.time()
+        t_fast0 = time.monotonic()
         fast_kind = "native packed-Q1"
         fast_ok = ref.enable_native()
         if not fast_ok:
             fast_kind = "Q1 sign cache"
             fast_ok = ref.enable_fast(check_ram=True, cache_output=True)
-        t_fast = time.time() - t_fast0
+        t_fast = time.monotonic() - t_fast0
         if not fast_ok and args.fast_required:
             print("[bonsai] FATAL: --fast-required set but RAM-gated Bonsai fast path could not be enabled",
                   file=sys.stderr)
             return 1
         state = f"{fast_kind} enabled" if fast_ok else "unavailable; using oracle packed path"
         print(f"[bonsai] fast path {state} ({t_fast:.1f}s)", file=sys.stderr)
+        if evidence:
+            evidence.add_phase("cpu-fast-path-setup", t_fast, enabled=bool(fast_ok), engine=fast_kind)
     verifier_ref = None
     if args.receipt and args.verify_mode == "fresh-oracle":
+        verifier_load_started = time.monotonic()
         print("[bonsai] loading fresh slow oracle verifier for receipts ...", file=sys.stderr)
         verifier_art, verifier_info = load_artifact_bonsai(args.artifact)
         if verifier_info["digest"] != info["digest"]:
             print("[bonsai] FATAL: verifier artifact digest drifted while loading", file=sys.stderr)
             return 1
         verifier_ref = ref_class(verifier_art)
+        if evidence:
+            evidence.add_phase(
+                "fresh-oracle-load", time.monotonic() - verifier_load_started,
+                artifactDigest=verifier_info["digest"],
+            )
     gpu_executor = None
     gpu_report = None
     if getattr(args, "gpu", False) and artifact_arch == "qwen35" and not args.prompt_cache:
+        gpu_setup_started = time.monotonic()
         try:
             gpu_executor, gpu_report = Bonsai35GpuExecutor.try_create_reported(art)
         except (MemoryError, RuntimeError, ValueError) as exc:
+            if getattr(args, "require_gpu", False):
+                print(f"[bonsai] FATAL: required resident CUDA unavailable: {exc}", file=sys.stderr)
+                if evidence:
+                    evidence.add_phase(
+                        "gpu-residency-upload", time.monotonic() - gpu_setup_started,
+                        status="failed", error=str(exc),
+                    )
+                return 1
             print(f"[bonsai] Qwen3.5 resident CUDA unavailable ({exc}); clean CPU replay enabled",
                   file=sys.stderr)
         if gpu_executor is None:
+            if getattr(args, "require_gpu", False):
+                reason = gpu_report.reason if gpu_report is not None else "unavailable"
+                print(f"[bonsai] FATAL: required resident CUDA not started: {reason}", file=sys.stderr)
+                if evidence:
+                    evidence.add_phase(
+                        "gpu-residency-upload", time.monotonic() - gpu_setup_started,
+                        status="failed", reason=reason,
+                    )
+                return 1
             if gpu_report is not None:
                 print(f"[bonsai] Qwen3.5 resident CUDA not started: {gpu_report.reason}; "
                       "using canonical CPU engine", file=sys.stderr)
@@ -662,9 +792,23 @@ def _run_native(args, cfg: SamplerConfig) -> int:
                 print("[bonsai] Qwen3.5 resident CUDA unavailable; using canonical CPU engine",
                       file=sys.stderr)
         else:
+            args._gpu_executor = gpu_executor
             print(f"[bonsai] Qwen3.5 resident CUDA graph enabled; "
                   f"memory-proof peak={gpu_executor.report.peak_used_bytes} bytes",
                   file=sys.stderr)
+        if evidence:
+            evidence.add_phase(
+                "gpu-residency-upload", time.monotonic() - gpu_setup_started,
+                status="ok" if gpu_executor is not None else "fallback",
+                enabled=gpu_executor is not None,
+                report=(gpu_report.as_dict() if gpu_report is not None and hasattr(gpu_report, "as_dict") else None),
+            )
+            evidence.update(
+                "engine",
+                gpuRequested=True,
+                gpuRequired=bool(getattr(args, "require_gpu", False)),
+                gpuResident=gpu_executor is not None,
+            )
     print("[bonsai] receipt-bound native reference path; use --engine prismml.cpp only for raw "
           "non-receipt speed demos", file=sys.stderr)
     if args.bench:
@@ -744,7 +888,7 @@ def _run_native(args, cfg: SamplerConfig) -> int:
             if handled:
                 pending_prompt = next_prompt
                 continue
-        t_tok0 = time.time()
+        t_tok0 = time.monotonic()
         prepared = None
         if interactive:
             try:
@@ -781,10 +925,21 @@ def _run_native(args, cfg: SamplerConfig) -> int:
                     file=sys.stderr,
                 )
                 return 2
-        t_tok = time.time() - t_tok0
+        t_tok = time.monotonic() - t_tok0
+        if evidence:
+            evidence.add_phase(
+                "tokenize", t_tok, turn=len(evidence.record["tokens"].get("turns", [])) + 1,
+                inputTokens=len(input_ids),
+            )
         stream_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         out_parts: list[str] = []      # accumulate the human-visible text for the bundle transcript
-        t0 = time.time()
+        gpu_stats_before = None
+        if evidence and gpu_executor is not None:
+            try:
+                gpu_stats_before = gpu_executor.stats()
+            except (RuntimeError, ValueError):
+                pass
+        t0 = time.monotonic()
 
         def on_token(tok: int) -> None:
             # Drop control glyphs (<|im_start|>, <think>, …) from the USER-VISIBLE stream by decoding
@@ -819,6 +974,14 @@ def _run_native(args, cfg: SamplerConfig) -> int:
             if not interactive:
                 return 130
             continue
+        except RuntimeError as exc:
+            if live_session is not None:
+                live_session.invalidate()
+            print(f"\n[bonsai] FATAL: {exc}", file=sys.stderr)
+            status = 1
+            if not interactive:
+                break
+            continue
         tail = stream_decoder.decode(b"", final=True)
         if tail:
             out_parts.append(tail)
@@ -827,13 +990,106 @@ def _run_native(args, cfg: SamplerConfig) -> int:
         output_text = "".join(out_parts)
         if interactive and output_ids:
             conversation.commit(prepared, output_ids, output_text)
-        dt = time.time() - t0
+        dt = time.monotonic() - t0
+        if evidence:
+            turn_index = len(evidence.record["tokens"].get("turns", [])) + 1
+            turns = list(evidence.record["tokens"].get("turns", []))
+            generation_path = dict(getattr(args, "_last_generation_path", {}))
+            turns.append({
+                "turn": turn_index,
+                "input": len(input_ids),
+                "output": len(output_ids),
+                **generation_path,
+            })
+            evidence.update("tokens", turns=turns)
+            phase_details = {
+                "turn": turn_index,
+                "inputTokens": len(input_ids),
+                "outputTokens": len(output_ids),
+                "gpuResident": gpu_executor is not None,
+                **generation_path,
+            }
+            gpu_stats_after = None
+            if gpu_executor is not None:
+                try:
+                    gpu_stats_after = gpu_executor.stats()
+                    phase_details["gpuStats"] = gpu_stats_after
+                except (RuntimeError, ValueError):
+                    pass
+            if gpu_stats_before is not None and gpu_stats_after is not None:
+                evidence.add_phase("generation-total", dt, inclusive=True, **phase_details)
+
+                def _delta(key: str) -> int:
+                    return max(0, int(gpu_stats_after.get(key, 0)) - int(gpu_stats_before.get(key, 0)))
+
+                prefill_us = _delta("prefill_host_microseconds")
+                decode_us = (
+                    _delta("decode_host_logits_microseconds")
+                    + _delta("decode_device_logits_microseconds")
+                )
+                sampling_us = (
+                    _delta("device_sampling_prepare_microseconds")
+                    + _delta("device_sampling_select_microseconds")
+                )
+                evidence.add_phase(
+                    "gpu-prefill", prefill_us / 1_000_000.0, turn=turn_index,
+                    calls=_delta("prefill_host_calls"),
+                    tokens=_delta("prefill_host_tokens"),
+                    logitsD2HBytes=_delta("prefill_logits_d2h_bytes"),
+                )
+                evidence.add_phase(
+                    "gpu-decode", decode_us / 1_000_000.0, turn=turn_index,
+                    hostLogitsCalls=_delta("decode_host_logits_calls"),
+                    deviceLogitsCalls=_delta("decode_device_logits_calls"),
+                )
+                evidence.add_phase(
+                    "gpu-sampling", sampling_us / 1_000_000.0, turn=turn_index,
+                    calls=_delta("device_sampling_calls"),
+                    hostBytes=_delta("device_sampler_host_bytes"),
+                )
+                measured = (prefill_us + decode_us + sampling_us) / 1_000_000.0
+                evidence.add_phase(
+                    "generation-host-overhead", max(0.0, dt - measured), turn=turn_index,
+                )
+            else:
+                evidence.add_phase("prefill-decode", dt, **phase_details)
         if not args.quiet:
             print(f"\n[bonsai] {len(output_ids)} tok in {dt:.1f}s · "
                   f"{dt / max(len(output_ids), 1):.1f}s/tok", file=sys.stderr)
         if args.receipt and output_ids:
             try:
-                t_verify0 = time.time()
+                t_verify0 = time.monotonic()
+                receipt_telemetry: dict = {}
+                if verifier_policy is not None:
+                    verifier_route = route_verification(
+                        verifier_policy,
+                        input_tokens=len(input_ids),
+                        output_tokens=len(output_ids),
+                    )
+                else:
+                    verifier_route = {
+                        "engine": "oracle" if verifier_ref is not None else "producer",
+                        "strategy": "auto",
+                    }
+                if verifier_policy is not None and args.receipt_verify_strategy != "auto":
+                    raise ValueError(
+                        "receipt verifier policy cannot be overridden after routing"
+                    )
+                if verifier_policy is None and args.receipt_verify_strategy != "auto":
+                    verifier_route["strategy"] = args.receipt_verify_strategy
+                receipt_verifier = verifier_ref if verifier_ref is not None else ref
+                if verifier_ref is not None and verifier_route["engine"] not in {"oracle", "producer"}:
+                    raise ValueError(
+                        "fresh-oracle receipt issuance refuses a verifier policy route that selects "
+                        f"engine={verifier_route['engine']!r}"
+                    )
+                receipt_verifier.receipt_verify_strategy = verifier_route["strategy"]
+                if evidence:
+                    evidence.update(
+                        "engine",
+                        receiptVerifierEngine=verifier_route["engine"],
+                        receiptVerifierStrategy=verifier_route["strategy"],
+                    )
                 # Real third-party-verifiable secp256k1 keys by default (load-or-generate under
                 # ~/.local/trinote/keys); --demo-keys forces the legacy deterministic HMAC vouch.
                 if args.demo_keys:
@@ -864,8 +1120,33 @@ def _run_native(args, cfg: SamplerConfig) -> int:
                             confirm=args.chain_confirm, change_to_source=True, allow_unconfirmed=True)
                             if args.onchain else None),
                         tx_log=(args.tx_log or None),
+                        telemetry=receipt_telemetry,
                     )
-                t_verify = time.time() - t_verify0
+                t_verify = time.monotonic() - t_verify0
+                if evidence:
+                    evidence.add_phase(
+                        "receipt-preparation",
+                        receipt_telemetry.get("receiptPreparationSeconds", 0.0),
+                        turn=turn_index,
+                    )
+                    evidence.add_phase(
+                        "receipt-construction",
+                        receipt_telemetry.get("receiptConstructionSeconds", 0.0),
+                        turn=turn_index,
+                    )
+                    evidence.add_phase(
+                        "fresh-oracle-verification",
+                        receipt_telemetry.get("verificationSeconds", 0.0),
+                        turn=turn_index,
+                        strategy=receipt_telemetry.get("verificationStrategy"),
+                        checkedTokens=receipt_telemetry.get("verificationCheckedTokens"),
+                    )
+                    evidence.add_phase(
+                        "receipt-emission",
+                        receipt_telemetry.get("emissionSeconds", 0.0),
+                        turn=turn_index,
+                        onchain=bool(args.onchain),
+                    )
             except ValueError as exc:
                 print(f"[receipt] FATAL: {exc}", file=sys.stderr)
                 status = 1
@@ -935,6 +1216,8 @@ def _run_native(args, cfg: SamplerConfig) -> int:
             break
     if gpu_executor is not None:
         gpu_executor.close()
+        if evidence:
+            evidence.update("cleanup", gpuClosed=True)
     return status
 
 
@@ -986,6 +1269,7 @@ def _run_prismml(args, cfg: SamplerConfig) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    real_argv = argv is None
     # allow_abbrev=False: the bonsai-notary launcher gates auto-funding + fresh-change on a LITERAL
     # ' --chain-confirm ' substring, so a prefix like --chain-conf must NOT resolve to the real
     # broadcast flag (that would spend with change-address hygiene skipped). Matches agent_cli.py/cli.py.
@@ -1028,6 +1312,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.set_defaults(receipt=True)
     ap.add_argument("--verify-mode", choices=["fast-local", "fresh-oracle"], default="fast-local",
                     help="receipt verifier: reuse producer model or re-load a fresh slow oracle")
+    ap.add_argument("--receipt-verify-strategy",
+                    choices=["auto", "teacher-forced", "cached-replay"], default="auto",
+                    help="exact full-replay algorithm used during receipt issuance")
+    ap.add_argument("--receipt-verify-policy", default=None,
+                    help="artifact/thread-bound receipt-verifier-policy/v1; routes issuance by committed "
+                         "input/output token counts (fresh-oracle issuance accepts only oracle routes)")
     ap.add_argument("--model-key", default=None,
                     help="path to the model (issuer) secp256k1 receipt signing key (JSON). Default: "
                          f"{model_key_default()} — generated on first use if absent (third-party-verifiable).")
@@ -1047,8 +1337,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="per-host opt-in: use the byte-identical CUDA producer (Qwen3.5 uses a fully "
                          "resident hybrid CUDA graph); cleanly replay/fall back to CPU when the library, "
                          "GPU memory, or an integer range guard is unavailable. Composes with --fast.")
+    ap.add_argument("--require-gpu", action="store_true",
+                    help="fail closed unless the Qwen3.5 resident CUDA engine starts and completes; implies --gpu")
     ap.add_argument("--bench", action="store_true",
                     help="print per-stage native timing to stderr")
+    ap.add_argument("--run-report", default=None,
+                    help="atomically write model/engine identities, phase timings, token counts, and cleanup as "
+                         "receipt-run/v1 JSON (never records prompt text or key paths)")
     ap.add_argument("--prompt-cache", action="store_true",
                     help="Qwen3.5: persist and verify a content-addressed deterministic prefix state")
     ap.add_argument("--prompt-cache-dir", default=None,
@@ -1088,7 +1383,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="PrismML llama.cpp GPU layers (-ngl); 99 offloads all Bonsai-27B layers")
     ap.add_argument("--flash-attn", action="store_true",
                     help="enable PrismML llama.cpp flash attention (-fa on)")
-    ap.add_argument("--threads", type=int, default=0,
+    ap.add_argument("--threads", "--cpu-threads", dest="threads", type=int, default=0,
                     help="OpenMP threads for a SINGLE query (1 process / 1 shard). 0 = auto = nproc-1. An "
                          "explicit OMP_NUM_THREADS in the environment (launch scripts / the parallel bench) "
                          "is respected; the parallel bench tool sets its own per-shard threads.")
@@ -1122,34 +1417,126 @@ def main(argv: list[str] | None = None) -> int:
     ap.set_defaults(**defaults)
     args = ap.parse_args(argv)
 
-    if args.random_seed:
-        args.seed = secrets.randbits(64)
-        print(f"[bonsai] random seed = {args.seed} (committed in receipt)", file=sys.stderr)
     bad = _validate_args(args)
     if bad:
         return bad
-    cfg = _sampler_from_args(args)
+    args._receipt_verify_policy = None
+    if args.receipt_verify_policy:
+        try:
+            args._receipt_verify_policy = load_verifier_policy(args.receipt_verify_policy)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[bonsai] invalid --receipt-verify-policy: {exc}", file=sys.stderr)
+            return 2
+        policy_threads = int(args._receipt_verify_policy["threads"])
+        if args.threads and int(args.threads) != policy_threads:
+            print(
+                f"[bonsai] --cpu-threads {args.threads} disagrees with the measured receipt policy "
+                f"thread count {policy_threads}",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.threads:
+            args.threads = policy_threads
     # Threading default for a SINGLE query (one process / one shard): nproc-1 OpenMP threads (leaves a core
     # for the system). Precedence: explicit --threads > an OMP_NUM_THREADS already in the env (launch scripts /
     # the parallel bench, which manages its own per-shard threads) > nproc-1. Set before any model/.so load so
     # OpenMP picks it up.
     if args.threads and args.threads > 0:
-        os.environ["OMP_NUM_THREADS"] = str(args.threads)
-    elif "OMP_NUM_THREADS" not in os.environ:
-        os.environ["OMP_NUM_THREADS"] = str(max(1, (os.cpu_count() or 2) - 1))
+        thread_count = args.threads
+    else:
+        raw_threads = os.environ.get("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 2) - 1)))
+        try:
+            thread_count = int(raw_threads)
+        except ValueError:
+            print(f"[bonsai] invalid OMP_NUM_THREADS={raw_threads!r}; expected a positive integer",
+                  file=sys.stderr)
+            return 2
+        if thread_count <= 0:
+            print("[bonsai] OMP_NUM_THREADS must be > 0", file=sys.stderr)
+            return 2
+    if args.threads and args.threads > 0:
+        maybe_reexec_with_threads(
+            thread_count,
+            real_argv=real_argv,
+            module_name="trinote.cli.run_bonsai_cli",
+        )
+    for name in (
+        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+    ):
+        if args.threads and args.threads > 0:
+            os.environ[name] = str(thread_count)
+        else:
+            os.environ.setdefault(name, str(thread_count))
+    if args.threads and args.threads > 0:
+        os.environ["TRINOTE_ORACLE_Q1_THREADS"] = str(thread_count)
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    if args.random_seed:
+        args.seed = secrets.randbits(64)
+        print(f"[bonsai] random seed = {args.seed} (committed in receipt)", file=sys.stderr)
+    cfg = _sampler_from_args(args)
+    evidence = None
+    if args.run_report:
+        try:
+            evidence = ReceiptRunEvidence(
+                args.run_report,
+                operation="produce-receipt" if args.receipt else "generate",
+                options={
+                    "engine": args.engine,
+                    "gpuRequested": bool(args.gpu),
+                    "gpuRequired": bool(args.require_gpu),
+                    "receipt": bool(args.receipt),
+                    "verifyMode": args.verify_mode,
+                    "receiptVerifyStrategy": args.receipt_verify_strategy,
+                    "receiptVerifyPolicy": bool(args.receipt_verify_policy),
+                    "onchain": bool(args.onchain),
+                    "maxNew": int(args.max_new),
+                    "threads": int(thread_count),
+                },
+            )
+            args._run_evidence = evidence
+            evidence.update("resources", oracleQ1Workers=oracle_q1_worker_count())
+        except OSError as exc:
+            print(f"[bonsai] FATAL: cannot create --run-report: {exc}", file=sys.stderr)
+            return 2
+    rc = 1
+    error = None
     try:
         if args.json:
             from .json_mode import run_json   # deferred import (avoids an import cycle)
-            return run_json(args, cfg)
-        if args.engine == "prismml.cpp":
-            return _run_prismml(args, cfg)
-        return _run_native(args, cfg)
+            rc = run_json(args, cfg)
+        elif args.engine == "prismml.cpp":
+            rc = _run_prismml(args, cfg)
+        else:
+            rc = _run_native(args, cfg)
     except FileNotFoundError as exc:
         # Missing GGUF / artifact / identity (e.g. defaults resolved outside the repo, or a wrong --path):
         # report cleanly instead of dumping a traceback, and exit non-zero.
         target = getattr(exc, "filename", None) or exc
         print(f"[bonsai] FATAL: required file not found: {target}", file=sys.stderr)
-        return 1
+        error = f"required file not found: {target}"
+        rc = 1
+    except (RuntimeError, ValueError) as exc:
+        print(f"[bonsai] FATAL: {exc}", file=sys.stderr)
+        error = str(exc)
+        rc = 1
+    finally:
+        gpu_executor = getattr(args, "_gpu_executor", None)
+        if gpu_executor is not None:
+            try:
+                gpu_executor.close()
+                if evidence:
+                    evidence.update("cleanup", gpuClosed=True)
+            except Exception as exc:  # cleanup is recorded and affects the run verdict
+                if evidence:
+                    evidence.update("cleanup", gpuClosed=False, gpuCloseError=str(exc))
+                if rc == 0:
+                    error = f"GPU cleanup failed: {exc}"
+                    rc = 1
+        if evidence:
+            evidence.finish("pass" if rc == 0 else "failed", exit_code=rc, error=error)
+    return rc
 
 
 if __name__ == "__main__":

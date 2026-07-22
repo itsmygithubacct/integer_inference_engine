@@ -33,15 +33,37 @@ trap cleanup EXIT HUP INT TERM
 "$nvcc" -O3 -arch="$arch" --cudart static -Xcompiler -fPIC -shared "$src" -o "$tmp"
 for symbol in \
   qk_cuda_abi_version \
+  qk_linear_cuda \
   qk_cuda_available \
   qk_register_weight \
+  qk_register_i64 \
   qk_resident_reserve \
+  qk_apply_resident \
+  qk_rmsnorm_router \
   qk_resident_capacity \
+  qk_resident_count \
+  qk_apply_resident_grouped \
+  qk_attention_bank_create \
+  qk_attention_bank_import \
+  qk_attention_bank_apply \
+  qk_attention_bank_moe_configure \
+  qk_attention_bank_moe_bind \
+  qk_attention_bank_moe_begin \
+  qk_attention_bank_moe_continue \
+  qk_attention_bank_moe_export \
+  qk_attention_bank_workspace_bytes \
+  qk_attention_bank_reset \
+  qk_attention_bank_destroy \
+  qk_free_all \
   qk_moe_ffn \
   qk_moe_ffn_batched \
+  qk_moe_ffn_batched_dp4a \
   qk_moe_workspace_allocations \
   qk_moe_workspace_bytes \
-  qk_moe_workspace_release
+  qk_moe_workspace_release \
+  qk_profile_reset \
+  qk_profile_set_enabled \
+  qk_profile_snapshot
 do
   if ! nm -D --defined-only "$tmp" | awk -v wanted="$symbol" '$3 == wanted { found=1 } END { exit !found }'; then
     echo "build_nmc_cuda.sh: required dynamic symbol is missing: $symbol" >&2

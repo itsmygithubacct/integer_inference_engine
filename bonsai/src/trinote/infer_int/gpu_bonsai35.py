@@ -14,9 +14,10 @@ allocations; it is not just a spreadsheet estimate.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from time import monotonic
+from time import monotonic, monotonic_ns
 import ctypes
 import hashlib
+import json
 
 import numpy as np
 
@@ -40,6 +41,51 @@ DEFAULT_DEVICE_CEILING = int(7.5 * GIB)
 # regular Prism Bonsai-27B REPL) is rejected immediately instead of failing
 # after several gigabytes have already crossed PCIe.
 CUDA_PREFLIGHT_RUNTIME_RESERVE = 1 << 30
+BONSAI35_GPU_ABI_VERSION = 3
+BONSAI35_PROFILE_FAMILIES = (
+    "h2d", "projection", "norm", "recurrent", "attention", "elementwise", "d2h",
+)
+
+
+def _gpu_last_error(lib, prefix: str) -> RuntimeError:
+    detail = "unknown CUDA error"
+    if lib is not None and hasattr(lib, "bonsai_gpu_last_error"):
+        fn = lib.bonsai_gpu_last_error
+        fn.argtypes = []
+        fn.restype = ctypes.c_char_p
+        raw = fn()
+        if raw:
+            detail = raw.decode("utf-8", "replace")
+    return RuntimeError(f"{prefix}: {detail}")
+
+
+def bonsai35_gpu_abi_manifest(lib=None) -> dict[str, object] | None:
+    """Return the versioned CUDA ABI manifest, or ``None`` for a stale library."""
+    lib = _load_lib() if lib is None else lib
+    required = ("bonsai_gpu_abi_version", "bonsai_gpu_abi_manifest")
+    if lib is None or any(not hasattr(lib, name) for name in required):
+        return None
+    version = lib.bonsai_gpu_abi_version
+    version.argtypes = []
+    version.restype = ctypes.c_int
+    if int(version()) != BONSAI35_GPU_ABI_VERSION:
+        return None
+    manifest_fn = lib.bonsai_gpu_abi_manifest
+    manifest_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    manifest_fn.restype = ctypes.c_size_t
+    size = int(manifest_fn(None, 0))
+    if size <= 0 or size > 64 * 1024:
+        return None
+    payload = ctypes.create_string_buffer(size + 1)
+    if int(manifest_fn(payload, len(payload))) != size:
+        return None
+    try:
+        manifest = json.loads(payload.value)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if manifest.get("abi_version") != BONSAI35_GPU_ABI_VERSION:
+        return None
+    return manifest
 
 
 def _checked_product(*values: int) -> int:
@@ -180,6 +226,11 @@ def qwen35_workspace_components(
         "attention_scores": _checked_product(h, cap, 8),
         "q1_bmma_activation_bitplanes": _checked_product(max_q1_input // 128, 4, 128),
         "output_logits": _checked_product(vocab, 8),
+        # Exact device sampler: canonical probability row, stable-sort key
+        # copy, token indices, bounded prompt history, and scalar result state.
+        "device_sampler_arena": _checked_product(vocab, 3, 8),
+        "device_sampler_history": _checked_product(cap, 8),
+        "device_sampler_scalars": 4 * 8 + 4,
         "layer_descriptors": _checked_product(len(layers), 32, 8),
         "debug_layer_trace": (
             _checked_product(len(layers) + 1, d, 8) if capture_trace else 0
@@ -449,6 +500,25 @@ def release_bonsai35_gpu_residency(handles: dict | None) -> None:
     q1_free_weights()
 
 
+def fused_silu_mul_gpu(gate_fp: np.ndarray, up_fp: np.ndarray, frac: int) -> "np.ndarray | None":
+    """Focused exact-parity rung for the q35 fused SiLU×multiply kernel."""
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "bonsai35_fused_silu_mul_gpu"):
+        return None
+    gate = np.ascontiguousarray(np.asarray(gate_fp, dtype=np.int64).reshape(-1))
+    up = np.ascontiguousarray(np.asarray(up_fp, dtype=np.int64).reshape(-1))
+    if gate.shape != up.shape or gate.size == 0:
+        raise ValueError("gate/up must be equal-sized, non-empty int64 arrays")
+    out = np.empty_like(gate)
+    fn = lib.bonsai35_fused_silu_mul_gpu
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
+                   ctypes.c_int64, ctypes.c_void_p]
+    fn.restype = ctypes.c_int
+    rc = fn(gate.ctypes.data, up.ctypes.data, ctypes.c_int64(gate.size),
+            ctypes.c_int64(int(frac)), out.ctypes.data)
+    return out if rc == 0 else None
+
+
 def recurrent_step_gpu(
     q_fp: np.ndarray,
     k_fp: np.ndarray,
@@ -683,6 +753,16 @@ class _Gpu35Layer(ctypes.Structure):
     )]
 
 
+class _Gpu35SamplerConfig(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int64) for name in (
+        "mode", "frac", "inv_temp", "top_k", "top_p", "min_p",
+        "rep_penalty", "no_repeat_ngram",
+    )]
+
+
+_GPU_SAMPLER_MODES = {"greedy": 0, "temp": 1, "top_k": 2, "top_p": 3, "min_p": 4}
+
+
 class Bonsai35GpuExecutor:
     """Fully resident, CUDA-graph-captured M=1 hybrid executor.
 
@@ -703,6 +783,9 @@ class Bonsai35GpuExecutor:
         *,
         capture_trace: bool,
         group_projections: bool,
+        native_config=None,
+        native_layers=None,
+        shared_state=None,
     ):
         self.artifact = artifact
         self.report = report
@@ -710,8 +793,21 @@ class Bonsai35GpuExecutor:
         self.ctx = int(ctx)
         self.capture_trace = bool(capture_trace)
         self.group_projections = bool(group_projections)
+        self._native_config = native_config
+        self._native_layers = native_layers
+        self._shared_state = shared_state if shared_state is not None else {"references": 1}
         self.position = 0
         self.closed = False
+        self._timing = {
+            "prefill_calls": 0, "prefill_tokens": 0, "prefill_ns": 0,
+            "prefill_logits_d2h_bytes": 0,
+            "decode_host_calls": 0, "decode_host_ns": 0, "decode_logits_d2h_bytes": 0,
+            "decode_device_calls": 0, "decode_device_ns": 0,
+            "sample_calls": 0, "sample_prepare_ns": 0, "sample_select_ns": 0,
+            "last_prefill_ns": 0, "last_decode_host_ns": 0,
+            "last_decode_device_ns": 0, "last_sample_prepare_ns": 0,
+            "last_sample_select_ns": 0,
+        }
 
     @classmethod
     def try_create(
@@ -751,13 +847,28 @@ class Bonsai35GpuExecutor:
         """Return both the optional executor and its auditable launch report."""
         lib = _load_lib()
         required_graph_abi = (
+            "bonsai_gpu_abi_version",
+            "bonsai_gpu_abi_manifest",
+            "bonsai_gpu_last_error",
+            "bonsai_gpu_device_probe",
             "bonsai35_ctx_create",
             "bonsai35_ctx_set_trace",
             "bonsai35_ctx_set_projection_grouping",
             "bonsai35_ctx_graph_stats",
             "bonsai35_ctx_projection_stats",
+            "bonsai35_ctx_profile_stats",
+            "bonsai35_profile_decode_token",
+            "bonsai35_prefill_tokens",
+            "bonsai35_decode_token_device",
+            "bonsai35_sample_prepare",
+            "bonsai35_sample_select",
+            "bonsai35_decode_batch",
         )
-        if lib is None or any(not hasattr(lib, name) for name in required_graph_abi):
+        if (
+            lib is None
+            or any(not hasattr(lib, name) for name in required_graph_abi)
+            or bonsai35_gpu_abi_manifest(lib) is None
+        ):
             return None, _unavailable(
                 "CUDA Qwen3.5 graph ABI is unavailable or stale; rebuild libbonsai_q1_gpu.so",
                 32,
@@ -842,8 +953,9 @@ class Bonsai35GpuExecutor:
         fn.restype = ctypes.c_int64
         ctx = int(fn(ctypes.byref(c), desc_array))
         if ctx < 0:
+            failure = str(_gpu_last_error(lib, "CUDA Qwen3.5 context creation failed"))
             q1_free_weights()
-            return None, report
+            return None, replace(report, feasible=False, reason=failure)
         set_trace = lib.bonsai35_ctx_set_trace
         set_trace.argtypes = [ctypes.c_int64, ctypes.c_int]
         set_trace.restype = ctypes.c_int
@@ -872,7 +984,45 @@ class Bonsai35GpuExecutor:
             ctx,
             capture_trace=capture_trace,
             group_projections=group_projections,
+            native_config=c,
+            native_layers=desc_array,
         ), report
+
+    def try_clone(self) -> "Bonsai35GpuExecutor | None":
+        """Allocate an independent cache/context while sharing resident weights."""
+        if self.closed or self._native_config is None or self._native_layers is None:
+            return None
+        lib = _load_lib()
+        create = lib.bonsai35_ctx_create
+        create.argtypes = [ctypes.POINTER(_Gpu35Config), ctypes.POINTER(_Gpu35Layer)]
+        create.restype = ctypes.c_int64
+        ctx = int(create(ctypes.byref(self._native_config), self._native_layers))
+        if ctx < 0:
+            return None
+        set_grouping = lib.bonsai35_ctx_set_projection_grouping
+        set_grouping.argtypes = [ctypes.c_int64, ctypes.c_int]
+        set_grouping.restype = ctypes.c_int
+        set_trace = lib.bonsai35_ctx_set_trace
+        set_trace.argtypes = [ctypes.c_int64, ctypes.c_int]
+        set_trace.restype = ctypes.c_int
+        if (
+            set_grouping(ctx, int(self.group_projections)) != 0
+            or set_trace(ctx, int(self.capture_trace)) != 0
+        ):
+            free = lib.bonsai35_ctx_free
+            free.argtypes = [ctypes.c_int64]
+            free.restype = None
+            free(ctx)
+            return None
+        self._shared_state["references"] += 1
+        return Bonsai35GpuExecutor(
+            self.artifact, self.report, self.handles, ctx,
+            capture_trace=self.capture_trace,
+            group_projections=self.group_projections,
+            native_config=self._native_config,
+            native_layers=self._native_layers,
+            shared_state=self._shared_state,
+        )
 
     def decode_embedded(self, x_fp: np.ndarray) -> "np.ndarray | None":
         if self.closed:
@@ -905,6 +1055,39 @@ class Bonsai35GpuExecutor:
         fn = lib.bonsai35_decode_token
         fn.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
         fn.restype = ctypes.c_int
+        started = monotonic_ns()
+        rc = fn(ctypes.c_int64(self.ctx), ctypes.c_int64(token),
+                ctypes.c_int64(self.position), out.ctypes.data)
+        elapsed = monotonic_ns() - started
+        if rc != 0:
+            return None
+        self._timing["decode_host_calls"] += 1
+        self._timing["decode_host_ns"] += elapsed
+        self._timing["last_decode_host_ns"] = elapsed
+        self._timing["decode_logits_d2h_bytes"] += vocab * 8
+        self.position += 1
+        return out
+
+    def profile_decode_token(self, token_id: int) -> "np.ndarray | None":
+        """Run one exact uncaptured token while collecting CUDA-event families.
+
+        Profiling must precede graph capture.  The ordinary decode graph stays
+        instrumentation-free, so production latency is unaffected when this
+        explicit diagnostic method is unused.
+        """
+        if self.closed:
+            raise RuntimeError("Bonsai35GpuExecutor is closed")
+        token = int(token_id)
+        vocab = int(self.artifact["config"]["vocab"])
+        if token < 0 or token >= vocab:
+            raise ValueError(f"token ID {token} is outside [0,{vocab})")
+        if self.stats()["graph_ready"]:
+            raise RuntimeError("profiling must run before CUDA graph capture/reset")
+        out = np.empty((vocab,), dtype=np.int64)
+        lib = _load_lib()
+        fn = lib.bonsai35_profile_decode_token
+        fn.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+        fn.restype = ctypes.c_int
         rc = fn(ctypes.c_int64(self.ctx), ctypes.c_int64(token),
                 ctypes.c_int64(self.position), out.ctypes.data)
         if rc != 0:
@@ -912,13 +1095,245 @@ class Bonsai35GpuExecutor:
         self.position += 1
         return out
 
+    def profile_report(self, *, reset: bool = False) -> dict[str, object]:
+        """Return stable per-family CUDA-event totals in integer microseconds."""
+        if self.closed:
+            raise RuntimeError("Bonsai35GpuExecutor is closed")
+        lib = _load_lib()
+        fn = lib.bonsai35_ctx_profile_stats
+        fn.argtypes = [
+            ctypes.c_int64, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_void_p,
+        ]
+        fn.restype = ctypes.c_int
+        count = len(BONSAI35_PROFILE_FAMILIES)
+        micros = (ctypes.c_uint64 * count)()
+        calls = (ctypes.c_uint64 * count)()
+        tokens = ctypes.c_uint64()
+        rc = fn(
+            ctypes.c_int64(self.ctx), ctypes.c_int(bool(reset)), micros, calls,
+            ctypes.c_int64(count), ctypes.byref(tokens),
+        )
+        if rc != 0:
+            raise _gpu_last_error(lib, "cannot query Bonsai35 CUDA profile")
+        families = {
+            name: {"microseconds": int(micros[i]), "calls": int(calls[i])}
+            for i, name in enumerate(BONSAI35_PROFILE_FAMILIES)
+        }
+        return {
+            "schema": "bonsai35-cuda-profile/v1",
+            "clock": "cuda_event",
+            "unit": "microseconds",
+            "profiled_tokens": int(tokens.value),
+            "families": families,
+        }
+
+    def decode_token_device(self, token_id: int) -> bool:
+        """Decode one token while retaining its logits on-device for sampling."""
+        if self.closed:
+            raise RuntimeError("Bonsai35GpuExecutor is closed")
+        token = int(token_id)
+        vocab = int(self.artifact["config"]["vocab"])
+        if token < 0 or token >= vocab:
+            raise ValueError(f"token ID {token} is outside [0,{vocab})")
+        lib = _load_lib()
+        fn = lib.bonsai35_decode_token_device
+        fn.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
+        fn.restype = ctypes.c_int
+        started = monotonic_ns()
+        rc = fn(ctypes.c_int64(self.ctx), ctypes.c_int64(token), ctypes.c_int64(self.position))
+        elapsed = monotonic_ns() - started
+        if rc != 0:
+            return False
+        self._timing["decode_device_calls"] += 1
+        self._timing["decode_device_ns"] += elapsed
+        self._timing["last_decode_device_ns"] = elapsed
+        self.position += 1
+        return True
+
+    def _prefill_device(self, token_ids) -> bool:
+        ids = np.ascontiguousarray(np.asarray(list(token_ids), dtype=np.int64).reshape(-1))
+        if ids.size == 0:
+            return False
+        vocab = int(self.artifact["config"]["vocab"])
+        if int(ids.min()) < 0 or int(ids.max()) >= vocab:
+            raise ValueError(f"prefill token IDs must be inside [0,{vocab})")
+        current = self.stats()
+        if current["graph_ready"] and current.get("input_mode") != "token_id_device_logits":
+            started = monotonic_ns()
+            for token in ids:
+                if self.decode_token(int(token)) is None:
+                    return False
+            elapsed = monotonic_ns() - started
+            self._timing["prefill_calls"] += 1
+            self._timing["prefill_tokens"] += int(ids.size)
+            self._timing["prefill_ns"] += elapsed
+            self._timing["last_prefill_ns"] = elapsed
+            self._timing["prefill_logits_d2h_bytes"] += int(ids.size) * vocab * 8
+            return True
+        lib = _load_lib()
+        fn = lib.bonsai35_prefill_tokens
+        fn.argtypes = [
+            ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_void_p,
+        ]
+        fn.restype = ctypes.c_int
+        started = monotonic_ns()
+        rc = fn(
+            ctypes.c_int64(self.ctx), ids.ctypes.data, ctypes.c_int64(ids.size),
+            ctypes.c_int64(self.position), ctypes.c_void_p(),
+        )
+        elapsed = monotonic_ns() - started
+        if rc != 0:
+            return False
+        self._timing["prefill_calls"] += 1
+        self._timing["prefill_tokens"] += int(ids.size)
+        self._timing["prefill_ns"] += elapsed
+        self._timing["last_prefill_ns"] = elapsed
+        self.position += int(ids.size)
+        return True
+
+    def prefill_device(self, token_ids) -> bool:
+        """Public scalar-I/O prefill for subsequent :meth:`sample_device`."""
+        return self._prefill_device(token_ids)
+
+    def sample_device(self, cfg, history_ids, position: int) -> int | None:
+        """Sample the resident logits exactly while transferring only scalars.
+
+        SHA-256 PRNG remains on the host as the canonical receipt primitive;
+        the GPU returns only the exact integer probability total, then consumes
+        the resulting integer target.  No vocabulary-sized row crosses PCIe.
+        """
+        from .sampler import (
+            _resolve_fp,
+            _resolve_min_p_fp,
+            draw_uniform_int,
+            validate_sampler_config,
+        )
+
+        cfg = validate_sampler_config(cfg)
+        frac = int(self.artifact["config"]["frac"])
+        inv_temp, top_p = (
+            (1 << frac, 1 << frac) if cfg.mode == "greedy" else _resolve_fp(cfg, frac)
+        )
+        min_p = _resolve_min_p_fp(cfg, frac) if cfg.mode == "min_p" else 0
+        native_cfg = _Gpu35SamplerConfig(
+            mode=_GPU_SAMPLER_MODES[cfg.mode], frac=frac, inv_temp=inv_temp,
+            top_k=int(cfg.top_k), top_p=top_p, min_p=min_p,
+            rep_penalty=int(cfg.rep_penalty), no_repeat_ngram=int(cfg.no_repeat_ngram),
+        )
+        history = np.ascontiguousarray(np.asarray(list(history_ids), dtype=np.int64).reshape(-1))
+        lib = _load_lib()
+        prepare = lib.bonsai35_sample_prepare
+        prepare.argtypes = [
+            ctypes.c_int64, ctypes.POINTER(_Gpu35SamplerConfig), ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        prepare.restype = ctypes.c_int
+        total = ctypes.c_int64()
+        argmax = ctypes.c_int64()
+        prepare_started = monotonic_ns()
+        rc = prepare(
+            ctypes.c_int64(self.ctx), ctypes.byref(native_cfg),
+            history.ctypes.data if history.size else ctypes.c_void_p(),
+            ctypes.c_int64(history.size), ctypes.byref(total), ctypes.byref(argmax),
+        )
+        prepare_elapsed = monotonic_ns() - prepare_started
+        if rc != 0:
+            return None
+        target = (
+            0 if cfg.mode == "greedy" or total.value <= 1
+            else draw_uniform_int(int(total.value), int(cfg.seed), int(position))
+        )
+        select = lib.bonsai35_sample_select
+        select.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+        select.restype = ctypes.c_int
+        token = ctypes.c_int64()
+        select_started = monotonic_ns()
+        select_rc = select(ctypes.c_int64(self.ctx), ctypes.c_int64(target), ctypes.byref(token))
+        select_elapsed = monotonic_ns() - select_started
+        if select_rc != 0:
+            return None
+        self._timing["sample_calls"] += 1
+        self._timing["sample_prepare_ns"] += prepare_elapsed
+        self._timing["sample_select_ns"] += select_elapsed
+        self._timing["last_sample_prepare_ns"] = prepare_elapsed
+        self._timing["last_sample_select_ns"] = select_elapsed
+        return int(token.value)
+
+    def generate_device(self, input_ids, n_new, cfg, *, eos=None, on_token=None):
+        """Generate with exact on-device sampling and scalar-only sampler I/O."""
+        if not self.reset():
+            return [], False
+        seq = [int(token) for token in input_ids]
+        if not self._prefill_device(seq):
+            return [], False
+        out = []
+        for step in range(int(n_new)):
+            token = self.sample_device(cfg, seq, len(seq))
+            if token is None:
+                return out, False
+            seq.append(token);out.append(token)
+            if on_token is not None:
+                on_token(token)
+            if eos is not None and token == int(eos):
+                return out, True
+            if step + 1 < int(n_new) and not self.decode_token_device(token):
+                return out, False
+        return out, True
+
     def prefill(self, token_ids) -> "np.ndarray | None":
-        last = None
-        for token_id in token_ids:
-            last = self.decode_token(int(token_id))
-            if last is None:
-                return None
-        return last
+        """Submit an ordered prompt in one native call and copy only final logits.
+
+        Qwen3.5 recurrent layers still require token-ordered graph replays, but
+        the Python loop and intermediate vocabulary-sized D2H transfers are
+        removed.  A context previously captured in legacy host-logits mode
+        retains the old exact loop for compatibility.
+        """
+        ids = np.ascontiguousarray(np.asarray(list(token_ids), dtype=np.int64).reshape(-1))
+        if ids.size == 0:
+            return None
+        vocab = int(self.artifact["config"]["vocab"])
+        if int(ids.min()) < 0 or int(ids.max()) >= vocab:
+            raise ValueError(f"prefill token IDs must be inside [0,{vocab})")
+        current = self.stats()
+        if current["graph_ready"] and current.get("input_mode") != "token_id_device_logits":
+            started = monotonic_ns()
+            last = None
+            for token_id in ids:
+                last = self.decode_token(int(token_id))
+                if last is None:
+                    return None
+            elapsed = monotonic_ns() - started
+            self._timing["prefill_calls"] += 1
+            self._timing["prefill_tokens"] += int(ids.size)
+            self._timing["prefill_ns"] += elapsed
+            self._timing["last_prefill_ns"] = elapsed
+            self._timing["prefill_logits_d2h_bytes"] += int(ids.size) * vocab * 8
+            return last
+        out = np.empty((vocab,), dtype=np.int64)
+        lib = _load_lib()
+        fn = lib.bonsai35_prefill_tokens
+        fn.argtypes = [
+            ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_void_p,
+        ]
+        fn.restype = ctypes.c_int
+        started = monotonic_ns()
+        rc = fn(
+            ctypes.c_int64(self.ctx), ids.ctypes.data, ctypes.c_int64(ids.size),
+            ctypes.c_int64(self.position), out.ctypes.data,
+        )
+        elapsed = monotonic_ns() - started
+        if rc != 0:
+            return None
+        self._timing["prefill_calls"] += 1
+        self._timing["prefill_tokens"] += int(ids.size)
+        self._timing["prefill_ns"] += elapsed
+        self._timing["last_prefill_ns"] = elapsed
+        self._timing["prefill_logits_d2h_bytes"] += vocab * 8
+        self.position += int(ids.size)
+        return out
 
     def generate(self, input_ids, n_new, pick, *, eos=None, on_token=None):
         """Generate with device-resident caches; return ``(tokens, complete)``."""
@@ -1086,14 +1501,100 @@ class Bonsai35GpuExecutor:
                   ctypes.byref(embedded_submissions), ctypes.byref(host_bytes)) != 0:
                 raise RuntimeError("cannot query Bonsai35 CUDA input stats")
             result.update({
-                "input_mode": "token_id" if mode.value == 2 else (
+                "input_mode": (
+                    "token_id" if mode.value == 2 else
+                    "token_id_device_logits" if mode.value == 3 else
                     "embedded_row" if mode.value == 1 else "uncaptured"
                 ),
                 "token_input_submissions": int(token_submissions.value),
                 "embedded_input_submissions": int(embedded_submissions.value),
                 "model_input_host_bytes": int(host_bytes.value),
             })
+        if hasattr(lib, "bonsai35_ctx_execution_stats"):
+            execution = lib.bonsai35_ctx_execution_stats
+            execution.argtypes = [ctypes.c_int64] + [ctypes.c_void_p] * 3
+            execution.restype = ctypes.c_int
+            prefill_calls = ctypes.c_uint64()
+            prefill_tokens = ctypes.c_uint64()
+            device_only = ctypes.c_uint64()
+            if execution(
+                ctypes.c_int64(self.ctx), ctypes.byref(prefill_calls),
+                ctypes.byref(prefill_tokens), ctypes.byref(device_only),
+            ) != 0:
+                raise RuntimeError("cannot query Bonsai35 CUDA execution stats")
+            result.update({
+                "prefill_strategy": "native_graph_sequence",
+                "prefill_calls": int(prefill_calls.value),
+                "prefill_tokens": int(prefill_tokens.value),
+                "device_only_decode_submissions": int(device_only.value),
+            })
+        if hasattr(lib, "bonsai35_ctx_sampler_stats"):
+            sampler = lib.bonsai35_ctx_sampler_stats
+            sampler.argtypes = [ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
+            sampler.restype = ctypes.c_int
+            prepare_calls = ctypes.c_uint64()
+            host_bytes = ctypes.c_uint64()
+            if sampler(
+                ctypes.c_int64(self.ctx), ctypes.byref(prepare_calls), ctypes.byref(host_bytes)
+            ) != 0:
+                raise RuntimeError("cannot query Bonsai35 CUDA sampler stats")
+            result.update({
+                "device_sampler_prepare_calls": int(prepare_calls.value),
+                "device_sampler_host_bytes": int(host_bytes.value),
+            })
+        timing = self._timing
+        result.update({
+            "timing_schema": "bonsai35-executor-timing/v1",
+            "prefill_host_calls": int(timing["prefill_calls"]),
+            "prefill_host_tokens": int(timing["prefill_tokens"]),
+            "prefill_host_microseconds": int(timing["prefill_ns"] // 1000),
+            "prefill_last_host_microseconds": int(timing["last_prefill_ns"] // 1000),
+            "prefill_logits_d2h_bytes": int(timing["prefill_logits_d2h_bytes"]),
+            "decode_host_logits_calls": int(timing["decode_host_calls"]),
+            "decode_host_logits_microseconds": int(timing["decode_host_ns"] // 1000),
+            "decode_device_logits_calls": int(timing["decode_device_calls"]),
+            "decode_device_logits_microseconds": int(timing["decode_device_ns"] // 1000),
+            "device_sampling_calls": int(timing["sample_calls"]),
+            "device_sampling_prepare_microseconds": int(timing["sample_prepare_ns"] // 1000),
+            "device_sampling_select_microseconds": int(timing["sample_select_ns"] // 1000),
+        })
         return result
+
+    def timing_stats(self) -> dict[str, int | str]:
+        """Stable per-run totals and last-step host/CUDA timing telemetry."""
+        t = self._timing
+        runtime = self.stats()
+        profile = self.profile_report()
+        profiled_d2h = profile["families"]["d2h"]
+        return {
+            "schema": "bonsai35-executor-timing/v1",
+            "clock": "monotonic_host_and_cuda_event",
+            "unit": "microseconds",
+            "prefill_calls": int(t["prefill_calls"]),
+            "prefill_tokens": int(t["prefill_tokens"]),
+            "prefill_total_microseconds": int(t["prefill_ns"] // 1000),
+            "prefill_last_microseconds": int(t["last_prefill_ns"] // 1000),
+            "prefill_final_logits_d2h_bytes": int(t["prefill_logits_d2h_bytes"]),
+            "decode_host_logits_calls": int(t["decode_host_calls"]),
+            "decode_host_logits_total_microseconds": int(t["decode_host_ns"] // 1000),
+            "decode_host_logits_last_microseconds": int(t["last_decode_host_ns"] // 1000),
+            "decode_full_logits_d2h_bytes": int(t["decode_logits_d2h_bytes"]),
+            "decode_device_logits_calls": int(t["decode_device_calls"]),
+            "decode_device_logits_total_microseconds": int(t["decode_device_ns"] // 1000),
+            "decode_device_logits_last_microseconds": int(t["last_decode_device_ns"] // 1000),
+            "device_sampling_calls": int(t["sample_calls"]),
+            "device_sampling_prepare_total_microseconds": int(t["sample_prepare_ns"] // 1000),
+            "device_sampling_prepare_last_microseconds": int(t["last_sample_prepare_ns"] // 1000),
+            "device_sampling_select_total_microseconds": int(t["sample_select_ns"] // 1000),
+            "device_sampling_select_last_microseconds": int(t["last_sample_select_ns"] // 1000),
+            "device_sampling_host_bytes": int(runtime.get("device_sampler_host_bytes", 0)),
+            "profiled_d2h_cuda_event_microseconds": int(profiled_d2h["microseconds"]),
+            "profiled_d2h_calls": int(profiled_d2h["calls"]),
+        }
+
+    def last_error(self) -> str:
+        """Return the thread-local structured CUDA error for the last failed ABI call."""
+        return str(_gpu_last_error(_load_lib(), "Bonsai35 CUDA"))
 
     def close(self) -> None:
         if self.closed:
@@ -1104,7 +1605,102 @@ class Bonsai35GpuExecutor:
             fn.argtypes = [ctypes.c_int64]
             fn.restype = None
             fn(ctypes.c_int64(self.ctx))
-        q1_free_weights()
+        self._shared_state["references"] -= 1
+        if self._shared_state["references"] == 0:
+            q1_free_weights()
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+class Bonsai35GpuBatchExecutor:
+    """Independent q35 contexts sharing weights, launched concurrently."""
+
+    def __init__(self, executors):
+        self.executors = list(executors)
+        self.closed = False
+        self._batches = 0
+        self._tokens = 0
+        self._wall_microseconds = 0
+
+    @classmethod
+    def try_create(cls, artifact: dict, batch_size: int, **kwargs):
+        size = int(batch_size)
+        if size <= 0:
+            raise ValueError("batch_size must be positive")
+        first = Bonsai35GpuExecutor.try_create(artifact, **kwargs)
+        if first is None:
+            return None
+        executors = [first]
+        for _ in range(1, size):
+            clone = first.try_clone()
+            if clone is None:
+                for executor in reversed(executors):
+                    executor.close()
+                return None
+            executors.append(clone)
+        return cls(executors)
+
+    def decode(self, token_ids) -> "np.ndarray | None":
+        if self.closed:
+            raise RuntimeError("Bonsai35GpuBatchExecutor is closed")
+        ids = np.ascontiguousarray(np.asarray(list(token_ids), dtype=np.int64).reshape(-1))
+        if ids.size != len(self.executors):
+            raise ValueError(f"expected {len(self.executors)} token IDs, got {ids.size}")
+        vocab = int(self.executors[0].artifact["config"]["vocab"])
+        if int(ids.min()) < 0 or int(ids.max()) >= vocab:
+            raise ValueError(f"batch token IDs must be inside [0,{vocab})")
+        handles = np.ascontiguousarray([executor.ctx for executor in self.executors], dtype=np.int64)
+        positions = np.ascontiguousarray([executor.position for executor in self.executors], dtype=np.int64)
+        out = np.empty((len(self.executors), vocab), dtype=np.int64)
+        wall = ctypes.c_uint64()
+        lib = _load_lib()
+        fn = lib.bonsai35_decode_batch
+        fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
+                                                      ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        rc = fn(
+            handles.ctypes.data, ids.ctypes.data, positions.ctypes.data,
+            ctypes.c_int64(ids.size), out.ctypes.data, ctypes.c_int64(vocab), ctypes.byref(wall),
+        )
+        if rc != 0:
+            return None
+        for executor in self.executors:
+            executor.position += 1
+        self._batches += 1
+        self._tokens += len(self.executors)
+        self._wall_microseconds += int(wall.value)
+        return out
+
+    def metadata(self) -> dict[str, int | float | str]:
+        elapsed = self._wall_microseconds
+        return {
+            "schema": "bonsai35-cuda-batch/v1",
+            "scheduling": "independent_context_streams",
+            "batch_size": len(self.executors),
+            "completed_batches": self._batches,
+            "completed_tokens": self._tokens,
+            "device_wall_microseconds": elapsed,
+            "mean_batch_latency_microseconds": (
+                elapsed / self._batches if self._batches else 0.0
+            ),
+            "aggregate_tokens_per_second": (
+                self._tokens * 1_000_000.0 / elapsed if elapsed else 0.0
+            ),
+        }
+
+    def reset(self) -> bool:
+        return all(executor.reset() for executor in self.executors)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        for executor in reversed(self.executors):
+            executor.close()
         self.closed = True
 
     def __enter__(self):

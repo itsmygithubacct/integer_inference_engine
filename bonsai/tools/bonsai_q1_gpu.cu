@@ -19,9 +19,46 @@
 
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#define BONSAI_GPU_API __declspec(dllexport)
+#elif defined(__clang__)
+#define BONSAI_GPU_API __attribute__((visibility("default"), used))
+#elif defined(__GNUC__)
+#define BONSAI_GPU_API __attribute__((visibility("default"), used, externally_visible))
+#else
+#define BONSAI_GPU_API
+#endif
+
+static constexpr int BONSAI_GPU_ABI_VERSION = 3;
+static thread_local int g_bonsai_gpu_error_code = 0;
+static thread_local char g_bonsai_gpu_error[512] = "ok";
+
+static int bonsai_gpu_errorf(int code, const char* format, ...) {
+    g_bonsai_gpu_error_code = code;
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(g_bonsai_gpu_error, sizeof(g_bonsai_gpu_error), format, args);
+    va_end(args);
+    return code;
+}
+
+static void bonsai_gpu_clear_error() {
+    g_bonsai_gpu_error_code = 0;
+    std::memcpy(g_bonsai_gpu_error, "ok", 3);
+}
 
 // Floor-toward-−∞ arithmetic shift, exact port of bonsai_q1_kernel.c:29-42 (arshift_i64).
 // NOT a CUDA signed `>>` (implementation-defined) and NOT truncating division (rounds toward zero -> wrong
@@ -826,6 +863,29 @@ __global__ void silu_kernel(const long long* __restrict__ x, long long* __restri
     out[i] = arshift_i64_floor(g_u64_to_i64(prod), frac);
 }
 
+// Exact fusion of SiLU(gate) followed by the fixed-point gate/up multiply.
+// The intermediate is materialized in a register with the same modulo-2^64
+// multiply and floor point as silu_kernel -> mulshift_kernel.
+__global__ void silu_mulshift_kernel(
+        const long long* __restrict__ gate,
+        const long long* __restrict__ up,
+        long long* __restrict__ out,
+        long long n, long long frac, long long log2e, long long d_clip) {
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n)return;
+    const long long xi=gate[i],m=xi>0?xi:0;
+    long long d0=m,d1=g_u64_to_i64((unsigned long long)m-(unsigned long long)xi);
+    if(d0>d_clip)d0=d_clip;if(d1>d_clip)d1=d_clip;
+    const long long e0=g_exp2_neg_fixed((d0*log2e)>>frac,frac);
+    const long long e1=g_exp2_neg_fixed((d1*log2e)>>frac,frac);
+    const long long z=e0+e1;
+    const long long sig=z?((e1<<frac)/z):0;
+    const long long silu=arshift_i64_floor(g_u64_to_i64(
+        (unsigned long long)xi*(unsigned long long)sig),frac);
+    out[i]=arshift_i64_floor(g_u64_to_i64(
+        (unsigned long long)silu*(unsigned long long)up[i]),frac);
+}
+
 // out[i] = ((a*b) mod 2^64) >> frac  (== (silu(gate)*up)>>frac).  numpy int64 * then arithmetic >>.
 __global__ void mulshift_kernel(const long long* __restrict__ a, const long long* __restrict__ b,
                                 long long* __restrict__ out, long long n, long long frac) {
@@ -840,6 +900,139 @@ __global__ void add_kernel(const long long* __restrict__ a, const long long* __r
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = g_u64_to_i64((unsigned long long) a[i] + (unsigned long long) b[i]);
+}
+
+// Versioned sampler ABI.  Mode values are committed in the manifest:
+// 0 greedy, 1 temp, 2 top_k, 3 top_p, 4 min_p.
+struct Bonsai35SamplerConfig {
+    long long mode,frac,inv_temp,top_k,top_p,min_p;
+    long long rep_penalty,no_repeat_ngram;
+};
+
+__device__ __forceinline__ long long q35_floor_div(long long numerator,long long denominator){
+    const long long q=numerator/denominator,r=numerator%denominator;
+    return (r<0)?q-1:q; // denominator is positive throughout the sampler ABI
+}
+
+__device__ __forceinline__ bool q35_history_contains(
+        const long long* history,long long history_n,long long token){
+    for(long long i=0;i<history_n;++i)if(history[i]==token)return true;
+    return false;
+}
+
+__device__ __forceinline__ bool q35_ngram_banned(
+        const long long* history,long long history_n,long long n,long long token){
+    if(n<=1||history_n<n)return false;
+    const long long prefix_start=history_n-(n-1);
+    for(long long i=0;i<=history_n-n;++i){
+        bool match=true;
+        for(long long j=0;j<n-1;++j)if(history[i+j]!=history[prefix_start+j]){match=false;break;}
+        if(match&&history[i+n-1]==token)return true;
+    }
+    return false;
+}
+
+__device__ __forceinline__ long long q35_sampler_adjust(
+        long long value,long long token,const long long* history,long long history_n,
+        const Bonsai35SamplerConfig& cfg){
+    if(cfg.rep_penalty&&q35_history_contains(history,history_n,token)){
+        const long long fp=1LL<<cfg.frac,denom=fp+cfg.rep_penalty;
+        const long long product=value>=0
+            ?g_u64_to_i64((unsigned long long)value*(unsigned long long)fp)
+            :g_u64_to_i64((unsigned long long)value*(unsigned long long)denom);
+        value=q35_floor_div(product,value>=0?denom:fp);
+    }
+    if(q35_ngram_banned(history,history_n,cfg.no_repeat_ngram,token))value=-(1LL<<40);
+    return value;
+}
+
+// A deliberately serial exact kernel.  Sampling is a decision boundary, not
+// a throughput reduction: this mirrors NumPy's integer floor points and tie
+// rules while eliminating a 1.9 MiB/logit-row PCIe transfer.  Sorting for
+// top-k/top-p is handled by stable Thrust primitives below.
+__global__ void q35_sampler_prepare_kernel(
+        const long long* logits,long long vocab,const long long* history,long long history_n,
+        Bonsai35SamplerConfig cfg,long long* probs,long long* total,long long* argmax,int* error){
+    if(blockIdx.x||threadIdx.x)return;
+    if(vocab<=0||cfg.frac<1||cfg.frac>29||cfg.mode<0||cfg.mode>4||cfg.inv_temp<=0){*error=1;return;}
+    long long best_token=0,best=q35_sampler_adjust(logits[0],0,history,history_n,cfg);
+    unsigned __int128 peak=g_abs_i64_u128(best);
+    probs[0]=best;
+    for(long long i=1;i<vocab;++i){
+        const long long adjusted=q35_sampler_adjust(logits[i],i,history,history_n,cfg);
+        probs[i]=adjusted;
+        if(adjusted>best){best=adjusted;best_token=i;}
+        const unsigned __int128 magnitude=g_abs_i64_u128(adjusted);
+        if(magnitude>peak)peak=magnitude;
+    }
+    *argmax=best_token;
+    if(cfg.mode==0){*total=1;return;}
+    if(peak*(unsigned __int128)cfg.inv_temp>=(unsigned __int128)1<<63){*error=2;return;}
+    const long long identity=1LL<<cfg.frac;
+    if(cfg.inv_temp!=identity){
+        best=arshift_i64_floor(g_u64_to_i64(
+            (unsigned long long)probs[0]*(unsigned long long)cfg.inv_temp),cfg.frac);
+        probs[0]=best;
+        for(long long i=1;i<vocab;++i){
+            probs[i]=arshift_i64_floor(g_u64_to_i64(
+                (unsigned long long)probs[i]*(unsigned long long)cfg.inv_temp),cfg.frac);
+            if(probs[i]>best)best=probs[i];
+        }
+    }
+    const long long LOG2E_Q16=94548,shift=16-cfg.frac;
+    const long long log2e=shift>=0?(LOG2E_Q16>>shift):(LOG2E_Q16<<(-shift));
+    const long long dca=((cfg.frac+2)<<(2*cfg.frac))/log2e;
+    const long long dcb=((long long)1<<62)/log2e,dclip=dca<dcb?dca:dcb;
+    unsigned long long normalizer=0;
+    for(long long i=0;i<vocab;++i){
+        long long distance=g_u64_to_i64((unsigned long long)best-(unsigned long long)probs[i]);
+        if(distance>dclip)distance=dclip;
+        const long long exponent=g_exp2_neg_fixed((distance*log2e)>>cfg.frac,cfg.frac);
+        probs[i]=exponent;normalizer+=(unsigned long long)exponent;
+    }
+    if(!normalizer){for(long long i=0;i<vocab;++i)probs[i]=0;*total=0;return;}
+    unsigned long long sum=0,max_probability=0;
+    for(long long i=0;i<vocab;++i){
+        probs[i]=(long long)(((unsigned long long)probs[i]<<cfg.frac)/normalizer);
+        const unsigned long long p=(unsigned long long)probs[i];sum+=p;if(p>max_probability)max_probability=p;
+    }
+    if(cfg.mode==4&&cfg.min_p>0){
+        const unsigned long long threshold=((unsigned long long)cfg.min_p*max_probability)>>cfg.frac;
+        sum=0;for(long long i=0;i<vocab;++i){if((unsigned long long)probs[i]<threshold)probs[i]=0;sum+=(unsigned long long)probs[i];}
+        if(!sum){probs[best_token]=1;sum=1;}
+    }
+    *total=(long long)sum;
+}
+
+__global__ void q35_sampler_truncate_sorted_kernel(
+        long long* probs,const long long* sorted_probs,const long long* sorted_indices,
+        long long vocab,Bonsai35SamplerConfig cfg,long long* total){
+    if(blockIdx.x||threadIdx.x)return;
+    long long keep=(cfg.top_k>0)?(cfg.top_k<vocab?cfg.top_k:vocab):vocab;
+    if(cfg.top_p<(1LL<<cfg.frac)){
+        unsigned long long cumulative=0;long long nucleus=0;
+        for(long long rank=0;rank<keep;++rank){
+            cumulative+=(unsigned long long)sorted_probs[vocab-1-rank];nucleus=rank+1;
+            if(cumulative>=(unsigned long long)cfg.top_p)break;
+        }
+        if(nucleus<1)nucleus=1;if(nucleus<keep)keep=nucleus;
+    }
+    for(long long rank=keep;rank<vocab;++rank)probs[sorted_indices[vocab-1-rank]]=0;
+    unsigned long long sum=0;for(long long i=0;i<vocab;++i)sum+=(unsigned long long)probs[i];
+    if(!sum){probs[sorted_indices[vocab-1]]=1;sum=1;}
+    *total=(long long)sum;
+}
+
+__global__ void q35_sampler_select_kernel(
+        const long long* probs,long long vocab,long long mode,long long total,long long target,
+        long long argmax,long long* token,int* error){
+    if(blockIdx.x||threadIdx.x)return;
+    if(mode==0){*token=argmax;return;}
+    if(total<=0){*token=argmax;return;}
+    if(target<0||target>=total){*error=3;return;}
+    unsigned long long cumulative=0;
+    for(long long i=0;i<vocab;++i){cumulative+=(unsigned long long)probs[i];if(cumulative>(unsigned long long)target){*token=i;return;}}
+    *error=3;
 }
 
 // ---- Qwen3.5 recurrent primitive parity rung -----------------------------------------------------------
@@ -1151,6 +1344,29 @@ __global__ void bonsai35_conv_decode_kernel(
     out[i]=arshift_i64_floor((long long)acc,frac);
     for(long long j=0;j<conv_k-2;++j)hist[j*conv_dim+i]=hist[(j+1)*conv_dim+i];
     hist[(conv_k-2)*conv_dim+i]=qkv[i];
+}
+
+// Exact recurrent convolution + SiLU fusion.  History mutation and the
+// convolution reduction are unchanged; only the otherwise round-tripped
+// convolution result remains in a register for the immediately following
+// SiLU operation.
+__global__ void bonsai35_conv_silu_decode_kernel(
+        const long long* qkv,long long* history,const long long* weight,
+        long long slot,long long conv_dim,long long conv_k,long long frac,
+        long long log2e,long long d_clip,long long* out){
+    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=conv_dim)return;
+    long long* hist=history+(size_t)slot*(conv_k-1)*conv_dim;
+    unsigned long long acc=0;
+    for(long long j=0;j<conv_k-1;++j)
+        acc+=(unsigned long long)hist[j*conv_dim+i]*(unsigned long long)weight[i*conv_k+j];
+    acc+=(unsigned long long)qkv[i]*(unsigned long long)weight[i*conv_k+conv_k-1];
+    const long long xi=arshift_i64_floor((long long)acc,frac);
+    for(long long j=0;j<conv_k-2;++j)hist[j*conv_dim+i]=hist[(j+1)*conv_dim+i];
+    hist[(conv_k-2)*conv_dim+i]=qkv[i];
+    const long long sig=g_sigmoid_fixed(xi,frac,log2e,d_clip);
+    out[i]=arshift_i64_floor(g_u64_to_i64(
+        (unsigned long long)xi*(unsigned long long)sig),frac);
 }
 
 // maxabs over each kv's (L,hd) block of a (Hkv, L, hd) tensor -> maxout[kv]. One thread per kv.
@@ -1687,22 +1903,47 @@ struct Bonsai35LayerDesc {
     long long wqkv,wz,walpha,wbeta,wout,conv,dt_bias,ssm_a,ssm_norm;
     long long wqg,wk,wv,wo,q_norm,k_norm;
 };
+enum Bonsai35ProfileFamily {
+    Q35_PROFILE_H2D=0,
+    Q35_PROFILE_PROJECTION=1,
+    Q35_PROFILE_NORM=2,
+    Q35_PROFILE_RECURRENT=3,
+    Q35_PROFILE_ATTENTION=4,
+    Q35_PROFILE_ELEMENTWISE=5,
+    Q35_PROFILE_D2H=6,
+    Q35_PROFILE_FAMILY_COUNT=7,
+};
+struct Bonsai35ProfileSpan {
+    int family;
+    cudaEvent_t begin;
+    cudaEvent_t end;
+};
 struct Bonsai35Ctx {
     Bonsai35Config c; std::vector<Bonsai35LayerDesc> layers; bool alive,poisoned;
     long long t,nrec,natt,conv_dim,max_k,graph_launches,input_mode;
     long long token_submissions,embedded_submissions,model_input_host_bytes;
+    long long prefill_calls,prefill_tokens,device_only_submissions;
     // Post-layer residual snapshots are a parity/debug facility, not part of
     // production inference.  Keeping this off removes one D2D memcpy graph
     // node for the embedding plus one after every transformer layer.
-    bool capture_trace,group_projections;
+    bool capture_trace,group_projections,profile_collecting;
     long long graph_nodes,graph_kernel_nodes,graph_memcpy_nodes;
     long long graph_memset_nodes,graph_other_nodes;
+    unsigned long long profile_us[Q35_PROFILE_FAMILY_COUNT];
+    unsigned long long profile_calls[Q35_PROFILE_FAMILY_COUNT];
+    unsigned long long profile_tokens;
+    std::vector<Bonsai35ProfileSpan> profile_spans;
     long long *state,*conv_hist;
     int *K,*V;  // guarded Q16 cache: every append proves exact int32 narrowing
     long long *x,*norm,*tmp,*qkv,*z,*alpha,*beta,*conv;
     long long *qn,*kn,*rv,*rout,*rnorm,*zs,*rgated,*ctl_beta,*ctl_decay;
     long long *qg,*aq,*agate,*ak,*av,*aout,*agated,*ffg,*ffu,*ffh,*scores,*digits,*logits,*trace;
     long long *pos,*len,*token; unsigned long long *maxk,*maxv; int *overflow;
+    long long *sample_probs,*sample_sorted,*sample_indices,*sample_history;
+    long long *sample_total,*sample_argmax,*sample_token;int *sample_error;
+    Bonsai35SamplerConfig sample_config;bool sample_prepared;
+    unsigned long long sample_prepare_calls,sample_host_bytes;
+    long long sample_total_host,sample_argmax_host;
     long long *h_x,*h_logits,*h_pos,*h_len,*h_token; int *h_overflow;
     cudaStream_t stream; cudaGraph_t graph; cudaGraphExec_t graph_exec; bool graph_ready;
 };
@@ -1725,6 +1966,54 @@ std::vector<DecodeCtx> g_decode;
 }  // namespace
 
 extern "C" {
+
+BONSAI_GPU_API int bonsai_gpu_abi_version(void) {
+    return BONSAI_GPU_ABI_VERSION;
+}
+
+BONSAI_GPU_API int bonsai_gpu_last_error_code(void) {
+    return g_bonsai_gpu_error_code;
+}
+
+BONSAI_GPU_API const char* bonsai_gpu_last_error(void) {
+    return g_bonsai_gpu_error;
+}
+
+// The manifest is deliberately data, not a C struct: ctypes callers can
+// negotiate new optional surfaces without guessing host-compiler padding.
+// Return the payload length excluding NUL.  A null/zero buffer is a size probe.
+BONSAI_GPU_API size_t bonsai_gpu_abi_manifest(char* dst, size_t capacity) {
+    static const char payload[] =
+        "{\"abi_version\":3,\"minimum_sm\":75,"
+        "\"context\":\"bonsai35/v3\","
+        "\"profile_families\":[\"h2d\",\"projection\",\"norm\",\"recurrent\",\"attention\",\"elementwise\",\"d2h\"],"
+        "\"sampler_modes\":[\"greedy\",\"temp\",\"top_k\",\"top_p\",\"min_p\"],"
+        "\"prefill\":\"native_graph_sequence\",\"batch\":\"multi_context\"}";
+    const size_t length = sizeof(payload) - 1;
+    if (dst && capacity) {
+        const size_t copied = std::min(length, capacity - 1);
+        std::memcpy(dst, payload, copied);
+        dst[copied] = '\0';
+    }
+    return length;
+}
+
+BONSAI_GPU_API int bonsai_gpu_device_probe(int* major, int* minor) {
+    int device = 0;
+    cudaDeviceProp props{};
+    cudaError_t error = cudaGetDevice(&device);
+    if (error == cudaSuccess) error = cudaGetDeviceProperties(&props, device);
+    if (error != cudaSuccess) {
+        return bonsai_gpu_errorf(2, "CUDA device probe failed: %s", cudaGetErrorString(error));
+    }
+    if (props.major * 10 + props.minor < 75) {
+        return bonsai_gpu_errorf(3, "CUDA device sm_%d%d is below required sm_75", props.major, props.minor);
+    }
+    if (major) *major = props.major;
+    if (minor) *minor = props.minor;
+    bonsai_gpu_clear_error();
+    return 0;
+}
 
 // Upload an int64 host array to the device once; return a handle (>=0) or -1. Used for gains/cos/sin in the
 // resident prefill forward. Free via bonsai_q1_free_weights (which also frees these).
@@ -1756,6 +2045,29 @@ int bonsai_gpu_mem_info(unsigned long long* free_bytes, unsigned long long* tota
     *free_bytes = (unsigned long long)f;
     *total_bytes = (unsigned long long)t;
     return 0;
+}
+
+// Focused parity rung for the fused SiLU×gate primitive used by q35 recurrent
+// and FFN blocks.  This ABI is diagnostic only; the resident graph invokes the
+// same kernel directly without host transfers.
+BONSAI_GPU_API int bonsai35_fused_silu_mul_gpu(
+        const long long* gate_host,const long long* up_host,long long n,
+        long long frac,long long* out_host){
+    if(!gate_host||!up_host||!out_host||n<=0||frac<1||frac>29)return 1;
+    long long *gate=nullptr,*up=nullptr,*out=nullptr;bool ok=true;
+    ok=ok&&(cudaMalloc(&gate,(size_t)n*8)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&up,(size_t)n*8)==cudaSuccess);
+    ok=ok&&(cudaMalloc(&out,(size_t)n*8)==cudaSuccess);
+    if(ok)ok=ok&&(cudaMemcpy(gate,gate_host,(size_t)n*8,cudaMemcpyHostToDevice)==cudaSuccess);
+    if(ok)ok=ok&&(cudaMemcpy(up,up_host,(size_t)n*8,cudaMemcpyHostToDevice)==cudaSuccess);
+    const long long LOG2E_Q16=94548,shift=16-frac;
+    const long long log2e=shift>=0?(LOG2E_Q16>>shift):(LOG2E_Q16<<(-shift));
+    const long long dca=((frac+2)<<(2*frac))/log2e,dcb=((long long)1<<62)/log2e;
+    const long long dclip=dca<dcb?dca:dcb;
+    if(ok){silu_mulshift_kernel<<<(unsigned)((n+63)/64),64>>>(gate,up,out,n,frac,log2e,dclip);
+        ok=ok&&(cudaDeviceSynchronize()==cudaSuccess);
+        ok=ok&&(cudaMemcpy(out_host,out,(size_t)n*8,cudaMemcpyDeviceToHost)==cudaSuccess);}
+    cudaFree(gate);cudaFree(up);cudaFree(out);return ok?0:2;
 }
 
 unsigned long long bonsai_q1_resident_weight_bytes(void) {
@@ -2445,6 +2757,38 @@ static inline bool q35_buf_ok(long long h) {
 }
 static inline long long* q35_buf(long long h) { return g_buffers[(size_t)h].ptr; }
 
+static size_t q35_profile_begin(Bonsai35Ctx& c,int family){
+    if(!c.profile_collecting)return (size_t)-1;
+    Bonsai35ProfileSpan span{family,nullptr,nullptr};
+    if(cudaEventCreateWithFlags(&span.begin,cudaEventDefault)!=cudaSuccess||
+       cudaEventCreateWithFlags(&span.end,cudaEventDefault)!=cudaSuccess){
+        if(span.begin)cudaEventDestroy(span.begin);if(span.end)cudaEventDestroy(span.end);
+        return (size_t)-1;
+    }
+    c.profile_spans.push_back(span);
+    cudaEventRecord(c.profile_spans.back().begin,c.stream);
+    return c.profile_spans.size()-1;
+}
+
+static void q35_profile_end(Bonsai35Ctx& c,size_t span){
+    if(span!=(size_t)-1)cudaEventRecord(c.profile_spans[span].end,c.stream);
+}
+
+static bool q35_profile_settle(Bonsai35Ctx& c){
+    bool ok=true;
+    for(auto& span:c.profile_spans){
+        float ms=0.0f;
+        if(cudaEventElapsedTime(&ms,span.begin,span.end)!=cudaSuccess)ok=false;
+        else{
+            const unsigned long long us=(unsigned long long)(ms*1000.0f+0.5f);
+            c.profile_us[span.family]+=us;c.profile_calls[span.family]++;
+        }
+        cudaEventDestroy(span.begin);cudaEventDestroy(span.end);
+    }
+    c.profile_spans.clear();c.profile_collecting=false;
+    return ok;
+}
+
 static void q35_prepare_digits(Bonsai35Ctx& c, const long long* x, long long K) {
     const long long words=(K/128)*32*4;
     q1_bmma_activation_kernel<<<mono_blocks(words),MONO_TPB,0,c.stream>>>(
@@ -2487,20 +2831,25 @@ static void q35_apply_prepared_group4(
         w0.n_blocks,c.c.frac);
 }
 
-static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
+static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input, bool copy_logits=true) {
     const Bonsai35Config& g=c.c; const long long T=MONO_TPB;
     const long long LOG2E_Q16=94548,sh=16-g.frac;
     const long long log2e=sh>=0?(LOG2E_Q16>>sh):(LOG2E_Q16<<(-sh));
     const long long dca=((g.frac+2)<<(2*g.frac))/log2e,dcb=((long long)1<<62)/log2e;
     const long long dclip=dca<dcb?dca:dcb;
     cudaMemsetAsync(c.overflow,0,sizeof(int),c.stream);
+    size_t profile_span=q35_profile_begin(c,Q35_PROFILE_H2D);
     if(token_input){
         const ResidentWeight& embed=g_weights[(size_t)g.embed];
         cudaMemcpyAsync(c.token,c.h_token,8,cudaMemcpyHostToDevice,c.stream);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
         q35_embedding_row_bmma_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(
             embed.dbits,embed.dscale32,embed.out_f,embed.n_blocks,c.token,c.x,c.overflow);
         if(c.capture_trace)
             cudaMemcpyAsync(c.trace,c.x,(size_t)g.d*8,cudaMemcpyDeviceToDevice,c.stream);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_H2D);
     }else{
         cudaMemcpyAsync(c.x,c.h_x,(size_t)g.d*8,cudaMemcpyHostToDevice,c.stream);
         if(c.capture_trace)
@@ -2508,10 +2857,14 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
     }
     cudaMemcpyAsync(c.pos,c.h_pos,8,cudaMemcpyHostToDevice,c.stream);
     cudaMemcpyAsync(c.len,c.h_len,8,cudaMemcpyHostToDevice,c.stream);
+    q35_profile_end(c,profile_span);
     for(long long li=0;li<g.n_layers;++li){
         const Bonsai35LayerDesc& l=c.layers[(size_t)li];
+        profile_span=q35_profile_begin(c,Q35_PROFILE_NORM);
         rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(l.n1),c.norm,c.overflow);
+        q35_profile_end(c,profile_span);
         if(l.kind==0){ // recurrent
+            profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
             q35_prepare_digits(c,c.norm,g.d);
             if(c.group_projections)
                 q35_apply_prepared_group4(c,l.wqkv,c.qkv,l.wz,c.z,l.walpha,c.alpha,l.wbeta,c.beta);
@@ -2519,10 +2872,11 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
                 q35_apply_prepared(c,l.wqkv,c.qkv);q35_apply_prepared(c,l.wz,c.z);
                 q35_apply_prepared(c,l.walpha,c.alpha);q35_apply_prepared(c,l.wbeta,c.beta);
             }
-            bonsai35_conv_decode_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
-                c.qkv,c.conv_hist,q35_buf(l.conv),l.slot,c.conv_dim,g.conv_k,g.frac,c.conv);
-            silu_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
-                c.conv,c.conv,c.conv_dim,g.frac,log2e,dclip);
+            q35_profile_end(c,profile_span);
+            profile_span=q35_profile_begin(c,Q35_PROFILE_RECURRENT);
+            bonsai35_conv_silu_decode_kernel<<<mono_blocks(c.conv_dim),T,0,c.stream>>>(
+                c.qkv,c.conv_hist,q35_buf(l.conv),l.slot,c.conv_dim,g.conv_k,g.frac,
+                log2e,dclip,c.conv);
             const long long key_width=g.key_heads*g.state_size;
             bonsai35_l2norm_kernel<<<mono_blocks(g.key_heads),T,0,c.stream>>>(
                 c.conv,g.key_heads,g.state_size,g.frac,c.qn,c.overflow);
@@ -2541,16 +2895,22 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
             rmsnorm_fast_i32_kernel<<<(unsigned)g.value_heads,256,0,c.stream>>>(
                 c.rout,g.value_heads,g.state_size,g.frac,g.ssm_eps,q35_buf(l.ssm_norm),
                 c.rnorm,c.overflow);
-            silu_kernel<<<mono_blocks(g.inner),T,0,c.stream>>>(c.z,c.zs,g.inner,g.frac,log2e,dclip);
-            mulshift_kernel<<<mono_blocks(g.inner),T,0,c.stream>>>(c.rnorm,c.zs,c.rgated,g.inner,g.frac);
+            silu_mulshift_kernel<<<mono_blocks(g.inner),T,0,c.stream>>>(
+                c.z,c.rnorm,c.rgated,g.inner,g.frac,log2e,dclip);
+            q35_profile_end(c,profile_span);
+            profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
             q35_prepare_digits(c,c.rgated,g.inner);q35_apply_prepared(c,l.wout,c.tmp);
+            q35_profile_end(c,profile_span);
         }else{ // full attention
+            profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
             q35_prepare_digits(c,c.norm,g.d);
             if(c.group_projections)
                 q35_apply_prepared_group4(c,l.wqg,c.qg,l.wk,c.ak,l.wv,c.av,-1,nullptr);
             else{
                 q35_apply_prepared(c,l.wqg,c.qg);q35_apply_prepared(c,l.wk,c.ak);q35_apply_prepared(c,l.wv,c.av);
             }
+            q35_profile_end(c,profile_span);
+            profile_span=q35_profile_begin(c,Q35_PROFILE_ATTENTION);
             bonsai35_split_qgate_kernel<<<mono_blocks(g.H*g.hd),T,0,c.stream>>>(c.qg,c.aq,c.agate,g.H,g.hd);
             rmsnorm_fast_i32_kernel<<<(unsigned)g.H,256,0,c.stream>>>(
                 c.aq,g.H,g.hd,g.frac,g.eps,q35_buf(l.q_norm),c.aq,c.overflow);
@@ -2577,26 +2937,48 @@ static bool q35_enqueue_decode(Bonsai35Ctx& c, bool token_input) {
                 maxKl,maxVl,c.aout,c.scores,c.overflow);
             bonsai35_sigmoid_gate_kernel<<<mono_blocks(g.H*g.hd),T,0,c.stream>>>(
                 c.aout,c.agate,c.agated,g.H*g.hd,g.frac,log2e,dclip);
+            q35_profile_end(c,profile_span);
+            profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
             q35_prepare_digits(c,c.agated,g.H*g.hd);q35_apply_prepared(c,l.wo,c.tmp);
+            q35_profile_end(c,profile_span);
         }
+        profile_span=q35_profile_begin(c,Q35_PROFILE_ELEMENTWISE);
         add_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(c.x,c.tmp,c.x,g.d);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_NORM);
         rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(l.n2),c.norm,c.overflow);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
         q35_prepare_digits(c,c.norm,g.d);
         if(c.group_projections)
             q35_apply_prepared_group4(c,l.w1,c.ffg,l.wu,c.ffu,-1,nullptr,-1,nullptr);
         else{q35_apply_prepared(c,l.w1,c.ffg);q35_apply_prepared(c,l.wu,c.ffu);}
-        silu_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffg,g.dff,g.frac,log2e,dclip);
-        mulshift_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(c.ffg,c.ffu,c.ffh,g.dff,g.frac);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_ELEMENTWISE);
+        silu_mulshift_kernel<<<mono_blocks(g.dff),T,0,c.stream>>>(
+            c.ffg,c.ffu,c.ffh,g.dff,g.frac,log2e,dclip);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
         q35_prepare_digits(c,c.ffh,g.dff);q35_apply_prepared(c,l.w2,c.tmp);
+        q35_profile_end(c,profile_span);
+        profile_span=q35_profile_begin(c,Q35_PROFILE_ELEMENTWISE);
         add_kernel<<<mono_blocks(g.d),T,0,c.stream>>>(c.x,c.tmp,c.x,g.d);
         if(c.capture_trace)
             cudaMemcpyAsync(c.trace+(size_t)(li+1)*g.d,c.x,(size_t)g.d*8,
                             cudaMemcpyDeviceToDevice,c.stream);
+        q35_profile_end(c,profile_span);
     }
+    profile_span=q35_profile_begin(c,Q35_PROFILE_NORM);
     rmsnorm_fast_i32_kernel<<<1,256,0,c.stream>>>(c.x,1,g.d,g.frac,g.eps,q35_buf(g.final_gain),c.norm,c.overflow);
+    q35_profile_end(c,profile_span);
+    profile_span=q35_profile_begin(c,Q35_PROFILE_PROJECTION);
     q35_prepare_digits(c,c.norm,g.d);q35_apply_prepared(c,g.out_head,c.logits);
-    cudaMemcpyAsync(c.h_logits,c.logits,(size_t)g.vocab*8,cudaMemcpyDeviceToHost,c.stream);
+    q35_profile_end(c,profile_span);
+    profile_span=q35_profile_begin(c,Q35_PROFILE_D2H);
+    if(copy_logits)
+        cudaMemcpyAsync(c.h_logits,c.logits,(size_t)g.vocab*8,cudaMemcpyDeviceToHost,c.stream);
     cudaMemcpyAsync(c.h_overflow,c.overflow,sizeof(int),cudaMemcpyDeviceToHost,c.stream);
+    q35_profile_end(c,profile_span);
     return cudaGetLastError()==cudaSuccess;
 }
 
@@ -2636,6 +3018,8 @@ static void q35_measure_graph(Bonsai35Ctx& c){
 }
 
 static void q35_free_ctx(Bonsai35Ctx& c){
+    for(auto& span:c.profile_spans){if(span.begin)cudaEventDestroy(span.begin);if(span.end)cudaEventDestroy(span.end);}
+    c.profile_spans.clear();
     if(c.graph_exec)cudaGraphExecDestroy(c.graph_exec);if(c.graph)cudaGraphDestroy(c.graph);
     if(c.stream)cudaStreamDestroy(c.stream);
     #define F(P) do{if(c.P)cudaFree(c.P);c.P=nullptr;}while(0)
@@ -2643,6 +3027,8 @@ static void q35_free_ctx(Bonsai35Ctx& c){
     F(qn);F(kn);F(rv);F(rout);F(rnorm);F(zs);F(rgated);F(ctl_beta);F(ctl_decay);F(qg);F(aq);F(agate);
     F(ak);F(av);F(aout);F(agated);F(ffg);F(ffu);F(ffh);F(scores);F(digits);F(logits);F(pos);F(len);F(token);
     F(maxk);F(maxv);F(overflow);F(trace);
+    F(sample_probs);F(sample_sorted);F(sample_indices);F(sample_history);F(sample_total);F(sample_argmax);
+    F(sample_token);F(sample_error);
     #undef F
     if(c.h_x)cudaFreeHost(c.h_x);if(c.h_logits)cudaFreeHost(c.h_logits);if(c.h_pos)cudaFreeHost(c.h_pos);
     if(c.h_len)cudaFreeHost(c.h_len);if(c.h_token)cudaFreeHost(c.h_token);if(c.h_overflow)cudaFreeHost(c.h_overflow);
@@ -2653,22 +3039,23 @@ static void q35_free_ctx(Bonsai35Ctx& c){
 // generic allocation lambda, despite the surrounding extern "C" block.  The
 // ctypes ABI then disappears from .dynsym even though the build succeeds.
 // Keep the entry point externally visible across supported nvcc host compilers.
-#if defined(__clang__)
-__attribute__((visibility("default"), used))
-#elif defined(__GNUC__)
-__attribute__((visibility("default"), used, externally_visible))
-#endif
-long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc* layers){
+BONSAI_GPU_API long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc* layers){
     if(!cfg||!layers||cfg->n_layers<=0||cfg->d<=0||cfg->dff<=0||cfg->H<=0||cfg->Hkv<=0||
        cfg->H%cfg->Hkv||cfg->hd<=0||cfg->cap<=0||cfg->state_size<=0||cfg->state_size>128||
-       cfg->conv_k<2||cfg->inner!=cfg->value_heads*cfg->state_size)return -1;
+       cfg->conv_k<2||cfg->inner!=cfg->value_heads*cfg->state_size){
+        bonsai_gpu_errorf(1,"context create: invalid q35 dimensions/configuration");return -1;
+    }
     Bonsai35Ctx c{};c.c=*cfg;c.alive=false;c.poisoned=false;c.t=0;c.graph_launches=0;c.graph_ready=false;
-    c.capture_trace=false;c.group_projections=true;
+    c.capture_trace=false;c.group_projections=true;c.profile_collecting=false;c.profile_tokens=0;c.sample_prepared=false;
+    c.sample_prepare_calls=0;c.sample_host_bytes=0;c.sample_total_host=0;c.sample_argmax_host=0;
+    for(int i=0;i<Q35_PROFILE_FAMILY_COUNT;++i){c.profile_us[i]=0;c.profile_calls[i]=0;}
     c.graph_nodes=c.graph_kernel_nodes=c.graph_memcpy_nodes=0;
     c.graph_memset_nodes=c.graph_other_nodes=0;
     c.input_mode=0;c.token_submissions=0;c.embedded_submissions=0;c.model_input_host_bytes=0;
+    c.prefill_calls=0;c.prefill_tokens=0;c.device_only_submissions=0;
     c.layers.assign(layers,layers+cfg->n_layers);c.nrec=0;c.natt=0;
-    for(const auto& l:c.layers){if(l.kind==0)c.nrec++;else if(l.kind==1)c.natt++;else return -1;}
+    for(const auto& l:c.layers){if(l.kind==0)c.nrec++;else if(l.kind==1)c.natt++;else{
+        bonsai_gpu_errorf(1,"context create: layer kind must be recurrent or attention");return -1;}}
     c.conv_dim=2*cfg->key_heads*cfg->state_size+cfg->inner;c.max_k=cfg->d;
     if(cfg->dff>c.max_k)c.max_k=cfg->dff;if(cfg->inner>c.max_k)c.max_k=cfg->inner;
     auto vw=[](long long h){return q35_weight_ok(h)&&g_weights[(size_t)h].scale_bits==32&&g_weights[(size_t)h].layout==2;};
@@ -2678,17 +3065,21 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
     auto vb=[](long long h){return q35_buf_ok(h);};
     if(!ww(cfg->embed,cfg->vocab,cfg->d)||!ww(cfg->out_head,cfg->vocab,cfg->d)||
        !vb(cfg->final_gain)||!vb(cfg->cos_buf)||!vb(cfg->sin_buf)||
-       !vb(cfg->soft_buf)||!vb(cfg->exp_buf))return -1;
+       !vb(cfg->soft_buf)||!vb(cfg->exp_buf)){
+        bonsai_gpu_errorf(1,"context create: top-level resident handles/shapes are stale");return -1;}
     for(const auto& l:c.layers){
         if(!vb(l.n1)||!vb(l.n2)||!ww(l.w1,cfg->dff,cfg->d)||
-           !ww(l.wu,cfg->dff,cfg->d)||!ww(l.w2,cfg->d,cfg->dff))return -1;
+           !ww(l.wu,cfg->dff,cfg->d)||!ww(l.w2,cfg->d,cfg->dff)){
+            bonsai_gpu_errorf(1,"context create: common layer handles/shapes are stale");return -1;}
         if(l.kind==0&&(!ww(l.wqkv,c.conv_dim,cfg->d)||!ww(l.wz,cfg->inner,cfg->d)||
            !ww(l.walpha,cfg->value_heads,cfg->d)||!ww(l.wbeta,cfg->value_heads,cfg->d)||
            !ww(l.wout,cfg->d,cfg->inner)||
-           !vb(l.conv)||!vb(l.dt_bias)||!vb(l.ssm_a)||!vb(l.ssm_norm)))return -1;
+           !vb(l.conv)||!vb(l.dt_bias)||!vb(l.ssm_a)||!vb(l.ssm_norm))){
+            bonsai_gpu_errorf(1,"context create: recurrent layer handles/shapes are stale");return -1;}
         if(l.kind==1&&(!ww(l.wqg,2*cfg->H*cfg->hd,cfg->d)||
            !ww(l.wk,cfg->Hkv*cfg->hd,cfg->d)||!ww(l.wv,cfg->Hkv*cfg->hd,cfg->d)||
-           !ww(l.wo,cfg->d,cfg->H*cfg->hd)||!vb(l.q_norm)||!vb(l.k_norm)))return -1;
+           !ww(l.wo,cfg->d,cfg->H*cfg->hd)||!vb(l.q_norm)||!vb(l.k_norm))){
+            bonsai_gpu_errorf(1,"context create: attention layer handles/shapes are stale");return -1;}
     }
     bool ok=true;auto cm=[&](auto** p,size_t n){if(ok)ok=(cudaMalloc((void**)p,n)==cudaSuccess);};
     const size_t S=(size_t)c.nrec*cfg->value_heads*cfg->state_size*cfg->state_size;
@@ -2708,6 +3099,9 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
     cm(&c.digits,(size_t)(c.max_k/128)*4*128);cm(&c.logits,(size_t)cfg->vocab*8);
     cm(&c.pos,8);cm(&c.len,8);cm(&c.token,8);
     cm(&c.maxk,(size_t)c.natt*cfg->Hkv*8);cm(&c.maxv,(size_t)c.natt*cfg->Hkv*8);cm(&c.overflow,sizeof(int));
+    cm(&c.sample_probs,(size_t)cfg->vocab*8);cm(&c.sample_sorted,(size_t)cfg->vocab*8);
+    cm(&c.sample_indices,(size_t)cfg->vocab*8);cm(&c.sample_history,(size_t)cfg->cap*8);
+    cm(&c.sample_total,8);cm(&c.sample_argmax,8);cm(&c.sample_token,8);cm(&c.sample_error,sizeof(int));
     if(ok)ok=(cudaHostAlloc(&c.h_x,(size_t)cfg->d*8,cudaHostAllocPortable)==cudaSuccess);
     if(ok)ok=(cudaHostAlloc(&c.h_logits,(size_t)cfg->vocab*8,cudaHostAllocPortable)==cudaSuccess);
     if(ok)ok=(cudaHostAlloc(&c.h_pos,8,cudaHostAllocPortable)==cudaSuccess);
@@ -2717,8 +3111,9 @@ long long bonsai35_ctx_create(const Bonsai35Config* cfg,const Bonsai35LayerDesc*
     if(ok)ok=(cudaStreamCreateWithFlags(&c.stream,cudaStreamNonBlocking)==cudaSuccess);
     if(ok){cudaMemset(c.state,0,S*8);cudaMemset(c.conv_hist,0,CH*8);cudaMemset(c.K,0,KV*4);cudaMemset(c.V,0,KV*4);
         cudaMemset(c.maxk,0,(size_t)c.natt*cfg->Hkv*8);cudaMemset(c.maxv,0,(size_t)c.natt*cfg->Hkv*8);}
-    if(!ok){q35_free_ctx(c);cudaGetLastError();return -1;}
-    c.alive=true;g_bonsai35.push_back(std::move(c));return (long long)g_bonsai35.size()-1;
+    if(!ok){const cudaError_t error=cudaGetLastError();q35_free_ctx(c);
+        bonsai_gpu_errorf(2,"context create allocation failed: %s",cudaGetErrorString(error));return -1;}
+    c.alive=true;g_bonsai35.push_back(std::move(c));bonsai_gpu_clear_error();return (long long)g_bonsai35.size()-1;
 }
 
 // Trace mode must be selected before the first decode captures the graph.  It
@@ -2750,23 +3145,63 @@ int bonsai35_ctx_set_projection_grouping(long long handle,int enabled){
     c.group_projections=enabled!=0;return 0;
 }
 
+// Opt-in diagnostic execution before graph capture.  It runs the exact same
+// enqueue routine on the context stream, brackets contiguous kernel families
+// with CUDA events, and accumulates integer microseconds/call counts.  Normal
+// graph decode contains no timing nodes and therefore pays no profiling cost.
+BONSAI_GPU_API int bonsai35_profile_decode_token(
+        long long handle,long long token,long long pos,long long* logits_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!logits_host)
+        return bonsai_gpu_errorf(1,"profile decode: invalid context/output");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.poisoned||c.graph_ready||pos!=c.t||pos>=c.c.cap||token<0||token>=c.c.vocab)
+        return bonsai_gpu_errorf(1,"profile decode: context must be live, uncaptured, and position-aligned");
+    *c.h_token=token;*c.h_pos=pos;*c.h_len=pos+1;*c.h_overflow=0;c.profile_collecting=true;
+    const bool enqueued=q35_enqueue_decode(c,true);
+    const cudaError_t sync_error=enqueued?cudaStreamSynchronize(c.stream):cudaGetLastError();
+    const bool settled=q35_profile_settle(c);
+    if(!enqueued||sync_error!=cudaSuccess||!settled)
+        return bonsai_gpu_errorf(2,"profile decode CUDA failure: %s",cudaGetErrorString(sync_error));
+    c.profile_tokens++;c.token_submissions++;c.model_input_host_bytes+=8;
+    if(*c.h_overflow){c.poisoned=true;return bonsai_gpu_errorf(4,"profile decode arithmetic guard poisoned context");}
+    std::memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);c.t++;bonsai_gpu_clear_error();return 0;
+}
+
+BONSAI_GPU_API int bonsai35_ctx_profile_stats(
+        long long handle,int reset,unsigned long long* microseconds,
+        unsigned long long* calls,long long family_count,unsigned long long* profiled_tokens){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||family_count<Q35_PROFILE_FAMILY_COUNT)
+        return bonsai_gpu_errorf(1,"profile stats: invalid context or family_count < 7");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive)return bonsai_gpu_errorf(1,"profile stats: dead context");
+    for(int i=0;i<Q35_PROFILE_FAMILY_COUNT;++i){
+        if(microseconds)microseconds[i]=c.profile_us[i];if(calls)calls[i]=c.profile_calls[i];
+    }
+    if(profiled_tokens)*profiled_tokens=c.profile_tokens;
+    if(reset){
+        for(int i=0;i<Q35_PROFILE_FAMILY_COUNT;++i){c.profile_us[i]=0;c.profile_calls[i]=0;}
+        c.profile_tokens=0;
+    }
+    bonsai_gpu_clear_error();return 0;
+}
+
 int bonsai35_decode_step(long long handle,const long long* x_host,long long pos,long long* logits_host){
-    if(handle<0||(size_t)handle>=g_bonsai35.size()||!x_host||!logits_host)return 1;
-    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap)return 1;
-    if(c.graph_ready&&c.input_mode!=1)return 3;
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!x_host||!logits_host)return bonsai_gpu_errorf(1,"embedded decode: invalid context/input/output");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap)return bonsai_gpu_errorf(1,"embedded decode: dead/poisoned or position mismatch");
+    if(c.graph_ready&&c.input_mode!=1)return bonsai_gpu_errorf(3,"embedded decode: context graph uses another input mode");
     memcpy(c.h_x,x_host,(size_t)c.c.d*8);*c.h_pos=pos;*c.h_len=pos+1;*c.h_overflow=0;
     if(!c.graph_ready){
-        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return 2;
+        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return bonsai_gpu_errorf(2,"embedded decode: graph capture begin failed");
         bool ok=q35_enqueue_decode(c,false);
-        if(!ok||cudaStreamEndCapture(c.stream,&c.graph)!=cudaSuccess)return 2;
+        const cudaError_t end_error=cudaStreamEndCapture(c.stream,&c.graph);
+        if(!ok||end_error!=cudaSuccess)return bonsai_gpu_errorf(2,"embedded decode: graph capture failed");
         q35_measure_graph(c);
-        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return 2;
+        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return bonsai_gpu_errorf(2,"embedded decode: graph instantiate failed");
         c.graph_ready=true;c.input_mode=1;
     }
-    if(cudaGraphLaunch(c.graph_exec,c.stream)!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)return 2;
+    if(cudaGraphLaunch(c.graph_exec,c.stream)!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)return bonsai_gpu_errorf(2,"embedded decode: graph launch/sync failed");
     c.graph_launches++;c.embedded_submissions++;c.model_input_host_bytes+=(long long)c.c.d*8;
-    if(*c.h_overflow){c.poisoned=true;return 4;}
-    memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);c.t++;return 0;
+    if(*c.h_overflow){c.poisoned=true;return bonsai_gpu_errorf(4,"embedded decode arithmetic guard poisoned context");}
+    memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);c.t++;bonsai_gpu_clear_error();return 0;
 }
 
 // Production resident decode.  The captured graph transfers one token ID and
@@ -2774,23 +3209,204 @@ int bonsai35_decode_step(long long handle,const long long* x_host,long long pos,
 // host activation crosses PCIe.  A context is deliberately locked to the
 // input mode of its first capture so only one large CUDA graph is resident.
 int bonsai35_decode_token(long long handle,long long token,long long pos,long long* logits_host){
-    if(handle<0||(size_t)handle>=g_bonsai35.size()||!logits_host)return 1;
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!logits_host)return bonsai_gpu_errorf(1,"token decode: invalid context/output");
     Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
-    if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap||token<0||token>=c.c.vocab)return 1;
-    if(c.graph_ready&&c.input_mode!=2)return 3;
+    if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap||token<0||token>=c.c.vocab)return bonsai_gpu_errorf(1,"token decode: dead/poisoned, invalid token, or position mismatch");
+    if(c.graph_ready&&c.input_mode!=2&&c.input_mode!=3)return bonsai_gpu_errorf(3,"token decode: context graph uses embedded input");
     *c.h_token=token;*c.h_pos=pos;*c.h_len=pos+1;*c.h_overflow=0;
     if(!c.graph_ready){
-        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return 2;
+        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)return bonsai_gpu_errorf(2,"token decode: graph capture begin failed");
         bool ok=q35_enqueue_decode(c,true);
-        if(!ok||cudaStreamEndCapture(c.stream,&c.graph)!=cudaSuccess)return 2;
+        const cudaError_t end_error=cudaStreamEndCapture(c.stream,&c.graph);
+        if(!ok||end_error!=cudaSuccess)return bonsai_gpu_errorf(2,"token decode: graph capture failed");
         q35_measure_graph(c);
-        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return 2;
+        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)return bonsai_gpu_errorf(2,"token decode: graph instantiate failed");
         c.graph_ready=true;c.input_mode=2;
     }
-    if(cudaGraphLaunch(c.graph_exec,c.stream)!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)return 2;
+    if(cudaGraphLaunch(c.graph_exec,c.stream)!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)return bonsai_gpu_errorf(2,"token decode: graph launch/sync failed");
     c.graph_launches++;c.token_submissions++;c.model_input_host_bytes+=8;
-    if(*c.h_overflow){c.poisoned=true;return 4;}
-    memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);c.t++;return 0;
+    if(*c.h_overflow){c.poisoned=true;return bonsai_gpu_errorf(4,"token decode arithmetic guard poisoned context");}
+    if(c.input_mode==3){
+        if(cudaMemcpy(logits_host,c.logits,(size_t)c.c.vocab*8,cudaMemcpyDeviceToHost)!=cudaSuccess)return bonsai_gpu_errorf(2,"token decode: logits D2H failed");
+    }else std::memcpy(logits_host,c.h_logits,(size_t)c.c.vocab*8);
+    c.t++;bonsai_gpu_clear_error();return 0;
+}
+
+// Multi-context aggregate-throughput surface.  Independent context streams
+// launch before any synchronize, allowing CUDA to overlap requests.  Output
+// publication is atomic at the batch boundary: no caller row is written until
+// every launch, arithmetic guard, and synchronization succeeds.
+BONSAI_GPU_API int bonsai35_decode_batch(
+        const long long* handles,const long long* tokens,const long long* positions,
+        long long count,long long* logits_host,long long row_stride,
+        unsigned long long* wall_microseconds){
+    if(!handles||!tokens||!positions||!logits_host||count<=0||count>1024)
+        return bonsai_gpu_errorf(1,"batch decode: invalid buffers/count");
+    std::vector<Bonsai35Ctx*> contexts;
+    try{contexts.reserve((size_t)count);}catch(...){return bonsai_gpu_errorf(2,"batch decode: host allocation failed");}
+    for(long long i=0;i<count;++i){
+        if(handles[i]<0||(size_t)handles[i]>=g_bonsai35.size())return bonsai_gpu_errorf(1,"batch decode: invalid handle %lld",i);
+        for(long long j=0;j<i;++j)if(handles[j]==handles[i])return bonsai_gpu_errorf(1,"batch decode: duplicate context handle");
+        Bonsai35Ctx& c=g_bonsai35[(size_t)handles[i]];
+        if(!c.alive||c.poisoned||positions[i]!=c.t||positions[i]>=c.c.cap||
+           tokens[i]<0||tokens[i]>=c.c.vocab||row_stride<c.c.vocab||
+           (c.graph_ready&&c.input_mode!=2))
+            return bonsai_gpu_errorf(1,"batch decode: context %lld is not ready/position-aligned",i);
+        contexts.push_back(&c);
+    }
+    for(long long i=0;i<count;++i){
+        Bonsai35Ctx& c=*contexts[(size_t)i];
+        *c.h_token=tokens[i];*c.h_pos=positions[i];*c.h_len=positions[i]+1;*c.h_overflow=0;
+        if(!c.graph_ready){
+            bool captured=cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)==cudaSuccess;
+            if(captured){const bool enqueued=q35_enqueue_decode(c,true);
+                captured=cudaStreamEndCapture(c.stream,&c.graph)==cudaSuccess&&enqueued;}
+            if(captured)q35_measure_graph(c);
+            if(!captured||cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess){
+                for(auto* context:contexts)context->poisoned=true;
+                return bonsai_gpu_errorf(2,"batch decode: graph capture/instantiate failed");
+            }
+            c.graph_ready=true;c.input_mode=2;
+        }
+    }
+    const auto start=std::chrono::steady_clock::now();bool ok=true;
+    for(auto* c:contexts)ok=ok&&(cudaGraphLaunch(c->graph_exec,c->stream)==cudaSuccess);
+    for(auto* c:contexts)ok=ok&&(cudaStreamSynchronize(c->stream)==cudaSuccess)&&!*c->h_overflow;
+    if(!ok){for(auto* c:contexts)c->poisoned=true;return bonsai_gpu_errorf(4,"batch decode failed atomically; contexts poisoned");}
+    for(long long i=0;i<count;++i){
+        Bonsai35Ctx& c=*contexts[(size_t)i];long long* destination=logits_host+(size_t)i*row_stride;
+        std::memcpy(destination,c.h_logits,(size_t)c.c.vocab*8);
+    }
+    const auto stop=std::chrono::steady_clock::now();
+    if(wall_microseconds)*wall_microseconds=(unsigned long long)
+        std::chrono::duration_cast<std::chrono::microseconds>(stop-start).count();
+    for(auto* c:contexts){c->graph_launches++;c->token_submissions++;c->model_input_host_bytes+=8;c->t++;}
+    bonsai_gpu_clear_error();return 0;
+}
+
+// Decode while retaining logits on device for the exact sampler ABI below.
+// The captured graph transfers only token/position/overflow; callers opt into
+// this mode explicitly and receive no partially copied logits row.
+BONSAI_GPU_API int bonsai35_decode_token_device(long long handle,long long token,long long pos){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())
+        return bonsai_gpu_errorf(1,"device decode: invalid context");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.poisoned||pos!=c.t||pos>=c.c.cap||token<0||token>=c.c.vocab)
+        return bonsai_gpu_errorf(1,"device decode: invalid token, position, or context state");
+    if(c.graph_ready&&c.input_mode!=3)
+        return bonsai_gpu_errorf(3,"device decode: context graph was captured for host logits");
+    *c.h_token=token;*c.h_pos=pos;*c.h_len=pos+1;*c.h_overflow=0;
+    if(!c.graph_ready){
+        if(cudaStreamBeginCapture(c.stream,cudaStreamCaptureModeGlobal)!=cudaSuccess)
+            return bonsai_gpu_errorf(2,"device decode: cannot begin CUDA graph capture");
+        const bool ok=q35_enqueue_decode(c,true,false);
+        const cudaError_t end_error=cudaStreamEndCapture(c.stream,&c.graph);
+        if(!ok||end_error!=cudaSuccess)
+            return bonsai_gpu_errorf(2,"device decode: CUDA graph capture failed");
+        q35_measure_graph(c);
+        if(cudaGraphInstantiate(&c.graph_exec,c.graph,nullptr,nullptr,0)!=cudaSuccess)
+            return bonsai_gpu_errorf(2,"device decode: CUDA graph instantiation failed");
+        c.graph_ready=true;c.input_mode=3;
+    }
+    const cudaError_t error=cudaGraphLaunch(c.graph_exec,c.stream);
+    if(error!=cudaSuccess||cudaStreamSynchronize(c.stream)!=cudaSuccess)
+        return bonsai_gpu_errorf(2,"device decode CUDA failure: %s",cudaGetErrorString(error));
+    c.graph_launches++;c.token_submissions++;c.device_only_submissions++;c.model_input_host_bytes+=8;
+    if(*c.h_overflow){c.poisoned=true;return bonsai_gpu_errorf(4,"device decode arithmetic guard poisoned context");}
+    c.t++;bonsai_gpu_clear_error();return 0;
+}
+
+// Exact prompt submission through the device-logits graph.  This removes the
+// Python token loop and all intermediate vocabulary D2H copies.  Hybrid
+// recurrence still requires ordered token graph replays; metadata exposes
+// that this is a native graph sequence rather than claiming layer-major math.
+BONSAI_GPU_API int bonsai35_prefill_tokens(
+        long long handle,const long long* tokens,long long count,long long start,long long* logits_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!tokens||count<=0)
+        return bonsai_gpu_errorf(1,"prefill: invalid context, token buffer, or count");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||c.poisoned||start!=c.t||count>c.c.cap-start)
+        return bonsai_gpu_errorf(1,"prefill: context is not position-aligned or prompt exceeds capacity");
+    for(long long i=0;i<count;++i)if(tokens[i]<0||tokens[i]>=c.c.vocab)
+        return bonsai_gpu_errorf(1,"prefill: token %lld is outside vocabulary",i);
+    for(long long i=0;i<count;++i){
+        const int rc=bonsai35_decode_token_device(handle,tokens[i],start+i);
+        if(rc!=0)return rc;
+    }
+    if(logits_host&&cudaMemcpy(logits_host,c.logits,(size_t)c.c.vocab*8,cudaMemcpyDeviceToHost)!=cudaSuccess)
+        return bonsai_gpu_errorf(2,"prefill: final logits D2H failed");
+    c.prefill_calls++;c.prefill_tokens+=(unsigned long long)count;
+    bonsai_gpu_clear_error();return 0;
+}
+
+BONSAI_GPU_API int bonsai35_sample_prepare(
+        long long handle,const Bonsai35SamplerConfig* config,
+        const long long* history,long long history_count,
+        long long* total_host,long long* argmax_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!config||!total_host||!argmax_host)
+        return bonsai_gpu_errorf(1,"sample prepare: invalid context/config/output");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];const Bonsai35SamplerConfig cfg=*config;
+    const long long fp=(cfg.frac>=1&&cfg.frac<=29)?(1LL<<cfg.frac):0;
+    if(!c.alive||c.poisoned||c.t<=0||cfg.frac!=c.c.frac||cfg.mode<0||cfg.mode>4||
+       cfg.inv_temp<=0||cfg.top_k<0||cfg.top_p<=0||cfg.top_p>fp||cfg.min_p<0||cfg.min_p>fp||
+       cfg.rep_penalty<0||cfg.no_repeat_ngram<0||history_count<0||history_count>c.c.cap||
+       (history_count&& !history))
+        return bonsai_gpu_errorf(1,"sample prepare: invalid sampler envelope/history");
+    for(long long i=0;i<history_count;++i)if(history[i]<0||history[i]>=c.c.vocab)
+        return bonsai_gpu_errorf(1,"sample prepare: history token %lld is outside vocabulary",i);
+    cudaMemsetAsync(c.sample_error,0,sizeof(int),c.stream);
+    if(history_count)cudaMemcpyAsync(c.sample_history,history,(size_t)history_count*8,
+                                     cudaMemcpyHostToDevice,c.stream);
+    q35_sampler_prepare_kernel<<<1,1,0,c.stream>>>(
+        c.logits,c.c.vocab,c.sample_history,history_count,cfg,c.sample_probs,
+        c.sample_total,c.sample_argmax,c.sample_error);
+    int host_error=0;
+    if(cudaStreamSynchronize(c.stream)!=cudaSuccess||
+       cudaMemcpy(&host_error,c.sample_error,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess)
+        return bonsai_gpu_errorf(2,"sample prepare: CUDA probability pass failed");
+    if(host_error)return bonsai_gpu_errorf(4,"sample prepare: exact sampler guard %d",host_error);
+    if((cfg.mode==2||cfg.mode==3)&&(cfg.top_k>0||cfg.top_p<fp)){
+        cudaMemcpyAsync(c.sample_sorted,c.sample_probs,(size_t)c.c.vocab*8,
+                        cudaMemcpyDeviceToDevice,c.stream);
+        thrust::device_ptr<long long> keys(c.sample_sorted),indices(c.sample_indices);
+        try{
+            thrust::sequence(thrust::cuda::par.on(c.stream),indices,indices+c.c.vocab,0LL);
+            // Ascending stable sort followed by reverse traversal reproduces
+            // np.argsort(kind="stable")[::-1], including high-token-id ties.
+            thrust::stable_sort_by_key(
+                thrust::cuda::par.on(c.stream),keys,keys+c.c.vocab,indices);
+        }catch(...){return bonsai_gpu_errorf(2,"sample prepare: stable device sort failed");}
+        q35_sampler_truncate_sorted_kernel<<<1,1,0,c.stream>>>(
+            c.sample_probs,c.sample_sorted,c.sample_indices,c.c.vocab,cfg,c.sample_total);
+        if(cudaStreamSynchronize(c.stream)!=cudaSuccess)
+            return bonsai_gpu_errorf(2,"sample prepare: truncation failed");
+    }
+    if(cudaMemcpy(total_host,c.sample_total,8,cudaMemcpyDeviceToHost)!=cudaSuccess||
+       cudaMemcpy(argmax_host,c.sample_argmax,8,cudaMemcpyDeviceToHost)!=cudaSuccess)
+        return bonsai_gpu_errorf(2,"sample prepare: scalar D2H failed");
+    c.sample_total_host=*total_host;c.sample_argmax_host=*argmax_host;
+    c.sample_config=cfg;c.sample_prepared=true;c.sample_prepare_calls++;
+    c.sample_host_bytes+=(unsigned long long)history_count*8+20;
+    bonsai_gpu_clear_error();return 0;
+}
+
+BONSAI_GPU_API int bonsai35_sample_select(
+        long long handle,long long target,long long* token_host){
+    if(handle<0||(size_t)handle>=g_bonsai35.size()||!token_host)
+        return bonsai_gpu_errorf(1,"sample select: invalid context/output");
+    Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
+    if(!c.alive||!c.sample_prepared)return bonsai_gpu_errorf(1,"sample select: no prepared distribution");
+    const long long total=c.sample_total_host,argmax=c.sample_argmax_host;int host_error=0;
+    cudaMemsetAsync(c.sample_error,0,sizeof(int),c.stream);
+    q35_sampler_select_kernel<<<1,1,0,c.stream>>>(
+        c.sample_probs,c.c.vocab,c.sample_config.mode,total,target,argmax,
+        c.sample_token,c.sample_error);
+    if(cudaStreamSynchronize(c.stream)!=cudaSuccess||
+       cudaMemcpy(&host_error,c.sample_error,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess||
+       cudaMemcpy(token_host,c.sample_token,8,cudaMemcpyDeviceToHost)!=cudaSuccess)
+        return bonsai_gpu_errorf(2,"sample select: CUDA selection failed");
+    if(host_error)return bonsai_gpu_errorf(1,"sample select: target is outside prepared distribution");
+    c.sample_prepared=false;c.sample_host_bytes+=12;bonsai_gpu_clear_error();return 0;
 }
 
 int bonsai35_ctx_reset(long long handle){
@@ -2800,7 +3416,7 @@ int bonsai35_ctx_reset(long long handle){
     cudaMemset(c.conv_hist,0,(size_t)c.nrec*(g.conv_k-1)*c.conv_dim*8);
     cudaMemset(c.K,0,(size_t)c.natt*g.Hkv*g.cap*g.hd*4);cudaMemset(c.V,0,(size_t)c.natt*g.Hkv*g.cap*g.hd*4);
     cudaMemset(c.maxk,0,(size_t)c.natt*g.Hkv*8);cudaMemset(c.maxv,0,(size_t)c.natt*g.Hkv*8);
-    c.t=0;c.poisoned=false;return cudaDeviceSynchronize()==cudaSuccess?0:2;
+    c.t=0;c.poisoned=false;c.sample_prepared=false;return cudaDeviceSynchronize()==cudaSuccess?0:2;
 }
 void bonsai35_ctx_free(long long handle){
     if(handle<0||(size_t)handle>=g_bonsai35.size())return;Bonsai35Ctx& c=g_bonsai35[(size_t)handle];
@@ -2847,6 +3463,26 @@ int bonsai35_ctx_input_stats(long long handle,long long* input_mode,long long* t
     if(token_submissions)*token_submissions=c.token_submissions;
     if(embedded_submissions)*embedded_submissions=c.embedded_submissions;
     if(model_input_host_bytes)*model_input_host_bytes=c.model_input_host_bytes;return 0;
+}
+
+BONSAI_GPU_API int bonsai35_ctx_execution_stats(
+        long long handle,unsigned long long* prefill_calls,unsigned long long* prefill_tokens,
+        unsigned long long* device_only_submissions){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;
+    const Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive)return 1;
+    if(prefill_calls)*prefill_calls=(unsigned long long)c.prefill_calls;
+    if(prefill_tokens)*prefill_tokens=(unsigned long long)c.prefill_tokens;
+    if(device_only_submissions)*device_only_submissions=(unsigned long long)c.device_only_submissions;
+    return 0;
+}
+
+BONSAI_GPU_API int bonsai35_ctx_sampler_stats(
+        long long handle,unsigned long long* prepare_calls,unsigned long long* host_bytes){
+    if(handle<0||(size_t)handle>=g_bonsai35.size())return 1;
+    const Bonsai35Ctx& c=g_bonsai35[(size_t)handle];if(!c.alive)return 1;
+    if(prepare_calls)*prepare_calls=c.sample_prepare_calls;
+    if(host_bytes)*host_bytes=c.sample_host_bytes;
+    return 0;
 }
 
 int bonsai35_ctx_graph_stats(long long handle,long long* total_nodes,long long* kernel_nodes,
@@ -3066,7 +3702,6 @@ int bonsai_prefill_forward_gpu(
         long long* out_logits, long long* out_k, long long* out_v) {   // out_k/out_v nullable: (n_layers,Hkv,T,hd) KV export
     if (!x_embed || !out_logits || T <= 0 || d <= 0 || n_layers <= 0 || H <= 0 || Hkv <= 0 || hd <= 0 ||
         dff <= 0 || H % Hkv != 0 || frac < 1 || frac > 29) return 1;
-    const long long rep = H / Hkv;
     // host-side softmax scalars (no on-device sqrt)
     const long long LOG2E_Q16 = 94548;
     long long shift = 16 - frac;

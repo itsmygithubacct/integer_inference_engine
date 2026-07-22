@@ -321,6 +321,8 @@ def _verify_onchain(loaded: dict, network: str) -> dict:
 
 def _verify_reexec(loaded: dict, model, model_digest: str | None,
                    model_pubkey: str | None = None, counterparty_pubkey: str | None = None,
+                   model_pin_source: str | None = None,
+                   counterparty_pin_source: str | None = None,
                    sample_k: int = 0, sample_seed: int = 0) -> dict:
     """Bit-exact re-execution layer — defers to receipts.verify_receipt (needs the model artifact).
 
@@ -333,6 +335,19 @@ def _verify_reexec(loaded: dict, model, model_digest: str | None,
     pass `model_pubkey`/`counterparty_pubkey` to PIN the expected signer identity (#11).
     """
     from ..receipts.verify import verify_receipt
+    if model_pin_source is None and model_pubkey is not None:
+        model_pin_source = "caller"
+    if counterparty_pin_source is None and counterparty_pubkey is not None:
+        counterparty_pin_source = "caller"
+    allowed_pin_sources = {None, "caller", "bundle-identity"}
+    if model_pin_source not in allowed_pin_sources or counterparty_pin_source not in allowed_pin_sources:
+        raise ValueError("unsupported signature pin source")
+    if (model_pubkey is None) != (model_pin_source is None):
+        raise ValueError("model signature pin and pin source must either both be present or both be absent")
+    if (counterparty_pubkey is None) != (counterparty_pin_source is None):
+        raise ValueError(
+            "counterparty signature pin and pin source must either both be present or both be absent"
+        )
     bundle = {"receipt": loaded["obj"]["receipt.json"], "preimage": loaded["obj"]["preimage.json"]}
     res = verify_receipt(bundle, model=model, model_digest=model_digest,
                          model_pubkey=model_pubkey, counterparty_pubkey=counterparty_pubkey,
@@ -353,15 +368,69 @@ def _verify_reexec(loaded: dict, model, model_digest: str | None,
                    if model_digest is not None else "no model_digest supplied (binding not provable)"},
     ]
     if sig_ok is not None:
-        pinned = model_pubkey is not None or counterparty_pubkey is not None
+        sources = [source for source in (model_pin_source, counterparty_pin_source) if source]
         checks.append({"check": "signatureOk", "ok": bool(sig_ok),
-                       "detail": "pinned to expected identity" if pinned
+                       "detail": f"bound to expected identity via {','.join(sources)}" if sources
                        else "valid for the receipt's embedded public key (identity NOT pinned)"})
+    model_signature_present = "sigModelOk" in res
+    counterparty_signature_present = "sigCounterpartyOk" in res
+    model_signature_authenticated = (
+        model_signature_present and res.get("sigModelOk") is True
+        and res.get("sigModelAuthenticated") is True
+    )
+    counterparty_signature_authenticated = (
+        counterparty_signature_present and res.get("sigCounterpartyOk") is True
+        and res.get("sigCounterpartyAuthenticated") is True
+    )
+    model_pin_effective = model_pubkey is not None
+    counterparty_pin_effective = counterparty_pubkey is not None
+    any_signature_pin_effective = model_pin_effective or counterparty_pin_effective
+    model_pin_requested = model_pin_source == "caller"
+    counterparty_pin_requested = counterparty_pin_source == "caller"
+    any_signature_pin_requested = model_pin_requested or counterparty_pin_requested
+    both_signature_pins_required = model_pin_requested and counterparty_pin_requested
+    requested_pins_authenticated = (
+        (not model_pin_requested or model_signature_authenticated)
+        and (not counterparty_pin_requested or counterparty_signature_authenticated)
+    )
+    signatures_pinned = (
+        both_signature_pins_required
+        and model_signature_authenticated
+        and counterparty_signature_authenticated
+    )
+    effective_pins_authenticated = (
+        (not model_pin_effective or model_signature_authenticated)
+        and (not counterparty_pin_effective or counterparty_signature_authenticated)
+    )
+    if any_signature_pin_effective:
+        checks.append({
+            "check": "signaturePins",
+            "ok": effective_pins_authenticated,
+            "detail": "every effective identity binding has a present, valid, authenticated signature; "
+                      f"modelSource={model_pin_source or 'none'} "
+                      f"counterpartySource={counterparty_pin_source or 'none'}",
+        })
     ok = (bool(res.get("structuralOk")) and bool(res.get("reexecOk"))
-          and bool(res.get("artifactBoundOk")) and sig_ok is not False)
+          and bool(res.get("artifactBoundOk")) and sig_ok is not False
+          and effective_pins_authenticated)
     return {"ok": ok, "checks": checks, "structuralOk": res.get("structuralOk"),
             "reexecOk": res.get("reexecOk"), "artifactBoundOk": res.get("artifactBoundOk"),
-            "signatureOk": sig_ok, "signaturePinned": model_pubkey is not None or counterparty_pubkey is not None,
+            "signatureOk": sig_ok,
+            "sigModelPresent": model_signature_present,
+            "sigCounterpartyPresent": counterparty_signature_present,
+            "sigModelAuthenticated": model_signature_authenticated,
+            "sigCounterpartyAuthenticated": counterparty_signature_authenticated,
+            "modelSignaturePinRequested": model_pin_requested,
+            "counterpartySignaturePinRequested": counterparty_pin_requested,
+            "modelSignaturePinSource": model_pin_source,
+            "counterpartySignaturePinSource": counterparty_pin_source,
+            "effectiveSignaturePinsAuthenticated": (
+                effective_pins_authenticated if any_signature_pin_effective else None
+            ),
+            "requestedSignaturePinsAuthenticated": (
+                requested_pins_authenticated if any_signature_pin_requested else None
+            ),
+            "signaturePinned": signatures_pinned,
             "strategy": reexec.get("strategy"), "checked": reexec.get("checked"),
             "of": reexec.get("of"), "sampled": bool(reexec.get("sampled")), "raw": res}
 
@@ -393,7 +462,11 @@ def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "ma
     (network). `reexec` runs iff `reexec=True` and a `model` is supplied. For EC-signed receipts, pass
     `model_pubkey`/`counterparty_pubkey` to PIN the expected signer identity; a stateful bundle defaults them
     to the committed `identity.json` (`agentPubKey`/`counterpartyPubKey`) so the action's own identity is
-    enforced unless the caller overrides.
+    enforced unless the caller overrides. Supplying a pin makes the corresponding signature mandatory;
+    ``reexec.signaturePinned`` is true only when both signatures are present, valid, and authenticated by
+    independently supplied model and counterparty pins. ``requestedSignaturePinsAuthenticated`` separately
+    reports whether every pin the caller actually supplied authenticated its corresponding signature. The
+    ``*SignaturePinSource`` fields distinguish those caller pins from stateful ``bundle-identity`` bindings.
     """
     # A malformed CONTAINER (unparseable/corrupt archive, missing manifest) raises a typed BundleError — a
     # deliberate, tested contract the caller catches (test_corrupt_tar_raises_bundle_error). What must NOT
@@ -432,9 +505,23 @@ def verify_bundle(path: str | Path, *, onchain: bool = False, network: str = "ma
         else:
             def _do_reexec():
                 identity = loaded["obj"].get("identity.json") or {}
-                mpk = model_pubkey or (identity.get("agentPubKey") if manifest.get("kind") == "stateful" else None)
-                cpk = counterparty_pubkey or (identity.get("counterpartyPubKey") if manifest.get("kind") == "stateful" else None)
+                stateful = manifest.get("kind") == "stateful"
+                model_source = (
+                    "caller" if model_pubkey is not None else
+                    "bundle-identity" if stateful and identity.get("agentPubKey") is not None else None
+                )
+                counterparty_source = (
+                    "caller" if counterparty_pubkey is not None else
+                    "bundle-identity"
+                    if stateful and identity.get("counterpartyPubKey") is not None else None
+                )
+                mpk = (model_pubkey if model_pubkey is not None else
+                       (identity.get("agentPubKey") if stateful else None))
+                cpk = (counterparty_pubkey if counterparty_pubkey is not None else
+                       (identity.get("counterpartyPubKey") if stateful else None))
                 return _verify_reexec(loaded, model, model_digest, model_pubkey=mpk, counterparty_pubkey=cpk,
+                                      model_pin_source=model_source,
+                                      counterparty_pin_source=counterparty_source,
                                       sample_k=sample_k, sample_seed=sample_seed)
             rx = _failclosed_layer("reexec", _do_reexec)
             result["reexec"] = rx
