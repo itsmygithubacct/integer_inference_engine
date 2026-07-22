@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import time
 import warnings
 from pathlib import Path
 from typing import Callable
@@ -414,7 +415,8 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
                                    model_key=None, counterparty_key=None,
                                    enable_chain: bool = False, chain_backend=None,
                                    tx_log: str | Path | None = None,
-                                   ts: str | None = None) -> tuple[dict, dict, dict]:
+                                   ts: str | None = None,
+                                   telemetry: dict | None = None) -> tuple[dict, dict, dict]:
     """Build, verify, and emit one Bonsai receipt.
 
     Fails closed when an identity file is supplied and its `modelHash` does not match the loaded artifact
@@ -425,6 +427,7 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
     (third-party-verifiable secp256k1 — verified from the committed public key, no shared secret). If omitted,
     the legacy symmetric HMAC demo constants are used (back-compat; the vouch proves wiring, not authenticity).
     """
+    preparation_started = time.monotonic()
     if verifier_mode not in {"fast-local", "fresh-oracle"}:
         raise ValueError(f"unknown Bonsai verifier mode {verifier_mode!r}")
     if verifier_mode == "fresh-oracle" and verifier_model is None:
@@ -469,6 +472,9 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
     mk = model_key if model_key is not None else dmk
     ck = counterparty_key if counterparty_key is not None else dck
     model_label = _label_for_model(model)
+    if telemetry is not None:
+        telemetry["receiptPreparationSeconds"] = time.monotonic() - preparation_started
+    receipt_started = time.monotonic()
     bundle = build_receipt(
         model_hash=model_hash,
         input_ids=input_ids,
@@ -480,8 +486,11 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
         artifact_digest=model_digest,
         fp_frac_bits=int(model.cfg["frac"]),   # v2: commit the sampler at the engine's fixed-point scale
     )
+    if telemetry is not None:
+        telemetry["receiptConstructionSeconds"] = time.monotonic() - receipt_started
     # Asymmetric keys verify from the committed public key (pin the signer = identity binding); symmetric
     # HMAC keys are passed through so the legacy vouch can still be checked.
+    verification_started = time.monotonic()
     verification = verify_receipt(
         bundle,
         model=verifier_model if verifier_model is not None else model,
@@ -491,9 +500,16 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
         model_pubkey=getattr(mk, "public_hex", None),
         counterparty_pubkey=getattr(ck, "public_hex", None),
     )
+    if telemetry is not None:
+        telemetry["verificationSeconds"] = time.monotonic() - verification_started
+        telemetry["verificationStrategy"] = (verification.get("reexec") or {}).get("strategy")
+        telemetry["verificationCheckedTokens"] = (verification.get("reexec") or {}).get("checked")
     verification["verificationMode"] = verifier_mode
     if not verification["ok"]:
+        if telemetry is not None:
+            telemetry["emissionSeconds"] = 0.0
         return bundle, verification, {}
+    emission_started = time.monotonic()
     emission = emit_receipt(
         bundle["receipt"],
         ledger=LocalLedger(ledger_path),
@@ -505,4 +521,6 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
         chain_backend=chain_backend,
         tx_log=tx_log,
     )
+    if telemetry is not None:
+        telemetry["emissionSeconds"] = time.monotonic() - emission_started
     return bundle, verification, emission

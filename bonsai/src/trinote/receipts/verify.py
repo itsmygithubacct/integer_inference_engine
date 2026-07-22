@@ -33,6 +33,8 @@ is present, so signature-free / digest-free callers stay backward-compatible):
 """
 from __future__ import annotations
 
+import re
+
 from .canonical import canonical_bytes, commit, token_commit
 from .receipt import receipt_hash, sampler_to_block
 from .signing import LocalKey, verify_signature
@@ -89,6 +91,22 @@ def _validate_vocab(model, ids: list[int]) -> None:
         raise ValueError(f"token id {bad} is outside model vocab size {vocab}")
 
 
+def _validate_ec_pubkey_pin(value: str | None, field: str) -> str | None:
+    """Reject ambiguous identity pins before signature verification.
+
+    A caller-supplied pin is a security boundary, so false-y strings must not
+    silently select the receipt's attacker-controlled embedded key.  Pins use
+    the same canonical compressed secp256k1 representation emitted by ECKey.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"(?:02|03)[0-9a-f]{64}", value) is None:
+        raise ValueError(
+            f"{field} must be canonical lowercase compressed secp256k1 public-key hex"
+        )
+    return value
+
+
 def verify_receipt(bundle: dict, **kwargs) -> dict:
     """Fail-closed wrapper (review finding #10): any unexpected KeyError/TypeError/ValueError/
     IndexError raised by a malformed or ADVERSARIAL bundle returns a result dict with ok:False
@@ -118,6 +136,10 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
     `checked=k`, `of=N`, and `sampled=True`; it is NOT a full verification (don't read it as such). Ignored
     for seeded sampler modes (which always do the full replay)."""
     try:
+        model_pubkey = _validate_ec_pubkey_pin(model_pubkey, "model_pubkey")
+        counterparty_pubkey = _validate_ec_pubkey_pin(
+            counterparty_pubkey, "counterparty_pubkey"
+        )
         if not isinstance(bundle, dict):
             raise ValueError("bundle must be a dict")
         receipt = bundle["receipt"]
@@ -236,8 +258,12 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
                                "outputCommit": receipt["outputCommit"],
                                "traceCommit": receipt["trace"]["traceCommit"]})
         result["sigModelPubKey"] = receipt.get("sigModelPubKey")
-        result["sigModelOk"] = verify_signature(msg, sig_model,
-                                                expected_pubkey=model_pubkey or receipt.get("sigModelPubKey"))
+        expected_model_pubkey = (
+            model_pubkey if model_pubkey is not None else receipt.get("sigModelPubKey")
+        )
+        result["sigModelOk"] = verify_signature(
+            msg, sig_model, expected_pubkey=expected_model_pubkey
+        )
         model_sig_pinned = model_pubkey is not None
         if not model_sig_pinned and result["sigModelOk"]:
             warnings.append(
@@ -245,6 +271,13 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
                 "supplied): the signature is self-consistent but the SIGNER IS NOT AUTHENTICATED — a forged "
                 "receipt can be self-signed with a fresh key. Pin model_pubkey, or rely on the modelHash "
                 "re-execution binding (modelHashMatch), for authenticity.")
+    elif model_pubkey is not None:
+        # Supplying an expected identity is a requirement, not a hint.  A
+        # missing signature (or one using an unsupported scheme) must not be
+        # treated like the backward-compatible "no signatures requested"
+        # case below.
+        result["sigModelOk"] = False
+        model_sig_pinned = True
     elif model_key is not None:
         msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
                                "outputCommit": receipt["outputCommit"],
@@ -256,14 +289,23 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
         msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
                                "outputCommit": receipt["outputCommit"]})
         result["sigCounterpartyPubKey"] = receipt.get("sigCounterpartyPubKey")
-        result["sigCounterpartyOk"] = verify_signature(msg, sig_cp,
-                                                        expected_pubkey=counterparty_pubkey or receipt.get("sigCounterpartyPubKey"))
+        expected_counterparty_pubkey = (
+            counterparty_pubkey
+            if counterparty_pubkey is not None
+            else receipt.get("sigCounterpartyPubKey")
+        )
+        result["sigCounterpartyOk"] = verify_signature(
+            msg, sig_cp, expected_pubkey=expected_counterparty_pubkey
+        )
         cp_sig_pinned = counterparty_pubkey is not None
         if not cp_sig_pinned and result["sigCounterpartyOk"]:
             warnings.append(
                 "sigCounterparty is valid only against the pubkey EMBEDDED in the receipt (no pinned "
                 "counterparty_pubkey supplied): the signature is self-consistent but the SIGNER IS NOT "
                 "AUTHENTICATED. Pin counterparty_pubkey to bind it to an expected identity.")
+    elif counterparty_pubkey is not None:
+        result["sigCounterpartyOk"] = False
+        cp_sig_pinned = True
     elif counterparty_key is not None:
         msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
                                "outputCommit": receipt["outputCommit"]})

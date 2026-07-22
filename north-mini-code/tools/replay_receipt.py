@@ -60,7 +60,10 @@ def pick(row, pos, hist):
     return rr.sample_token(np.asarray(row, np.int64), sampler, position=pos, frac_bits=fa, history_ids=hist)
 
 
-new = [int(x) for x in eng.generate(in_ids, len(out0), pick=pick)]
+# The recorded output length is authoritative. Disabling early EOS stopping is
+# equivalent for ordinary receipts (EOS, if present, is their final token) and
+# also makes fixed-length hardware-gate receipts exactly replayable.
+new = [int(x) for x in eng.generate(in_ids, len(out0), pick=pick, stop_eos=False)]
 ok3 = new == out0
 print(f"[replay] (3) re-executed {len(new)} tokens; BYTE-EXACT output match: {ok3}")
 if not ok3:

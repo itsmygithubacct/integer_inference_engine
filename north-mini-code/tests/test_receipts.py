@@ -32,6 +32,24 @@ def test_receipt_build_verify_pack(tmp_path):
     assert res["bundle"]["bundleHash"]
 
 
+def test_receipt_can_disable_even_the_local_broadcast_log(tmp_path):
+    km = ECKey.generate(label="m")
+    kc = ECKey.generate(label="c")
+    res = build_verify_pack(
+        model_hash="de" * 32, artifact_digest="ca" * 32,
+        input_ids=[2, 5], output_ids=[10, 11],
+        sampler=SamplerConfig(mode="greedy"), fa=16,
+        model_key=km, counterparty_key=kc,
+        out_dir=tmp_path / "bundle", ledger_path=tmp_path / "ledger.jsonl",
+        enable_chain=False, broadcast_to_log=False,
+    )
+    assert res["emission"]["onchain"]["status"] == "disabled"
+    assert res["bundle"]["manifest"]["kind"] == "local"
+    assert set(res["bundle"]["manifest"]["files"]) == {
+        "receipt.json", "preimage.json", "chain-artifact.json", "ledger-head.json",
+    }
+
+
 def test_tamper_breaks_verification(tmp_path):
     """Flipping an output id must break the offline commitment check (the point of a receipt)."""
     km = ECKey.generate(label="m"); kc = ECKey.generate(label="c")

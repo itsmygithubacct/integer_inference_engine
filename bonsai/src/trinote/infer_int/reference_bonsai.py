@@ -74,6 +74,11 @@ _ORACLE_Q1_POOL = (
 )
 
 
+def oracle_q1_worker_count() -> int:
+    """Return the immutable worker count selected when this module loaded."""
+    return _ORACLE_Q1_WORKERS
+
+
 def _q1_subset_output_chunk(
     subset_lut: np.ndarray,
     totals: np.ndarray,

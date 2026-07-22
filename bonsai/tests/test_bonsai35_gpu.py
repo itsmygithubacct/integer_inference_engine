@@ -4,8 +4,12 @@ import pytest
 
 from trinote.infer_int.gpu_native import gpu_available, gpu_memory_info
 from trinote.infer_int.gpu_bonsai35 import (
+    BONSAI35_GPU_ABI_VERSION,
+    BONSAI35_PROFILE_FAMILIES,
     Bonsai35GpuExecutor,
+    Bonsai35GpuBatchExecutor,
     attention_decode_gpu,
+    bonsai35_gpu_abi_manifest,
     cpu_oracle_trace,
     kv_i32_transaction_gpu,
     kv_i32_roundtrip_gpu,
@@ -13,6 +17,7 @@ from trinote.infer_int.gpu_bonsai35 import (
     qwen35_workspace_components,
     qwen35_embedding_output_identity,
     recurrent_step_gpu,
+    fused_silu_mul_gpu,
 )
 from trinote.infer_int.reference_bonsai35 import (
     _apply_partial_neox_rope,
@@ -24,6 +29,7 @@ from trinote.infer_int.reference_bonsai35 import (
 from trinote.infer_int.reference_bonsai import _head_rmsnorm, _rmsnorm, fixed_point_silu
 from trinote.infer_int.q1_native import attention_decode_native
 from trinote.determinism.fixedpoint import fixed_point_sigmoid
+from trinote.infer_int.sampler import SamplerConfig, sample_token
 
 
 def _need_gpu():
@@ -41,6 +47,16 @@ def test_qwen35_memory_probe_no_gpu_is_clean(monkeypatch):
     monkeypatch.setattr(g, "gpu_available", lambda: False)
     report, handles = g.prove_bonsai35_gpu_memory(_artifact())
     assert not report.available and not report.feasible and handles is None
+
+
+def test_qwen35_versioned_gpu_manifest_and_profile_schema():
+    _need_gpu()
+    manifest = bonsai35_gpu_abi_manifest()
+    assert manifest is not None
+    assert manifest["abi_version"] == BONSAI35_GPU_ABI_VERSION
+    assert tuple(manifest["profile_families"]) == BONSAI35_PROFILE_FAMILIES
+    assert manifest["sampler_modes"] == ["greedy", "temp", "top_k", "top_p", "min_p"]
+    assert manifest["prefill"] == "native_graph_sequence"
 
 
 def test_qwen35_executor_rejects_stale_graph_abi_before_model_upload(monkeypatch):
@@ -206,6 +222,95 @@ def test_qwen35_recurrent_primitive_matches_cpu_oracle():
     assert np.array_equal(got[1], expected_state)
 
 
+def test_qwen35_fused_silu_multiply_matches_adversarial_oracle():
+    _need_gpu()
+    frac = 16
+    gate = np.asarray([
+        np.iinfo(np.int64).min, -(1 << 50), -(1 << 20), -1, 0, 1,
+        1 << 20, 1 << 50, np.iinfo(np.int64).max,
+    ], dtype=np.int64)
+    up = np.asarray([
+        -1, np.iinfo(np.int64).max, -(1 << 40), 1 << 32, -7,
+        np.iinfo(np.int64).min, 1 << 40, -3, np.iinfo(np.int64).max,
+    ], dtype=np.int64)
+    silu = fixed_point_silu(gate, frac, native=False)
+    with np.errstate(over="ignore"):
+        expected = (silu * up) >> frac
+    actual = fused_silu_mul_gpu(gate, up, frac)
+    assert actual is not None and np.array_equal(actual, expected)
+
+
+def test_qwen35_opt_in_profile_is_exact_and_reports_every_family():
+    _need_gpu()
+    art = _artifact(70)
+    expected = cpu_oracle_trace(art, [2])["logits"]
+    executor = Bonsai35GpuExecutor.try_create(art)
+    assert executor is not None
+    try:
+        actual = executor.profile_decode_token(2)
+        assert actual is not None and np.array_equal(actual, expected)
+        report = executor.profile_report()
+        assert report["schema"] == "bonsai35-cuda-profile/v1"
+        assert report["profiled_tokens"] == 1
+        assert tuple(report["families"]) == BONSAI35_PROFILE_FAMILIES
+        assert all(report["families"][name]["calls"] > 0 for name in BONSAI35_PROFILE_FAMILIES)
+        assert executor.decode_token(3) is not None  # profiling does not prevent later graph capture
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("cfg", [
+    SamplerConfig(mode="greedy", rep_penalty=13107, no_repeat_ngram=2),
+    SamplerConfig(mode="temp", temperature=0.8, seed=19, rep_penalty=13107),
+    SamplerConfig(mode="top_k", temperature=0.7, top_k=7, seed=23),
+    SamplerConfig(mode="top_p", temperature=0.7, top_k=9, top_p=0.8, seed=29),
+    SamplerConfig(mode="min_p", temperature=0.9, min_p=0.15, seed=31),
+])
+def test_qwen35_device_sampler_matches_receipt_sampler_without_logits_d2h(cfg):
+    _need_gpu()
+    art = _artifact(71)
+    ids = [2, 3, 2, 3]
+    logits = cpu_oracle_trace(art, ids)["logits"]
+    expected = sample_token(logits, cfg, len(ids), int(art["config"]["frac"]), ids)
+    executor = Bonsai35GpuExecutor.try_create(art)
+    assert executor is not None
+    try:
+        assert executor.prefill_device(ids)
+        actual = executor.sample_device(cfg, ids, len(ids))
+        assert actual == expected
+        stats = executor.stats()
+        assert stats["prefill_logits_d2h_bytes"] == 0
+        assert stats["device_sampler_prepare_calls"] == 1
+        assert stats["device_sampler_host_bytes"] < int(art["config"]["vocab"]) * 8
+        timing = executor.timing_stats()
+        assert timing["device_sampling_calls"] == 1
+        assert timing["decode_full_logits_d2h_bytes"] == 0
+    finally:
+        executor.close()
+
+
+def test_qwen35_multi_context_batch_matches_independent_cpu_requests():
+    _need_gpu()
+    art = _artifact(72)
+    expected = np.stack([
+        cpu_oracle_trace(art, [2])["logits"],
+        cpu_oracle_trace(art, [3])["logits"],
+    ])
+    batch = Bonsai35GpuBatchExecutor.try_create(art, 2)
+    assert batch is not None
+    try:
+        actual = batch.decode([2, 3])
+        assert actual is not None and np.array_equal(actual, expected)
+        metadata = batch.metadata()
+        assert metadata["schema"] == "bonsai35-cuda-batch/v1"
+        assert metadata["batch_size"] == 2
+        assert metadata["completed_tokens"] == 2
+        assert metadata["aggregate_tokens_per_second"] > 0
+        assert metadata["mean_batch_latency_microseconds"] > 0
+    finally:
+        batch.close()
+
+
 @pytest.mark.parametrize("prefix_len", [0, 1, 31])
 def test_qwen35_attention_primitive_matches_cpu(prefix_len):
     _need_gpu()
@@ -257,12 +362,17 @@ def test_qwen35_resident_graph_full_trace_and_poison_reset():
             )
         )
         stats = executor.stats()
-        assert stats == {
+        expected = {
             "graph_launches": len(ids), "position": len(ids),
-            "graph_ready": True, "poisoned": False, "input_mode": "token_id",
+            "graph_ready": True, "poisoned": False,
+            "input_mode": "token_id_device_logits",
             "token_input_submissions": len(ids), "embedded_input_submissions": 0,
             "model_input_host_bytes": len(ids) * 8,
         }
+        assert {key: stats[key] for key in expected} == expected
+        assert stats["prefill_strategy"] == "native_graph_sequence"
+        assert stats["prefill_calls"] == 1 and stats["prefill_tokens"] == len(ids)
+        assert stats["prefill_logits_d2h_bytes"] == int(art["config"]["vocab"]) * 8
         # One context owns one captured graph.  An accidental host-embedding
         # call cannot silently switch the production token-input graph.
         assert executor.decode_embedded(np.zeros(int(art["config"]["dModel"]), dtype=np.int64)) is None

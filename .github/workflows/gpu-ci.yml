@@ -1,0 +1,155 @@
+name: gpu-exactness
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bonsai35-gpu-exactness
+  cancel-in-progress: false
+
+jobs:
+  bonsai35-release:
+    name: Bonsai-27B resident CUDA + exact verifier
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: bonsai
+    env:
+      BONSAI_INTEGER_27B_ARTIFACT: ${{ vars.BONSAI_INTEGER_27B_ARTIFACT }}
+      BONSAI_27B_GGUF: ${{ vars.BONSAI_27B_GGUF }}
+      GPU_VENV: ${{ runner.temp }}/bonsai-gpu-venv
+      BONSAI_BIN_DIR: ${{ runner.temp }}/bonsai-gpu-bin
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Preflight runner and release inputs
+        run: |
+          nvidia-smi
+          test -n "$BONSAI_INTEGER_27B_ARTIFACT"
+          test -f "$BONSAI_INTEGER_27B_ARTIFACT"
+          test -n "$BONSAI_27B_GGUF"
+          test -f "$BONSAI_27B_GGUF"
+
+      - name: Install isolated test environment
+        run: |
+          python3 -m venv "$GPU_VENV"
+          "$GPU_VENV/bin/pip" install -r requirements.txt -r requirements_test.txt
+
+      - name: Build CPU and CUDA exact kernels
+        run: |
+          tools/build_bonsai_q1_kernel.sh
+          tools/build_bonsai_q1_gpu.sh
+
+      - name: Require the built CUDA ABI and device probe
+        run: |
+          "$GPU_VENV/bin/python" - <<'PY'
+          from trinote.infer_int.gpu_native import gpu_available
+          if not gpu_available():
+              raise SystemExit("built Bonsai CUDA library/device probe is unavailable")
+          PY
+
+      - name: Synthetic CUDA differential and negative-guard suite
+        run: >-
+          "$GPU_VENV/bin/python" -m pytest -q
+          tests/test_bonsai35_gpu.py
+          tests/test_bonsai35_gpu_attention_long.py
+          tests/test_bonsai35_edge_gates.py
+
+      - name: Release 19-input / 64-output golden turn
+        run: >-
+          "$GPU_VENV/bin/python" tools/verify_bonsai35_golden.py
+          --artifact "$BONSAI_INTEGER_27B_ARTIFACT"
+          --gguf "$BONSAI_27B_GGUF"
+          --json-out "$RUNNER_TEMP/bonsai35-gpu-golden.json"
+
+      - name: Exact 20-output verifier thread/strategy matrix
+        run: >-
+          "$GPU_VENV/bin/python" tools/bench_bonsai35_verifier.py
+          --artifact "$BONSAI_INTEGER_27B_ARTIFACT"
+          --threads 1,2,4,8,16
+          --output-counts 20
+          --out "$RUNNER_TEMP/bonsai35-verifier-benchmark.json"
+          --policy-out "$RUNNER_TEMP/bonsai35-verifier-policy.json"
+          --oracle-policy-out "$RUNNER_TEMP/bonsai35-verifier-oracle-policy.json"
+
+      - name: Upload machine-readable acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bonsai35-gpu-exactness-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/bonsai35-gpu-golden.json
+            ${{ runner.temp }}/bonsai35-verifier-benchmark.json
+            ${{ runner.temp }}/bonsai35-verifier-policy.json
+            ${{ runner.temp }}/bonsai35-verifier-oracle-policy.json
+          retention-days: 30
+
+      - name: Remove isolated test environment
+        if: always()
+        run: rm -rf -- "$GPU_VENV" "$BONSAI_BIN_DIR"
+
+  nmc-cuda:
+    name: North Mini Code resident CUDA exactness
+    needs: bonsai35-release
+    if: ${{ always() }}
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: north-mini-code
+    env:
+      NMC_GPU_VENV: ${{ runner.temp }}/nmc-gpu-venv
+      BONSAI_BIN_DIR: ${{ runner.temp }}/nmc-gpu-bin
+      NMC_BONSAI_SRC: ../bonsai/src
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install isolated test environment
+        run: |
+          python3 -m venv "$NMC_GPU_VENV"
+          "$NMC_GPU_VENV/bin/pip" install -r requirements.txt -r requirements_test.txt -r requirements_receipts.txt
+
+      - name: Build CPU and CUDA exact kernels
+        run: |
+          tools/build_nmc_kernel.sh
+          tools/build_nmc_cuda.sh
+
+      - name: Require versioned CUDA capabilities
+        run: |
+          "$NMC_GPU_VENV/bin/python" - <<'PY'
+          from nmc import qk_cuda
+          gates = {
+              "base": qk_cuda.available(),
+              "resident": qk_cuda.resident_available(),
+              "grouped": qk_cuda.grouped_available(),
+              "resident_attention": qk_cuda.resident_attention_available(),
+              "dp4a": qk_cuda.dp4a_available(),
+          }
+          failed = [name for name, passed in gates.items() if not passed]
+          if failed:
+              raise SystemExit("missing NMC CUDA capabilities: " + ", ".join(failed))
+          PY
+
+      - name: Resident/grouped/DP4A differential suites
+        run: >-
+          "$NMC_GPU_VENV/bin/python" -m pytest -q
+          tests/test_qk_cuda.py
+          tests/test_qk_cuda_api.py
+          tests/test_profiling.py
+
+      - name: Remove isolated test environment
+        if: always()
+        run: rm -rf -- "$NMC_GPU_VENV" "$BONSAI_BIN_DIR"

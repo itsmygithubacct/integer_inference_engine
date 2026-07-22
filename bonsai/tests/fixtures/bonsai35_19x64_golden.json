@@ -1,0 +1,35 @@
+{
+  "schema": "trinote-bonsai35-golden/v1",
+  "prompt": "what is the meaning of life?",
+  "inputIds": [
+    248045, 846, 198, 12195, 369, 279, 7063, 314, 2199, 30, 248046, 198,
+    248045, 74455, 198, 248068, 271, 248069, 271
+  ],
+  "outputIds": [
+    760, 3296, 328, 3710, 369, 279, 7063, 2199, 7285, 369, 799, 314, 279,
+    22778, 321, 1379, 26281, 42432, 303, 3611, 3712, 13, 2532, 369, 874, 3074,
+    11, 58391, 7003, 5072, 263, 4087, 11, 430, 7063, 369, 16739, 4204, 321,
+    33094, 3808, 25881, 11, 41707, 11, 13164, 536, 11, 321, 3714, 11120, 13,
+    4213, 11, 1532, 513, 1010, 13177, 14541, 37178, 25, 271, 13962, 220
+  ],
+  "sampler": {
+    "preset": "bonsai27-rec",
+    "mode": "top_p",
+    "temperature": 0.7,
+    "topK": 20,
+    "topP": 0.95,
+    "minP": 0.0,
+    "seed": 0,
+    "repPenaltyFp": 0,
+    "noRepeatNgram": 4
+  },
+  "commitments": {
+    "inputIdsInt64LeSha256": "d6e7ff9a610ae9395b7b1d1eef6fb0a5764925024e24a3d6df988d508d14cf1a",
+    "outputIdsInt64LeSha256": "6528f94af6398d9bfa8c85099b5d1e2047ac133eafb0b20be00f494d71f125bf",
+    "visibleBytesSha256": "0326877dd8a72d427519acf2c33070dbe5049dd91136c29b5e6cbee7ff306c05"
+  },
+  "release": {
+    "artifactSha256": "7eab414ceff3fff1489053d415d0c6adb1e646e552d091cc1a898d0456adf3fb",
+    "ggufSha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0"
+  }
+}

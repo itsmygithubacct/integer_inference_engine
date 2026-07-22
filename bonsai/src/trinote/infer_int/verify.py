@@ -68,6 +68,29 @@ def _cached_replay_threshold(model) -> int | None:
     return max(1, int(threshold))
 
 
+def _full_verification_strategy(model, input_count: int, output_count: int) -> str:
+    """Resolve the exact full-verification algorithm for a committed turn.
+
+    ``receipt_verify_strategy`` is an operator-selected, evidence-backed override
+    used by the bundle verifier.  It changes only how the same deterministic
+    logits/tokens are recomputed; it never weakens full coverage.  ``auto``
+    preserves the model's measured cached-replay threshold.
+    """
+    selected = str(getattr(model, "receipt_verify_strategy", "auto") or "auto")
+    if selected not in {"auto", "teacher-forced", "cached-replay"}:
+        raise ValueError(f"unknown receipt verification strategy {selected!r}")
+    if selected == "teacher-forced":
+        return selected
+    threshold = _cached_replay_threshold(model)
+    if selected == "cached-replay":
+        if threshold is None:
+            raise ValueError("cached-replay requested but this model has no exact cached generator")
+        return selected
+    if threshold is not None and int(output_count) >= threshold:
+        return "cached-replay"
+    return "teacher-forced"
+
+
 def _cached_replay_positions(input_ids, output_ids, replayed) -> tuple[bool, list[dict]]:
     n_in = len(input_ids)
     positions = []
@@ -139,8 +162,13 @@ def verify_greedy(model, input_ids, output_ids, *, rep_penalty_fp: int = 0,
         return {"ok": True, "checked": 0, "positions": [], "strategy": "greedy-full"}
     eff = _eff_ctx(model)
     seq = input_ids + output_ids
-    threshold = _cached_replay_threshold(model)
-    if threshold is not None and len(output_ids) >= threshold and len(seq) <= eff:
+    strategy = _full_verification_strategy(model, len(input_ids), len(output_ids))
+    if (strategy == "cached-replay" and len(seq) > eff
+            and getattr(model, "receipt_verify_strategy", "auto") == "cached-replay"):
+        raise ValueError(
+            "cached-replay was explicitly selected, but the committed turn exceeds the exact context window"
+        )
+    if strategy == "cached-replay" and len(seq) <= eff:
         return _verify_greedy_cached_replay(
             model,
             input_ids,
@@ -220,8 +248,13 @@ def verify_resample(model, input_ids, output_ids, *, sampler_cfg: SamplerConfig)
     frac = int(model.cfg["frac"])
     eff = _eff_ctx(model)
     seq = input_ids + output_ids
-    threshold = _cached_replay_threshold(model)
-    if threshold is not None and len(output_ids) >= threshold and len(seq) <= eff:
+    strategy = _full_verification_strategy(model, len(input_ids), len(output_ids))
+    if (strategy == "cached-replay" and len(seq) > eff
+            and getattr(model, "receipt_verify_strategy", "auto") == "cached-replay"):
+        raise ValueError(
+            "cached-replay was explicitly selected, but the committed turn exceeds the exact context window"
+        )
+    if strategy == "cached-replay" and len(seq) <= eff:
         return _verify_resample_cached_replay(model, input_ids, output_ids, sampler_cfg=sampler_cfg)
     full = teacher_forced_logits(model, seq) if len(seq) <= eff else None   # single prefill iff it fits
     n_in = len(input_ids)

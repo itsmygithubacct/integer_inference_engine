@@ -123,7 +123,8 @@ def wallet_backend(*, confirm=False, **kw):
 
 def build_verify_pack(*, model_hash, artifact_digest, input_ids, output_ids, sampler, fa,
                       model_key, counterparty_key, out_dir, transcript=None, ledger_path=None,
-                      model_label=MODEL_LABEL, enable_chain=False, chain_backend=None):
+                      model_label=MODEL_LABEL, enable_chain=False, chain_backend=None,
+                      broadcast_to_log=True):
     """Build the receipt, self-verify (commitments + secp256k1 sigs), record the 3rd entry (local ledger +
     chain artifact — dry-run-logged by default; real BSV broadcast iff enable_chain=True + a confirmed wallet
     backend), pack the bundle, and offline-verify it. Model-free (synthetic ids OK) so it is unit-testable."""
@@ -142,7 +143,8 @@ def build_verify_pack(*, model_hash, artifact_digest, input_ids, output_ids, sam
     rdir = STATE_HOME / "receipts"
     led = LocalLedger(str(ledger_path or rdir / "ledger.jsonl"))
     emission = emit_receipt(rcpt, ledger=led, ts=datetime.now(timezone.utc).isoformat(),
-                            enable_chain=enable_chain, chain_backend=chain_backend, broadcast_to_log=True,
+                            enable_chain=enable_chain, chain_backend=chain_backend,
+                            broadcast_to_log=broadcast_to_log,
                             chain_artifacts_dir=str(rdir / "chain"), broadcast_log=str(rdir / "broadcast.log"))
     onchain = emission["onchain"] if enable_chain else None   # only a REAL send makes the bundle non-local
     info = pack_bundle(bundle=bundle, onchain=onchain, out_dir=str(out_dir),

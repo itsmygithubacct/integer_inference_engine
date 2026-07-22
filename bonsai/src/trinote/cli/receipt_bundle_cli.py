@@ -11,11 +11,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 from ..bundle import pack_bundle, verify_bundle, load_bundle, BundleError
+from .run_evidence import ReceiptRunEvidence
+from .thread_bootstrap import maybe_reexec_with_threads
+from .verifier_policy import load_verifier_policy, route_verification
+
+
+_THREAD_ENV = (
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+    "TRINOTE_ORACLE_Q1_THREADS",
+)
+
+
+def _configure_cpu_threads(count: int) -> None:
+    value = str(int(count))
+    for name in _THREAD_ENV:
+        os.environ[name] = value
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 
 def _load_json(path: str):
@@ -128,7 +147,7 @@ def _cmd_pack(args) -> int:
     return 0
 
 
-def _load_model(artifact: str, *, fast: bool = True):
+def _load_model(artifact: str, *, fast: bool = True, require_native: bool = False):
     from ..infer_int.artifact_io_bonsai import load_artifact_bonsai
     from ..infer_int.reference_bonsai import BonsaiReferenceModel
     from ..infer_int.reference_bonsai35 import BonsaiQwen35ReferenceModel
@@ -146,9 +165,17 @@ def _load_model(artifact: str, *, fast: bool = True):
         # (proven in tests/test_bonsai_smoke.py), so the replay verdict is unchanged — but ~100x faster, the
         # difference between a usable verify and a multi-minute oracle replay. Falls back to sign-cache, then
         # the oracle, if the native kernel can't load.
-        if model.enable_native():
+        native_enabled = bool(model.enable_native())
+        resident_native = native_enabled and (
+            architecture != "qwen35" or getattr(model, "_model_executor", None) is not None
+        )
+        if resident_native:
             engine = "native"
-        elif model.enable_fast(check_ram=True, cache_output=True):
+        elif architecture == "qwen35" and native_enabled:
+            # Primitive/native-runtime acceleration is exact, but it is not the
+            # resident packed-model executor measured by a `native` policy.
+            engine = "native-primitives"
+        elif architecture != "qwen35" and model.enable_fast(check_ram=True, cache_output=True):
             engine = "sign-cache"
     # Telemetry/guard: a silent downgrade to the ~100x-slower pure-NumPy oracle is the main way a "verify" looks
     # broken (multi-minute hangs). Make the engine path VISIBLE on stderr and in the debug log so it's
@@ -159,6 +186,11 @@ def _load_model(artifact: str, *, fast: bool = True):
               file=sys.stderr)
     else:
         print(f"[bundle] re-exec engine: {engine}", file=sys.stderr)
+    if require_native and engine != "native":
+        raise RuntimeError(
+            "native verifier engine was required, but the resident packed-Q1 model executor "
+            "could not be enabled"
+        )
     try:
         from .json_mode import debug_log
         debug_log({"ts": time.time(), "schema": "bonsai-debug/v1", "event": "receipt-verify-load",
@@ -168,31 +200,164 @@ def _load_model(artifact: str, *, fast: bool = True):
     return model, info["digest"], engine
 
 
+def _committed_token_counts(path: str | Path) -> tuple[int, int]:
+    loaded = load_bundle(path)
+    preimage = loaded["obj"].get("preimage.json") or {}
+    input_ids = preimage.get("inputIds")
+    output_ids = preimage.get("outputIds")
+    if not isinstance(input_ids, list) or not isinstance(output_ids, list):
+        raise BundleError("preimage inputIds/outputIds must be lists for verifier routing")
+    return len(input_ids), len(output_ids)
+
+
+def _resolve_verifier_route(args, policy: dict | None, path: str | Path) -> dict[str, str]:
+    if policy is not None:
+        if (getattr(args, "verifier_engine", "auto") != "auto"
+                or bool(getattr(args, "oracle", False))
+                or getattr(args, "strategy", "auto") != "auto"):
+            raise ValueError(
+                "--strategy-policy is authoritative and cannot be combined with --oracle, "
+                "--verifier-engine, or --strategy overrides"
+            )
+        n_input, n_output = _committed_token_counts(path)
+        return route_verification(policy, input_tokens=n_input, output_tokens=n_output)
+    route = {
+        "engine": "oracle" if args.oracle else "native",
+        "strategy": "auto",
+    }
+    if args.verifier_engine != "auto":
+        route["engine"] = args.verifier_engine
+    elif args.oracle:
+        route["engine"] = "oracle"
+    if args.strategy != "auto":
+        route["strategy"] = args.strategy
+    return route
+
+
 def _cmd_verify(args) -> int:
     bundles = args.bundle if isinstance(args.bundle, list) else [args.bundle]
-    model, model_digest = None, None
+    if args.oracle and args.verifier_engine == "native":
+        print("[bundle] --oracle conflicts with --verifier-engine native", file=sys.stderr)
+        return 2
+    try:
+        policy = load_verifier_policy(args.strategy_policy) if args.strategy_policy else None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[bundle] invalid --strategy-policy: {exc}", file=sys.stderr)
+        return 2
+    if policy is not None:
+        if (getattr(args, "verifier_engine", "auto") != "auto"
+                or bool(getattr(args, "oracle", False))
+                or getattr(args, "strategy", "auto") != "auto"):
+            print(
+                "[bundle] --strategy-policy is authoritative; remove --oracle, "
+                "--verifier-engine, and --strategy overrides",
+                file=sys.stderr,
+            )
+            return 2
+        policy_threads = int(policy["threads"])
+        if args.threads and int(args.threads) != policy_threads:
+            print(
+                f"[bundle] --cpu-threads {args.threads} disagrees with the measured policy thread count "
+                f"{policy_threads}; regenerate the policy for that thread budget",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.threads:
+            args.threads = policy_threads
+    if args.threads:
+        maybe_reexec_with_threads(
+            args.threads,
+            real_argv=bool(getattr(args, "_real_argv", False)),
+            module_name="trinote.cli.receipt_bundle_cli",
+        )
+        _configure_cpu_threads(args.threads)
+
+    evidence = None
+    if args.run_report:
+        evidence = ReceiptRunEvidence(
+            args.run_report,
+            operation="verify-receipt-bundles",
+            options={
+                "bundleCount": len(bundles),
+                "onchain": bool(args.onchain),
+                "reexec": bool(args.reexec),
+                "strategyPolicyApplied": policy is not None,
+                "strategyPolicyEvidenceSha256": (
+                    policy.get("evidenceSha256") if policy is not None else None
+                ),
+            },
+        )
+    model_cache: dict[str, tuple[object, str, str]] = {}
     if args.reexec:
         if not args.artifact:
             print("[bundle] --reexec requires --artifact <safetensors>", file=sys.stderr)
+            if evidence:
+                evidence.finish("failed", exit_code=2, error="--reexec requires --artifact")
             return 2
-        # Batch model-load amortization: load + enable_native() ONCE, reuse the read-only model across every
-        # bundle (verify_bundle takes model=/model_digest=; KV state is per-call). Turns an N-bundle sweep
-        # from N·(load+reexec) into load_once + N·reexec.
-        print(f"[bundle] loading model once for {len(bundles)} bundle(s): {args.artifact}", file=sys.stderr)
-        model, model_digest, _engine = _load_model(args.artifact, fast=not args.oracle)
-        if args.cached_replay_threshold is not None:
-            model.receipt_verify_cached_threshold = max(1, int(args.cached_replay_threshold))
-            print(f"[bundle] cached-replay threshold = {model.receipt_verify_cached_threshold} output tokens",
-                  file=sys.stderr)
+        print(f"[bundle] verifier routing {len(bundles)} bundle(s): {args.artifact}", file=sys.stderr)
 
     results, rc = [], 0
-    for b in bundles:
+    for bundle_index, b in enumerate(bundles):
+        model, model_digest = None, None
+        route = {"engine": "none", "strategy": "none"}
         try:
+            if args.reexec:
+                route = _resolve_verifier_route(args, policy, b)
+                cache_key = route["engine"]
+                if cache_key not in model_cache:
+                    load_started = time.monotonic()
+                    require_native = (
+                        route["engine"] == "native"
+                        and (policy is not None or args.verifier_engine == "native")
+                    )
+                    model_cache[cache_key] = _load_model(
+                        args.artifact,
+                        fast=route["engine"] == "native",
+                        require_native=require_native,
+                    )
+                    if evidence:
+                        from ..infer_int.reference_bonsai import oracle_q1_worker_count
+
+                        evidence.update("resources", oracleQ1Workers=oracle_q1_worker_count())
+                        evidence.add_phase(
+                            "model-load",
+                            time.monotonic() - load_started,
+                            requestedEngine=route["engine"],
+                            actualEngine=model_cache[cache_key][2],
+                        )
+                model, model_digest, actual_engine = model_cache[cache_key]
+                if policy is not None and model_digest != policy["artifactSha256"]:
+                    raise RuntimeError(
+                        "verifier policy is bound to artifact "
+                        f"{policy['artifactSha256']}, but the loaded artifact is {model_digest}"
+                    )
+                model.receipt_verify_strategy = route["strategy"]
+                if args.cached_replay_threshold is not None:
+                    model.receipt_verify_cached_threshold = max(1, int(args.cached_replay_threshold))
+                print(
+                    f"[bundle] route {b}: engine={actual_engine} strategy={route['strategy']}",
+                    file=sys.stderr,
+                )
+            verify_started = time.monotonic()
             res = verify_bundle(b, onchain=args.onchain, network=args.network,
                                 reexec=args.reexec, model=model, model_digest=model_digest,
                                 model_pubkey=args.model_pubkey, counterparty_pubkey=args.counterparty_pubkey,
                                 sample_k=args.sample_positions, sample_seed=args.sample_seed)
-        except (FileNotFoundError, BundleError) as exc:
+            if evidence:
+                input_count, output_count = _committed_token_counts(b)
+                evidence.add_phase(
+                    "bundle-verify",
+                    time.monotonic() - verify_started,
+                    bundleIndex=bundle_index,
+                    bundleHash=res.get("bundleHash"),
+                    inputTokens=input_count,
+                    outputTokens=output_count,
+                    requestedEngine=route["engine"],
+                    requestedStrategy=route["strategy"],
+                    actualStrategy=(res.get("reexec") or {}).get("strategy"),
+                    verified=bool(res.get("ok")),
+                )
+        except (FileNotFoundError, BundleError, RuntimeError, ValueError) as exc:
             print(f"[bundle] verify failed for {b}: {exc}", file=sys.stderr)
             rc = 2
             continue
@@ -208,7 +373,11 @@ def _cmd_verify(args) -> int:
         print(json.dumps(results[0] if len(results) == 1 else results))
     if len(bundles) > 1:
         n_ok = sum(1 for r in results if r["ok"])
-        print(f"\n[bundle] SUMMARY: {n_ok}/{len(bundles)} bundles VERIFIED (model loaded once)", file=sys.stderr)
+        print(f"\n[bundle] SUMMARY: {n_ok}/{len(bundles)} bundles VERIFIED "+
+              f"({len(model_cache)} verifier engine(s) loaded)", file=sys.stderr)
+    if evidence:
+        evidence.update("engine", loadedEngines=sorted(model_cache), policyApplied=policy is not None)
+        evidence.finish("pass" if rc == 0 else "failed", exit_code=rc)
     return rc
 
 
@@ -238,7 +407,16 @@ def _print_human(res: dict) -> None:
         print(f"  [{mark}] re-exec (bit-exact reference engine) {extra}")
         for c in rx.get("checks", []):
             print(f"      {'ok ' if c['ok'] else 'ERR'} {c['check']}  ({c.get('detail','')})")
-        if rx.get("signatureOk") is not None and not rx.get("signaturePinned"):
+        requested_pins_ok = rx.get("requestedSignaturePinsAuthenticated")
+        if requested_pins_ok is True and not rx.get("signaturePinned"):
+            print("      NOTE every requested signature pin authenticated, but only one signer identity"
+                  " was pinned; signaturePinned requires independent pins for both signers")
+        elif "bundle-identity" in {
+            rx.get("modelSignaturePinSource"), rx.get("counterpartySignaturePinSource")
+        }:
+            print("      NOTE signatures match the stateful bundle identity, but no independent caller pin"
+                  " was supplied; signaturePinned remains false")
+        elif rx.get("signatureOk") is not None and requested_pins_ok is None:
             print("      NOTE signature is valid for the receipt's EMBEDDED key but identity was NOT pinned"
                   " — pass --model-pubkey to bind it to an expected signer")
         elif rx.get("signatureOk") is None:
@@ -262,6 +440,7 @@ def _cmd_inspect(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    real_argv = argv is None
     ap = argparse.ArgumentParser(prog="trinote-receipt-bundle",
                                  description="Package and verify portable Bonsai receipt bundles")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -292,6 +471,18 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--cached-replay-threshold", type=int, default=None, metavar="N",
                    help="override the long-turn KV-cached-replay threshold: output turns >= N tokens replay via "
                         "cached M=1 decode instead of an M=N teacher-forced prefill (M=N is slower on this CPU)")
+    v.add_argument("--strategy", choices=["auto", "teacher-forced", "cached-replay"], default="auto",
+                   help="exact full-replay algorithm; auto uses the model threshold or --strategy-policy")
+    v.add_argument("--strategy-policy", default=None,
+                   help="receipt-verifier-policy/v1 JSON produced by the verifier benchmark; routes by committed "
+                        "input/output token counts")
+    v.add_argument("--verifier-engine", choices=["auto", "native", "oracle"], default="auto",
+                   help="re-execution engine override; an explicit native selection fails instead of silently "
+                        "downgrading to the oracle")
+    v.add_argument("--threads", "--cpu-threads", dest="threads", type=int, default=0,
+                   help="CPU threads for this verifier process; sets OpenMP and common BLAS runtimes before load")
+    v.add_argument("--run-report", default=None,
+                   help="atomically write phase timings and selected routes as receipt-run/v1 JSON")
     v.add_argument("--onchain", action="store_true", help="also confirm the third entry on WhatsOnChain (network)")
     v.add_argument("--network", default="main", help="BSV network for --onchain (default main)")
     v.add_argument("--reexec", action="store_true", help="also re-run the bit-exact reference engine (needs --artifact)")
@@ -312,6 +503,9 @@ def main(argv: list[str] | None = None) -> int:
     i.set_defaults(func=_cmd_inspect)
 
     args = ap.parse_args(argv)
+    args._real_argv = real_argv
+    if getattr(args, "threads", 0) < 0:
+        ap.error("--threads must be >= 0")
     return args.func(args)
 
 

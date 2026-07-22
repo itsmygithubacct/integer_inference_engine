@@ -2,7 +2,7 @@ name: ci
 
 # Gates the load-bearing claim in README.md / integer_engine.md: the pure-integer CPU ORACLE is byte-exact
 # with the C/OpenMP NATIVE producer (incl. the int64 overflow boundary), enforced on every push/PR. GPU
-# parity is NOT run here (no GPU runner) — that remains an on-hardware / BONSAI_VERIFY_GPU check, as documented.
+# parity is not run in this CPU workflow; the separate gpu-exactness workflow gates it on a self-hosted GPU.
 on:
   push:
     branches: [main]
@@ -20,7 +20,9 @@ jobs:
       run:
         working-directory: bonsai
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
       - name: Create venv + install deps
@@ -44,7 +46,9 @@ jobs:
       run:
         working-directory: north-mini-code
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
       - name: Create venv (py3.12) + install deps
