@@ -1,0 +1,119 @@
+{
+  "schema": "trinote.receipt/v3",
+  "note": "Signed-message and receipt-hash vectors. v2 rows pin what must not change. Synthetic inputs only.",
+  "messages": [
+    {
+      "name": "v2-model",
+      "entry": "model",
+      "note": "unchanged from today \u2014 these bytes must never move",
+      "inputs": {
+        "model_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "input_commit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "output_commit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "trace_commit": "0303030303030303030303030303030303030303030303030303030303030303"
+      },
+      "canonicalText": "{\"inputCommit\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"modelHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"outputCommit\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"traceCommit\":\"0303030303030303030303030303030303030303030303030303030303030303\"}",
+      "signingDigest": "b9e44da58d175a5511b90b83e1e52db7f5fd7ba31ec6ef713e418c04d328da79"
+    },
+    {
+      "name": "v2-counterparty",
+      "entry": "counterparty",
+      "note": "the counterparty co-signs only what it observed",
+      "inputs": {
+        "model_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "input_commit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "output_commit": "0202020202020202020202020202020202020202020202020202020202020202"
+      },
+      "canonicalText": "{\"inputCommit\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"modelHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"outputCommit\":\"0202020202020202020202020202020202020202020202020202020202020202\"}",
+      "signingDigest": "154553d06d1928ce2d9f3fd7ae7edde4569c0317f7c4fa647bd45e0bf8c62439"
+    },
+    {
+      "name": "v3-model",
+      "entry": "model",
+      "note": "exactly one key added; contextCommit sorts first",
+      "inputs": {
+        "model_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "input_commit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "output_commit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "trace_commit": "0303030303030303030303030303030303030303030303030303030303030303",
+        "context_commit": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+      },
+      "canonicalText": "{\"contextCommit\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"inputCommit\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"modelHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"outputCommit\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"traceCommit\":\"0303030303030303030303030303030303030303030303030303030303030303\"}",
+      "signingDigest": "951962e9fc34ab0acbbbccc4894c12154a1ba2eb72acc82b5caaf090ba88fa4a"
+    },
+    {
+      "name": "v3-counterparty",
+      "entry": "counterparty",
+      "note": "the counterparty signs the context too, or its signature would be transferable between requests",
+      "inputs": {
+        "model_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "input_commit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "output_commit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "context_commit": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+      },
+      "canonicalText": "{\"contextCommit\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"inputCommit\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"modelHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"outputCommit\":\"0202020202020202020202020202020202020202020202020202020202020202\"}",
+      "signingDigest": "226af39bc6415e940ec740c38da09c4ecd8fd94d1575aaa50ce62f4291cd07f9"
+    },
+    {
+      "name": "v3-model-different-context",
+      "entry": "model",
+      "note": "same execution, different request context \u2014 the signed bytes must differ",
+      "inputs": {
+        "model_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "input_commit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "output_commit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "trace_commit": "0303030303030303030303030303030303030303030303030303030303030303",
+        "context_commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      },
+      "canonicalText": "{\"contextCommit\":\"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1\",\"inputCommit\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"modelHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"outputCommit\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"traceCommit\":\"0303030303030303030303030303030303030303030303030303030303030303\"}",
+      "signingDigest": "7014b249fc3b02fe4dc6b848df7d5d4f4721858fd20803da91c0bc96321953d0"
+    }
+  ],
+  "receipts": [
+    {
+      "name": "v2-body",
+      "note": "abridged body; the point is that the hash covers every field",
+      "body": {
+        "schema": "trinote.receipt/v2",
+        "modelHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inputCommit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "outputCommit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "receiptBound": true,
+        "sigModelKeyId": "key:model-a",
+        "sigCounterpartyKeyId": "key:cp-b"
+      },
+      "receiptHash": "034c423b293b1d2fae6a81984c1010721db006aba1ac1c6d4b4ea5b243da3202"
+    },
+    {
+      "name": "v3-body",
+      "note": "same execution plus contextCommit \u2014 a different receiptHash",
+      "body": {
+        "schema": "trinote.receipt/v3",
+        "modelHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inputCommit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "outputCommit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "receiptBound": true,
+        "sigModelKeyId": "key:model-a",
+        "sigCounterpartyKeyId": "key:cp-b",
+        "contextCommit": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+      },
+      "receiptHash": "70c3eb418571bd898327b433141e0251b03975dae47d0ba80975808a900589f6"
+    },
+    {
+      "name": "v3-body-hash-excludes-itself",
+      "note": "receiptHash recomputes identically when the field is already present",
+      "body": {
+        "schema": "trinote.receipt/v3",
+        "modelHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inputCommit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "outputCommit": "0202020202020202020202020202020202020202020202020202020202020202",
+        "receiptBound": true,
+        "sigModelKeyId": "key:model-a",
+        "sigCounterpartyKeyId": "key:cp-b",
+        "contextCommit": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "receiptHash": "70c3eb418571bd898327b433141e0251b03975dae47d0ba80975808a900589f6"
+      },
+      "receiptHash": "70c3eb418571bd898327b433141e0251b03975dae47d0ba80975808a900589f6"
+    }
+  ]
+}
