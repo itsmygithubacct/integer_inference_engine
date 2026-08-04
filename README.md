@@ -45,6 +45,8 @@ verbatim under `north-mini-code/src/nmc/_bonsai/` to keep it self-contained.
 
 ## Watch the episode
 
+https://github.com/user-attachments/assets/0c914c0c-2f35-4e77-bd1f-d0f60ced6dae
+
 **[Trinote Project One: The Integer Inference Engine](https://github.com/itsmygithubacct/integer_inference_engine/releases/download/media-v1/02-integer-inference-engine.mp4)**
 — part two of *Trinote: From Deterministic Inference to Durable Evidence*, the six-part series across
 the four composed trinote projects (1920×1080, 3m12s, 8.4 MB; published as a
