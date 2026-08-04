@@ -23,13 +23,18 @@ receipt schema does not change when MI lands.
 """
 from __future__ import annotations
 
+import re
 from .canonical import canonical_bytes, commit, token_commit
 from .signing import LocalKey, sign
 from ..hashing.sha import sha256_hex
+
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 from ..infer_int.sampler import RECEIPT_SAFE_MODES, inv_temp_fp, top_p_fp, min_p_fp
 
 SCHEMA = "trinote.receipt/v2"
 PREIMAGE_SCHEMA = "trinote.receipt-preimage/v2"
+SCHEMA_V3 = "trinote.receipt/v3"
+PREIMAGE_SCHEMA_V3 = "trinote.receipt-preimage/v3"
 SCHEMA_V1 = "trinote.receipt/v1"
 PREIMAGE_SCHEMA_V1 = "trinote.receipt-preimage/v1"
 
@@ -120,19 +125,34 @@ def build_receipt(*, model_hash: str, input_ids, output_ids, sampler,
                   model_key: LocalKey, counterparty_key: LocalKey,
                   trace: dict | None = None, model_label: str = "",
                   artifact_digest: str | None = None,
-                  fp_frac_bits: int = 16, schema_version: str = "v2") -> dict:
+                  fp_frac_bits: int = 16, schema_version: str = "v2",
+                  context_commit: str | None = None) -> dict:
     """Build a receipt BUNDLE for one inference turn. Pure: no I/O, no chain. Greedy → receiptBound.
 
     `schema_version="v2"` (default) commits a fully-integer sampler block (float-free, language-neutral);
     `fp_frac_bits` is the fixed-point scale (must match the engine's `model.cfg["frac"]`). Pass
-    `schema_version="v1"` ONLY to reproduce a historical float-block receiptHash byte-for-byte."""
-    if schema_version not in ("v1", "v2"):              # fail loud, never silently fall through to v2
-        raise ValueError(f"unknown receipt schema_version {schema_version!r} (expected 'v1' or 'v2')")
+    `schema_version="v1"` ONLY to reproduce a historical float-block receiptHash byte-for-byte.
+
+    `schema_version="v3"` additionally binds the receipt to the request that asked for it: the caller
+    supplies `context_commit` (semantos.trinote.context/v1) and it is committed inside BOTH signed
+    messages and the receipt body. v2 receipts are byte-unchanged — a v2 receiptHash computed before v3
+    existed still recomputes identically, which matters because those digests are anchored on-chain."""
+    if schema_version not in ("v1", "v2", "v3"):        # fail loud, never silently fall through to v2
+        raise ValueError(f"unknown receipt schema_version {schema_version!r} (expected 'v1', 'v2' or 'v3')")
+    if schema_version == "v3":
+        if not isinstance(context_commit, str) or not _HEX64.match(context_commit):
+            # a v3 receipt without a valid binding would claim freshness it does not have
+            raise ValueError("schema_version='v3' requires context_commit as 64 lowercase hex chars")
+    elif context_commit is not None:
+        raise ValueError(f"context_commit is only meaningful for v3, not {schema_version!r}")
     input_commit = token_commit(input_ids)
     output_commit = token_commit(output_ids)
     if schema_version == "v1":
         sampler_block = _sampler_to_block_v1(sampler)
         schema, preimage_schema = SCHEMA_V1, PREIMAGE_SCHEMA_V1
+    elif schema_version == "v3":
+        sampler_block = sampler_to_block(sampler, fp_frac_bits)
+        schema, preimage_schema = SCHEMA_V3, PREIMAGE_SCHEMA_V3
     else:
         sampler_block = sampler_to_block(sampler, fp_frac_bits)
         schema, preimage_schema = SCHEMA, PREIMAGE_SCHEMA
@@ -148,7 +168,7 @@ def build_receipt(*, model_hash: str, input_ids, output_ids, sampler,
         "sampler": sampler_block,
         "miStatus": trace.get("miStatus", "pending"),                # honest: MI attribution not wired
     }
-    if schema_version == "v2":
+    if schema_version in ("v2", "v3"):
         # The v2 float-free / language-neutral guarantee covers the WHOLE committed preimage, not just the
         # sampler block. The MI fields are empty today (P5/pending), but enforce the invariant now so that
         # when MI lands it must commit fixed-point ints (e.g. actFp=round(act·2^f)) rather than IEEE floats
@@ -160,13 +180,20 @@ def build_receipt(*, model_hash: str, input_ids, output_ids, sampler,
 
     # 1st entry — model signs the full claim including the trace commitment. `key.sign` is polymorphic:
     # a LocalKey emits a symmetric HMAC vouch; an ECKey emits a third-party-verifiable secp256k1 signature.
-    model_msg = canonical_bytes({"modelHash": model_hash, "inputCommit": input_commit,
-                                 "outputCommit": output_commit,
-                                 "traceCommit": trace_block["traceCommit"]})
+    model_entry = {"modelHash": model_hash, "inputCommit": input_commit,
+                   "outputCommit": output_commit, "traceCommit": trace_block["traceCommit"]}
+    if context_commit is not None:
+        model_entry["contextCommit"] = context_commit
+    model_msg = canonical_bytes(model_entry)
     sig_model = model_key.sign(model_msg)
     # 2nd entry — counterparty co-signs only the input/output it observed (not the internal trace).
-    cp_msg = canonical_bytes({"modelHash": model_hash, "inputCommit": input_commit,
-                              "outputCommit": output_commit})
+    # the counterparty co-signs only what it observed — plus the context, or its
+    # signature would be transferable between requests
+    cp_entry = {"modelHash": model_hash, "inputCommit": input_commit,
+                "outputCommit": output_commit}
+    if context_commit is not None:
+        cp_entry["contextCommit"] = context_commit
+    cp_msg = canonical_bytes(cp_entry)
     sig_counterparty = counterparty_key.sign(cp_msg)
 
     body = {
@@ -189,6 +216,8 @@ def build_receipt(*, model_hash: str, input_ids, output_ids, sampler,
     cp_pub = getattr(counterparty_key, "public_hex", None)
     if cp_pub:
         body["sigCounterpartyPubKey"] = cp_pub
+    if context_commit is not None:
+        body["contextCommit"] = context_commit
     receipt = dict(body)
     receipt["receiptHash"] = sha256_hex(canonical_bytes(body))   # commits the signed pair (3rd-entry payload)
 
