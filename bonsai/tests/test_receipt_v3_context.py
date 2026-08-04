@@ -179,3 +179,38 @@ def test_a_v3_receipt_hash_ignores_a_receipt_hash_already_in_the_body():
     with_field = RECEIPTS["v3-body-hash-excludes-itself"]["body"]
     without_field = RECEIPTS["v3-body"]["body"]
     assert receipt_hash(with_field) == receipt_hash(without_field)
+
+
+def test_a_v3_receipt_verifies_structurally():
+    """The defect this covers: verify.py rebuilt the signed messages in the v2 shape,
+    so every valid v3 signature failed to verify. Found by running a real generation,
+    where the engine printed "verify failed" while every component it listed said
+    True — construction tests could not have caught it."""
+    from trinote.receipts.verify import verify_receipt
+
+    receipt = _build(schema_version="v3", context_commit=CONTEXT)
+    preimage = {"schema": "trinote.receipt-preimage/v3", "receiptHash": receipt["receiptHash"],
+                "modelHash": receipt["modelHash"], "modelLabel": "", "artifactDigest": None,
+                "inputIds": [1, 2, 3], "outputIds": [4, 5],
+                "sampler": receipt["trace"]["sampler"], "trace": receipt["trace"]}
+    model_key, cp_key = _keys()
+    res = verify_receipt({"receipt": receipt, "preimage": preimage},
+                         model_key=model_key, counterparty_key=cp_key)
+    assert res["sigModelOk"] is True
+    assert res["sigCounterpartyOk"] is True
+    assert res["receiptHashMatch"] is True
+
+
+def test_a_v2_receipt_still_verifies_unchanged():
+    from trinote.receipts.verify import verify_receipt
+
+    receipt = _build()
+    preimage = {"schema": "trinote.receipt-preimage/v2", "receiptHash": receipt["receiptHash"],
+                "modelHash": receipt["modelHash"], "modelLabel": "", "artifactDigest": None,
+                "inputIds": [1, 2, 3], "outputIds": [4, 5],
+                "sampler": receipt["trace"]["sampler"], "trace": receipt["trace"]}
+    model_key, cp_key = _keys()
+    res = verify_receipt({"receipt": receipt, "preimage": preimage},
+                         model_key=model_key, counterparty_key=cp_key)
+    assert res["sigModelOk"] is True
+    assert res["sigCounterpartyOk"] is True

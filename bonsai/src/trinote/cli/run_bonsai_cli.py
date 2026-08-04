@@ -1120,6 +1120,7 @@ def _run_native(args, cfg: SamplerConfig) -> int:
                             confirm=args.chain_confirm, change_to_source=True, allow_unconfirmed=True)
                             if args.onchain else None),
                         tx_log=(args.tx_log or None),
+                        context_commit=args.context_commit,
                         telemetry=receipt_telemetry,
                     )
                 t_verify = time.monotonic() - t_verify0
@@ -1308,6 +1309,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rep-penalty", type=float, default=1.0)
     ap.add_argument("--no-repeat-ngram", type=int, default=0)
     ap.add_argument("--receipt", action="store_true")
+    ap.add_argument("--context-commit", dest="context_commit", default=None, metavar="HEX64",
+                    help="bind the receipt to a semantos request (semantos.trinote.context/v1), "
+                         "emitting trinote.receipt/v3 instead of v2. Without it the receipt "
+                         "commits nothing about any request and can be presented against another.")
     ap.add_argument("--no-receipt", dest="receipt", action="store_false")
     ap.set_defaults(receipt=True)
     ap.add_argument("--verify-mode", choices=["fast-local", "fresh-oracle"], default="fast-local",
