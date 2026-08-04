@@ -27,9 +27,9 @@ import re
 from .canonical import canonical_bytes, commit, token_commit
 from .signing import LocalKey, sign
 from ..hashing.sha import sha256_hex
+from ..infer_int.sampler import RECEIPT_SAFE_MODES, inv_temp_fp, top_p_fp, min_p_fp
 
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
-from ..infer_int.sampler import RECEIPT_SAFE_MODES, inv_temp_fp, top_p_fp, min_p_fp
 
 SCHEMA = "trinote.receipt/v2"
 PREIMAGE_SCHEMA = "trinote.receipt-preimage/v2"
