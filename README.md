@@ -43,6 +43,16 @@ See [`integer_engine.md`](integer_engine.md) for the full design (sections marke
 `north-mini-code` reuses `bonsai`'s determinism primitives (`fixedpoint`, RoPE); a small set is vendored
 verbatim under `north-mini-code/src/nmc/_bonsai/` to keep it self-contained.
 
+## Watch the episode
+
+**[Trinote Project One: The Integer Inference Engine](https://github.com/itsmygithubacct/integer_inference_engine/releases/download/media-v1/02-integer-inference-engine.mp4)**
+— part two of *Trinote: From Deterministic Inference to Durable Evidence*, the six-part series across
+the four composed trinote projects (1920×1080, 3m12s, 8.4 MB; published as a
+[media release](https://github.com/itsmygithubacct/integer_inference_engine/releases/tag/media-v1) so a
+clone stays small). This episode: removing float drift, model binding, what a receipt commits to.
+The [full series](https://github.com/itsmygithubacct/bonsai-notary#watch-the-series) (16m28s) lives on
+`bonsai-notary`.
+
 ## Get it
 
 ```bash
