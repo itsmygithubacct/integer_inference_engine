@@ -10,12 +10,31 @@ for arg in "$@"; do case "$arg" in -h|--help) usage; exit 0;; esac; done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 src="$ROOT/tools/bonsai_q1_gpu.cu"
+nvcc="${NVCC:-nvcc}"
+arch="${CUDA_ARCH:-}"
+
+# An architecture the caller supplied is checked before the toolchain is probed and
+# before anything is created. CUDA_ARCH=native is wrong on every host, so it has to be
+# reported as a bad architecture everywhere — not as "nvcc not found" on the hosts that
+# happen to lack CUDA, which would make the same bad input diagnose differently per host.
+require_supported_arch() {
+  if [[ ! "$1" =~ ^sm_[0-9]{2,3}$ ]]; then
+    echo "build_bonsai_q1_gpu.sh: CUDA_ARCH must look like sm_86, got: $1" >&2
+    exit 2
+  fi
+  if ((10#${1#sm_} < 75)); then
+    echo "build_bonsai_q1_gpu.sh: $1 is unsupported; exact BMMA kernels require sm_75 or newer" >&2
+    exit 2
+  fi
+}
+if [ -n "$arch" ]; then
+  require_supported_arch "$arch"
+fi
+
 # Built kernel goes to $BONSAI_NOTARY_HOME/bin (build artifacts are not source); the loader prefers it and
 # falls back to <repo>/tools for back-compat. Override with $BONSAI_BIN_DIR.
 BIN_DIR="${BONSAI_BIN_DIR:-${BONSAI_NOTARY_HOME:-$HOME/.local/trinote}/bin}"; mkdir -p "$BIN_DIR"
 out="$BIN_DIR/libbonsai_q1_gpu.so"
-nvcc="${NVCC:-nvcc}"
-arch="${CUDA_ARCH:-}"
 
 if ! command -v "$nvcc" >/dev/null 2>&1; then
   echo "build_bonsai_q1_gpu.sh: nvcc not found on PATH (set NVCC=...). GPU build is opt-in; the CPU path stays." >&2
@@ -39,15 +58,8 @@ if [ -z "$arch" ]; then
   fi
   arch="sm_$capability"
 fi
-if [[ ! "$arch" =~ ^sm_[0-9]{2,3}$ ]]; then
-  echo "build_bonsai_q1_gpu.sh: CUDA_ARCH must look like sm_86, got: $arch" >&2
-  exit 2
-fi
+require_supported_arch "$arch"   # covers the auto-detected value; idempotent for an explicit CUDA_ARCH
 arch_number="${arch#sm_}"
-if ((10#$arch_number < 75)); then
-  echo "build_bonsai_q1_gpu.sh: $arch is unsupported; exact BMMA kernels require sm_75 or newer" >&2
-  exit 2
-fi
 echo "[bonsai-gpu-build] target architecture: $arch${CUDA_ARCH:+ (override)}"
 
 # NO --use_fast_math / -ffast-math: would relax/reorder arithmetic. Integer kernel only, but assert it.
