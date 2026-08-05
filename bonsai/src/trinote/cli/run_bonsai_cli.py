@@ -19,6 +19,7 @@ from ..infer_int.bonsai_runtime import (
     emit_and_verify_bonsai_receipt,
     generate_bonsai_tokens,
     load_or_generate_signing_keys,
+    resolve_signing_keys,
     validate_bonsai35_receipt_identity,
 )
 from ..infer_int.gguf_tokenizer_v2 import load_gguf_tokens, llama_tokenize, token_bytes
@@ -1096,7 +1097,12 @@ def _run_native(args, cfg: SamplerConfig) -> int:
                     os.environ["TRINOTE_DEMO_KEYS_OK"] = "1"
                     sign_mk = sign_ck = None
                 else:
-                    sign_mk, sign_ck = load_or_generate_signing_keys(args.model_key, args.counterparty_key)
+                    sign_mk, sign_ck = resolve_signing_keys(
+                        args.model_key, args.counterparty_key,
+                        counterparty_command=args.counterparty_remote,
+                        counterparty_pubkey=args.counterparty_pubkey,
+                        allow_local_counterparty=args.counterparty_local,
+                    )
                 guard = terminal.quarantine_input() if terminal else contextlib.nullcontext()
                 with guard:
                     bundle, verification, emission = emit_and_verify_bonsai_receipt(
@@ -1327,7 +1333,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="path to the model (issuer) secp256k1 receipt signing key (JSON). Default: "
                          f"{model_key_default()} — generated on first use if absent (third-party-verifiable).")
     ap.add_argument("--counterparty-key", default=None,
-                    help=f"path to the counterparty signing key (JSON). Default: {counterparty_key_default()}.")
+                    help="path to a counterparty signing key (JSON) held on THIS host. Naming one is a "
+                         "deliberate choice to sign both receipt entries here; prefer --counterparty-remote.")
+    ap.add_argument("--counterparty-remote", default=None,
+                    help="command that reaches an independent counterparty signing service (e.g. "
+                         "\"ssh notary trinote-counterparty-sign\"). The request goes in on stdin, the "
+                         "signature comes back on stdout; no counterparty secret is held here.")
+    ap.add_argument("--counterparty-pubkey", default=None,
+                    help="the remote counterparty's compressed secp256k1 public key (66 hex chars), pinned "
+                         "by policy. Required with --counterparty-remote: a signing service is the wrong "
+                         "party to ask who it is.")
+    ap.add_argument("--counterparty-local", action="store_true",
+                    help="accept a single-party receipt: generate/use the default counterparty key on this "
+                         "host, so both signatures are made by one party. Off by default — the resulting "
+                         "receipt reads as two-party attestation and is not.")
     ap.add_argument("--demo-keys", action="store_true",
                     help="sign with the legacy deterministic HMAC demo keys (NO authenticity; for reproducible "
                          "snapshots only). Default is real secp256k1 keys under ~/.local/trinote/keys.")
