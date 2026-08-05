@@ -31,6 +31,19 @@ from trinote.receipts.verify import verify_receipt
 H = lambda b: b * 64                                    # noqa: E731
 
 
+@pytest.fixture(autouse=True)
+def _isolated_key_home(tmp_path, monkeypatch):
+    """Keep generated keys out of the real home.
+
+    Caught the first time these tests ran: the waiver path generates at
+    `counterparty_key_default()`, which resolves under `$BONSAI_NOTARY_HOME` — so a test
+    that exercised the waiver minted a live key in the developer's own key directory. A
+    test that writes outside its tmp_path is also a test whose result depends on what is
+    already there.
+    """
+    monkeypatch.setenv("BONSAI_NOTARY_HOME", str(tmp_path / "notary-home"))
+
+
 def _service(key, *, echo_key=None):
     """A counterparty that rebuilds the message from named fields and signs that."""
 
