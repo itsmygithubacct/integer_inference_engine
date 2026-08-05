@@ -119,6 +119,25 @@ def verify_receipt(bundle: dict, **kwargs) -> dict:
         return _invalid_result(str(e))
 
 
+def _signed_messages(receipt: dict) -> tuple[bytes, bytes]:
+    """Rebuild the two signed messages exactly as `build_receipt` assembled them.
+
+    v3 receipts carry `contextCommit` inside BOTH signed messages, so a verifier that
+    rebuilt the v2 shape would compute different bytes and reject every valid v3
+    signature. Keyed off the field's presence rather than the schema string: the
+    bytes are what was signed, and a receipt claiming v3 without the field is caught
+    by the schema check, not here.
+    """
+    base = {"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
+            "outputCommit": receipt["outputCommit"]}
+    context = receipt.get("contextCommit")
+    if context is not None:
+        base["contextCommit"] = context
+    model_msg = canonical_bytes({**base, "traceCommit": receipt["trace"]["traceCommit"]})
+    cp_msg = canonical_bytes(base)
+    return model_msg, cp_msg
+
+
 def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None = None,
                    model_key: LocalKey | None = None,
                    counterparty_key: LocalKey | None = None,
@@ -254,9 +273,7 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
     cp_sig_pinned = False
     sig_model = receipt.get("sigModel")
     if sig_model and str(sig_model).startswith(EC_SCHEME + ":"):
-        msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
-                               "outputCommit": receipt["outputCommit"],
-                               "traceCommit": receipt["trace"]["traceCommit"]})
+        msg, _ = _signed_messages(receipt)
         result["sigModelPubKey"] = receipt.get("sigModelPubKey")
         expected_model_pubkey = (
             model_pubkey if model_pubkey is not None else receipt.get("sigModelPubKey")
@@ -279,15 +296,12 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
         result["sigModelOk"] = False
         model_sig_pinned = True
     elif model_key is not None:
-        msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
-                               "outputCommit": receipt["outputCommit"],
-                               "traceCommit": receipt["trace"]["traceCommit"]})
+        msg, _ = _signed_messages(receipt)
         result["sigModelOk"] = verify_signature(msg, sig_model, key=model_key)
         model_sig_pinned = True                 # caller supplied the producing secret = an external authenticator
     sig_cp = receipt.get("sigCounterparty")
     if sig_cp and str(sig_cp).startswith(EC_SCHEME + ":"):
-        msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
-                               "outputCommit": receipt["outputCommit"]})
+        _, msg = _signed_messages(receipt)
         result["sigCounterpartyPubKey"] = receipt.get("sigCounterpartyPubKey")
         expected_counterparty_pubkey = (
             counterparty_pubkey
@@ -307,8 +321,7 @@ def _verify_receipt_impl(bundle: dict, *, model=None, model_digest: str | None =
         result["sigCounterpartyOk"] = False
         cp_sig_pinned = True
     elif counterparty_key is not None:
-        msg = canonical_bytes({"modelHash": receipt["modelHash"], "inputCommit": receipt["inputCommit"],
-                               "outputCommit": receipt["outputCommit"]})
+        _, msg = _signed_messages(receipt)
         result["sigCounterpartyOk"] = verify_signature(msg, sig_cp, key=counterparty_key)
         cp_sig_pinned = True
 

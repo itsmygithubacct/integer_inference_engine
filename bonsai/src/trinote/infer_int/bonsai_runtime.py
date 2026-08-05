@@ -416,6 +416,7 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
                                    enable_chain: bool = False, chain_backend=None,
                                    tx_log: str | Path | None = None,
                                    ts: str | None = None,
+                                   context_commit: str | None = None,
                                    telemetry: dict | None = None) -> tuple[dict, dict, dict]:
     """Build, verify, and emit one Bonsai receipt.
 
@@ -426,6 +427,11 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
     `model_key`/`counterparty_key` select the receipt signature scheme. Pass `ECKey`s for a real deployment
     (third-party-verifiable secp256k1 — verified from the committed public key, no shared secret). If omitted,
     the legacy symmetric HMAC demo constants are used (back-compat; the vouch proves wiring, not authenticity).
+
+    `context_commit` binds the receipt to the request that asked for it
+    (`semantos.trinote.context/v1`), producing a `trinote.receipt/v3`. Without it the
+    receipt is v2 and commits nothing about any request — valid, and reusable against
+    a different one.
     """
     preparation_started = time.monotonic()
     if verifier_mode not in {"fast-local", "fresh-oracle"}:
@@ -485,6 +491,8 @@ def emit_and_verify_bonsai_receipt(model, *, input_ids, output_ids, model_digest
         model_label=model_label,
         artifact_digest=model_digest,
         fp_frac_bits=int(model.cfg["frac"]),   # v2: commit the sampler at the engine's fixed-point scale
+        **({"schema_version": "v3", "context_commit": context_commit}
+           if context_commit is not None else {}),
     )
     if telemetry is not None:
         telemetry["receiptConstructionSeconds"] = time.monotonic() - receipt_started
