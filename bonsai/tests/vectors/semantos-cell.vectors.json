@@ -1,0 +1,279 @@
+{
+  "accept": [
+    {
+      "name": "submitted-no-proof",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "evidenceCommit": "bbbe1bf3c626f4e858c4e50a1f0b63f98c8bd15e85009ecb17b238aa0291f324",
+      "canonical": "{\"cellHash\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"inclusionProofRef\":null,\"kind\":\"semantos-cell\",\"modelBindingHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"receiptHash\":\"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\",\"txid\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"typeHash\":\"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\",\"vout\":0}"
+    },
+    {
+      "name": "confirmed-with-proof",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": "beef:0001"
+      },
+      "evidenceCommit": "76df6631ea0b98f07cac708e68b3727253a28d538e87a826ab25abad289a0ead",
+      "canonical": "{\"cellHash\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"inclusionProofRef\":\"beef:0001\",\"kind\":\"semantos-cell\",\"modelBindingHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"receiptHash\":\"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\",\"txid\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"typeHash\":\"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\",\"vout\":0}"
+    },
+    {
+      "name": "vout-nonzero",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 7,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "evidenceCommit": "c50bbaef1833ccf60ab3983b62e42508585cc58135aebde27b3a5db463fdac5c",
+      "canonical": "{\"cellHash\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"inclusionProofRef\":null,\"kind\":\"semantos-cell\",\"modelBindingHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"receiptHash\":\"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\",\"txid\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"typeHash\":\"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\",\"vout\":7}"
+    },
+    {
+      "name": "vout-large-safe-int",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 9007199254740991,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "evidenceCommit": "ef6ddcb2ce26ea23d2c1cebdd03c88e46c50d22ff748c392d886c855cf8ca622",
+      "canonical": "{\"cellHash\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"inclusionProofRef\":null,\"kind\":\"semantos-cell\",\"modelBindingHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"receiptHash\":\"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\",\"txid\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"typeHash\":\"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\",\"vout\":9007199254740991}"
+    },
+    {
+      "name": "proof-ref-printable-ascii",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": "merkle path #3 (~!@#$%^&*)"
+      },
+      "evidenceCommit": "4a0f455e6786b16db6f3f6402c1f52f20499d4624de337e8e2ab5193f686324a",
+      "canonical": "{\"cellHash\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"inclusionProofRef\":\"merkle path #3 (~!@#$%^&*)\",\"kind\":\"semantos-cell\",\"modelBindingHash\":\"e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\",\"receiptHash\":\"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\",\"txid\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"typeHash\":\"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\",\"vout\":0}"
+    },
+    {
+      "name": "all-zero-hashes",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+        "cellHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "typeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "receiptHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "modelBindingHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "inclusionProofRef": null
+      },
+      "evidenceCommit": "fad4249b50b0c4e92b390d1e12deca061646cc7c977c0bf90224db0fe9db2e8e",
+      "canonical": "{\"cellHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"inclusionProofRef\":null,\"kind\":\"semantos-cell\",\"modelBindingHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"receiptHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"txid\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"typeHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"vout\":0}"
+    },
+    {
+      "name": "all-f-hashes",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "vout": 0,
+        "cellHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "typeHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "receiptHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "modelBindingHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "inclusionProofRef": null
+      },
+      "evidenceCommit": "d3de827792387902e2d80795ae17347fd78b019d0450824277c419d66a8eb8bb",
+      "canonical": "{\"cellHash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"inclusionProofRef\":null,\"kind\":\"semantos-cell\",\"modelBindingHash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"receiptHash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"txid\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"typeHash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"vout\":0}"
+    }
+  ],
+  "reject": [
+    {
+      "name": "missing-field",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "missing-field"
+    },
+    {
+      "name": "extra-field",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null,
+        "extra": "9999999999999999999999999999999999999999999999999999999999999999"
+      },
+      "reason": "unknown-field"
+    },
+    {
+      "name": "wrong-kind",
+      "evidence": {
+        "kind": "stateful",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-kind"
+    },
+    {
+      "name": "uppercase-hex",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-hex"
+    },
+    {
+      "name": "short-hex",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "ab",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-length"
+    },
+    {
+      "name": "negative-vout",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": -1,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-number"
+    },
+    {
+      "name": "float-vout",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 1.5,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-number"
+    },
+    {
+      "name": "non-ascii-proof-ref",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": "proofé"
+      },
+      "reason": "bad-charset"
+    },
+    {
+      "name": "empty-proof-ref",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": ""
+      },
+      "reason": "bad-length"
+    },
+    {
+      "name": "overlong-proof-ref",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "reason": "bad-length"
+    },
+    {
+      "name": "vout-beyond-safe-int",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "vout": 9007199254740992,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-number"
+    },
+    {
+      "name": "null-hash",
+      "evidence": {
+        "kind": "semantos-cell",
+        "txid": null,
+        "vout": 0,
+        "cellHash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "typeHash": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "receiptHash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "modelBindingHash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "inclusionProofRef": null
+      },
+      "reason": "bad-type"
+    }
+  ]
+}

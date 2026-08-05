@@ -22,6 +22,13 @@ from ..receipts.receipt import receipt_hash
 from ..receipts.emit import chain_artifact
 from ..hashing.sha import txid_of
 from .pack import BUNDLE_SCHEMA, BundleError
+from .semantos_cell import (
+    EVIDENCE_KIND as SEMANTOS_CELL_KIND,
+    EvidenceError,
+    evidence_binds_receipt,
+    is_confirmed,
+    validate_evidence,
+)
 from .stateful import agent_action_receipt_hash
 from . import chain_read
 
@@ -178,9 +185,11 @@ def _verify_offline(loaded: dict) -> dict:
     else:
         onchain = obj.get("onchain.json") or {}
         kind = onchain.get("kind")
-        _check(checks, "onchain.kind", kind in ("standalone", "stateful"), str(kind))
+        _check(checks, "onchain.kind", kind in ("standalone", "stateful", SEMANTOS_CELL_KIND), str(kind))
 
-        if kind == "standalone":
+        if kind == SEMANTOS_CELL_KIND:
+            _verify_semantos_cell_offline(checks, receipt, onchain, rh)
+        elif kind == "standalone":
             _check(checks, "standalone.modelHash", onchain.get("modelHash") == receipt.get("modelHash"),
                    onchain.get("modelHash", ""))
             _check(checks, "standalone.receiptHash", onchain.get("receiptHash") == rh, onchain.get("receiptHash", ""))
@@ -227,6 +236,44 @@ def _verify_offline(loaded: dict) -> dict:
     return {"ok": ok, "checks": checks}
 
 
+def _verify_semantos_cell_offline(checks: list, receipt: dict, onchain: dict, rh: str) -> None:
+    """Bind a semantos-published result cell to this receipt, offline.
+
+    This is the whole of Trinote's half. semantos proves the transaction is in a block;
+    what it cannot prove on Trinote's behalf is that the cell describes *this*
+    computation, because that is a statement about the receipt sitting next to it in
+    the bundle.
+
+    `modelBindingHash` is checked for shape and committed, but not recomputed — it is a
+    semantos record and this side has nothing to derive it from. Recording it as
+    verified would be a claim nobody made.
+    """
+    try:
+        validate_evidence(onchain)
+    except EvidenceError as exc:
+        _check(checks, "semantosCell.wellFormed", False, str(exc))
+        return
+    _check(checks, "semantosCell.wellFormed", True, "")
+
+    _check(checks, "semantosCell.receiptHash",
+           evidence_binds_receipt(onchain, rh), onchain.get("receiptHash", ""))
+
+    # The evidence commits the model binding it was anchored against; a bundle whose
+    # receipt carries a different modelHash than the cell claims would bind two
+    # computations together by proximity alone.
+    _check(checks, "semantosCell.modelHashPresent",
+           isinstance(receipt.get("modelHash"), str) and bool(receipt.get("modelHash")),
+           "receipt.modelHash")
+
+    # Not a failure — a distinction. Submitted evidence is honest evidence; it is simply
+    # not yet inclusion, and a verifier that reported the two identically would be the
+    # reason someone treats a broadcast as settled.
+    confirmed = is_confirmed(onchain)
+    _check(checks, "semantosCell.anchorState", True,
+           "confirmed (inclusion proof present)" if confirmed
+           else "submitted (broadcast, inclusion NOT yet proven)")
+
+
 def _verify_stateful_offline(checks: list, receipt: dict, onchain: dict, identity: dict) -> None:
     """Recompute the AgentTea action hash from the bundle's committed fields and bind it to the receipt."""
     action = onchain.get("action") or {}
@@ -258,6 +305,39 @@ def _verify_stateful_offline(checks: list, receipt: dict, onchain: dict, identit
         return
     _check(checks, "stateful.actionReceiptHash", recomputed == onchain.get("receiptHashOnChain"),
            f"{recomputed} vs {onchain.get('receiptHashOnChain')}")
+
+
+def _verify_semantos_cell_onchain(checks: list, onchain: dict, network: str) -> None:
+    """What Trinote can honestly check on chain about a cell it did not publish.
+
+    Not inclusion. Inclusion is a merkle proof against a block header, semantos holds
+    the BEEF, and this side has no business claiming to have checked it — an auditor who
+    read `ok: True` here and assumed otherwise would be wrong in the one way that
+    matters.
+
+    What *is* checkable, and worth checking, is that the transaction the evidence names
+    exists and really has an output at the stated index. That is what fails when a txid
+    is invented, which is the cheap forgery this closes; the expensive one is semantos's
+    to catch.
+    """
+    txid = onchain.get("txid")
+    try:
+        raw = chain_read.fetch_raw_tx(txid, network)
+        parsed = chain_read.parse_tx(raw)
+    except (chain_read.ChainReadError, ValueError, KeyError, IndexError, TypeError) as exc:
+        _check(checks, "semantosCell.txFound", False, f"{txid}: {exc}")
+        return
+    _check(checks, "semantosCell.txFound", True, str(txid))
+
+    outputs = parsed.get("outputs") or []
+    vout = onchain.get("vout")
+    _check(checks, "semantosCell.voutExists",
+           isinstance(vout, int) and 0 <= vout < len(outputs),
+           f"vout {vout} of {len(outputs)} outputs")
+
+    # Say plainly what was not done, so nobody reads this result as more than it is.
+    _check(checks, "semantosCell.inclusionCheckedBy", True,
+           "semantos (BEEF/SPV); Trinote verifies content binding only")
 
 
 def _verify_onchain(loaded: dict, network: str) -> dict:
@@ -311,6 +391,8 @@ def _verify_onchain(loaded: dict, network: str) -> dict:
                     walk = chain_read.walk_identity_to_genesis(txid, genesis, net)
                     _check(checks, "onchain.chainToGenesis", walk.get("ok"),
                            f"{walk.get('hops')} hops; {walk.get('reason', 'reached genesis')}")
+        elif kind == SEMANTOS_CELL_KIND:
+            _verify_semantos_cell_onchain(checks, onchain, net)
         else:
             _check(checks, "onchain.kind", False, f"unknown kind {kind!r}")
     except chain_read.ChainReadError as exc:
