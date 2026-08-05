@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import time
 import warnings
 from pathlib import Path
@@ -13,6 +14,10 @@ from typing import Callable
 
 from ..notary_paths import ledger_default, model_key_default, counterparty_key_default
 from ..receipts import keygen, build_receipt, ECKey
+from ..receipts.remote_counterparty import (
+    CounterpartyNotConfigured,
+    RemoteCounterpartySigner,
+)
 from ..receipts.emit import emit_receipt
 from ..receipts.ledger import LocalLedger
 from ..receipts.verify import verify_receipt
@@ -106,6 +111,68 @@ def load_or_generate_signing_keys(model_key_path: str | Path | None = None,
     model = ECKey.load_or_generate(mp, label=BONSAI_LABEL + " model")
     counterparty = ECKey.load_or_generate(cp, label=BONSAI_LABEL + " counterparty")
     return model, counterparty
+
+
+#: an independent counterparty, configured out of band
+COUNTERPARTY_COMMAND_ENV = "TRINOTE_COUNTERPARTY_COMMAND"
+COUNTERPARTY_PUBKEY_ENV = "TRINOTE_COUNTERPARTY_PUBKEY"
+#: the explicit waiver — sign both entries here, and say so
+COUNTERPARTY_LOCAL_OK_ENV = "TRINOTE_COUNTERPARTY_LOCAL_OK"
+
+
+def resolve_signing_keys(model_key_path: str | Path | None = None,
+                         counterparty_key_path: str | Path | None = None,
+                         *,
+                         counterparty_command: list[str] | str | None = None,
+                         counterparty_pubkey: str | None = None,
+                         allow_local_counterparty: bool = False) -> tuple[ECKey, object]:
+    """Resolve the two receipt signers, preferring a counterparty this host does not hold.
+
+    The order is deliberate:
+
+    1. a configured **remote** counterparty — the producer holds no second secret;
+    2. an **explicitly supplied** local key path — the operator chose it, so it stands;
+    3. the co-resident default, but only when it has been **waived out loud**;
+    4. otherwise refuse.
+
+    Case 4 is the change. Generating a counterparty key next to the model key was the
+    old default, and it produced receipts that carry two signatures made by one party —
+    evidence that reads as two-party attestation and is not. Nothing downstream can
+    detect that, so the refusal has to happen here, where the arrangement is still
+    visible. Waiving it is one flag; it is not the silent path any more.
+    """
+    model = ECKey.load_or_generate(Path(model_key_path) if model_key_path else Path(model_key_default()),
+                                   label=BONSAI_LABEL + " model")
+
+    command = counterparty_command or os.environ.get(COUNTERPARTY_COMMAND_ENV) or None
+    if isinstance(command, str):
+        command = shlex.split(command)
+    pubkey = counterparty_pubkey or os.environ.get(COUNTERPARTY_PUBKEY_ENV) or None
+
+    if command:
+        if not pubkey:
+            # unpinned, the counterparty's own answer would be the only claim about who
+            # it is — and a signing service is exactly the wrong party to ask
+            raise CounterpartyNotConfigured(
+                "unpinned-counterparty",
+                f"a remote counterparty needs its public key pinned "
+                f"(--counterparty-pubkey or {COUNTERPARTY_PUBKEY_ENV})")
+        return model, RemoteCounterpartySigner(public_hex=pubkey, command=list(command))
+
+    if counterparty_key_path:
+        return model, ECKey.load_or_generate(Path(counterparty_key_path),
+                                             label=BONSAI_LABEL + " counterparty")
+
+    if allow_local_counterparty or os.environ.get(COUNTERPARTY_LOCAL_OK_ENV) or _demo_keys_requested():
+        return model, ECKey.load_or_generate(Path(counterparty_key_default()),
+                                             label=BONSAI_LABEL + " counterparty")
+
+    raise CounterpartyNotConfigured(
+        "co-resident-counterparty",
+        "both receipt signatures would be made on this host, which is one party signing "
+        "twice. Configure an independent counterparty (--counterparty-remote with "
+        "--counterparty-pubkey), name a key deliberately (--counterparty-key), or accept "
+        "a single-party receipt (--counterparty-local)")
 
 
 def _demo_keys_requested() -> bool:
