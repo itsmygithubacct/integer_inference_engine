@@ -25,6 +25,11 @@ from pathlib import Path
 
 from ..receipts.canonical import canonical_bytes, commit
 from ..receipts.emit import chain_artifact
+from .semantos_cell import (
+    EVIDENCE_KIND as SEMANTOS_CELL_KIND,
+    EvidenceError,
+    validate_evidence,
+)
 
 BUNDLE_SCHEMA = "trinote.receipt-bundle/v1"
 
@@ -109,8 +114,23 @@ def pack_bundle(
         kind = "local"
     else:
         kind = onchain.get("kind")
-        if kind not in ("standalone", "stateful"):
-            raise BundleError(f"onchain.kind must be 'standalone', 'stateful', or omitted (local), got {kind!r}")
+        if kind not in ("standalone", "stateful", SEMANTOS_CELL_KIND):
+            raise BundleError(
+                f"onchain.kind must be 'standalone', 'stateful', '{SEMANTOS_CELL_KIND}', "
+                f"or omitted (local), got {kind!r}")
+        if kind == SEMANTOS_CELL_KIND:
+            # The third entry is a cell semantos published, not a mark this side wrote.
+            # Validate the evidence at pack time so a malformed record never reaches a
+            # bundle: a verifier that has to reject the whole bundle later cannot tell
+            # the operator which field was wrong, and by then the anchor has been paid for.
+            try:
+                validate_evidence(onchain)
+            except EvidenceError as exc:
+                raise BundleError(f"semantos-cell evidence is malformed ({exc})") from exc
+            if onchain["receiptHash"] != receipt["receiptHash"]:
+                raise BundleError(
+                    "semantos-cell evidence references a different receipt "
+                    f"({onchain['receiptHash']} != {receipt['receiptHash']})")
         if kind == "stateful":
             if not isinstance(identity, dict):
                 raise BundleError("stateful bundle requires an 'identity' dict (ricardianHash, genesisTxid, pubkeys)")
