@@ -27,7 +27,17 @@ import re
 from .canonical import canonical_bytes, commit, token_commit
 from .signing import LocalKey, sign
 from ..hashing.sha import sha256_hex
-from ..infer_int.sampler import RECEIPT_SAFE_MODES, inv_temp_fp, top_p_fp, min_p_fp
+
+
+def _sampler_fp():
+    """Fixed-point sampler helpers, imported on use.
+
+    `infer_int.sampler` pulls in numpy. Only the two functions below need it, and a
+    process that merely loads a key or hashes a receipt needs neither — which is what
+    lets a counterparty host hold the second signing key without installing the
+    inference stack beside it."""
+    from ..infer_int.sampler import RECEIPT_SAFE_MODES, inv_temp_fp, top_p_fp, min_p_fp
+    return RECEIPT_SAFE_MODES, inv_temp_fp, top_p_fp, min_p_fp
 
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -99,6 +109,7 @@ def sampler_to_block(sampler, frac_bits: int = 16) -> dict:
         if g("minPFp") is not None:                              # carry min-p only if present (block-compat)
             block["minPFp"] = int(g("minPFp"))
         return block
+    _, inv_temp_fp, top_p_fp, min_p_fp = _sampler_fp()
     mode, temperature, top_k, top_p, seed, rep_penalty, no_repeat_ngram, inv_c, topp_c = _sampler_fields(sampler)
     min_p, min_c = _sampler_min_p(sampler)
     f = int(frac_bits)
@@ -159,7 +170,8 @@ def build_receipt(*, model_hash: str, input_ids, output_ids, sampler,
     # Receipt-bound iff the sampler is re-executable. Greedy (argmax) and the SEEDED integer samplers
     # (temp/top-k/top-p) are all bit-exactly re-derivable — the seed is committed in the block and the
     # draw is the counter-based integer Lemire draw (sampler.py / docs/architecture/SAMPLER-INTEGER.md).
-    receipt_bound = sampler_block["mode"] in RECEIPT_SAFE_MODES
+    receipt_safe_modes, _, _, _ = _sampler_fp()
+    receipt_bound = sampler_block["mode"] in receipt_safe_modes
 
     trace = trace or {}
     trace_record = {

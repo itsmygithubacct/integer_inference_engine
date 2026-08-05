@@ -23,7 +23,25 @@ from .broadcast import (LogBroadcastBackend, LocalNodeChainBackend, LocalNodeTea
                         WalletThirdEntryBackend, ChainBroadcastError)
 from .emit import emit_receipt, chain_artifact, ChainDisabledError, CHAIN_TAG
 from .txlog import append_tx_log, log_transaction, tx_record, read_tx_log, TX_LOG_SCHEMA
-from .verify import verify_receipt
+
+
+def __getattr__(name: str):
+    """`verify_receipt` is resolved on first use, not on import.
+
+    Verification re-executes the model, so `verify.py` pulls in the inference stack —
+    numpy and `infer_int`. Signing needs none of it. Importing it eagerly meant a host
+    whose only job is to hold the counterparty key had to install the entire engine to
+    load that key, which is the wrong direction for the one machine in the arrangement
+    whose isolation is doing the work.
+
+    Anything that actually verifies pays the import at the call it was always going to
+    make; `from trinote.receipts import verify_receipt` still works.
+    """
+    if name == "verify_receipt":
+        from .verify import verify_receipt
+        return verify_receipt
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "canonical_bytes", "commit", "token_commit",
